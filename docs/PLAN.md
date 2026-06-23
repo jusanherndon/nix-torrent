@@ -144,14 +144,17 @@ The daemon remains the only writer of torrent state.
 - Test duplicate torrent add by info hash.
 - Add limits for peers per torrent and active torrents.
 
+## Decisions
+
+- Target the Zig 0.16.0 release.
+
 ## Open Questions
 
 These should be resolved before or during implementation:
 
-1. Which Zig version should this project target?
-2. Should configuration use a file, environment variables, CLI flags, or a combination?
-3. What exact directory layout should the staging area use?
-4. What should `remove` mean for staged data: forget only, delete data, or ask for a mode?
-5. Should completed torrent history persist after handoff?
-6. What level of tracker compatibility is required for the first home-lab replacement?
-7. What observability is required: logs only, status command, metrics endpoint, or all later?
+1. Should configuration use a file, environment variables, CLI flags, or a combination?
+2. What exact directory layout should the staging area use?
+3. What should `remove` mean for staged data: forget only, delete data, or ask for a mode?
+4. Should completed torrent history persist after handoff?
+5. What level of tracker compatibility is required for the first home-lab replacement?
+6. What observability is required: logs only, status command, metrics endpoint, or all later?
