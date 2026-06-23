@@ -1,0 +1,3 @@
+# Use TOML for daemon configuration
+
+Nix Torrent v2 will use a user-editable TOML configuration file for daemon paths, socket discovery, and operational safety limits because this is a home-lab daemon whose limits should be visible without searching code. The default path is `$XDG_CONFIG_HOME/nix-torrent/config.toml`, falling back to `~/.config/nix-torrent/config.toml`; explicit `--config` paths are supported, and precedence is CLI flags, then environment variables, then TOML, then built-in defaults. The CLI reads configuration only to resolve daemon connection settings such as `socket_path`, while torrent behavior and safety limits remain daemon-owned.

@@ -70,10 +70,13 @@ Initial CLI commands:
 - `pause <info-hash>`
 - `resume <info-hash>`
 - `remove <info-hash>`
+- `status`
 
 The daemon remains the only writer of torrent state.
 
 ## Suggested Implementation Milestones
+
+Current implementation status: milestones 1 and 2 are complete. Later milestones have skeletons, codecs, parsers, or unit-level helpers, but the real socket, tracker networking, peer networking, download engine, handoff flow, and integration hardening are planned for v2. See `docs/V2_PLAN.md`.
 
 ### Milestone 1: Project Skeleton — Done
 
@@ -92,69 +95,77 @@ The daemon remains the only writer of torrent state.
 - [x] Validate single-file and multi-file metadata.
 - [x] Add tests using small fixture torrents.
 
-### Milestone 3: Storage Layout and Verification — Done
+### Milestone 3: Storage Layout and Verification — Partial
 
-- [x] Map torrent files to staging paths.
-- [x] Write piece data to the correct file offsets.
-- [x] Read pieces back for verification.
+- [x] Map torrent pieces to file spans.
+- [ ] Validate torrent paths before creating staged files.
+- [ ] Create staged file trees.
+- [ ] Write verified piece data to the correct file offsets.
+- [ ] Read pieces back for verification.
 - [x] Track verified, missing, and in-progress pieces in memory.
-- [x] Recheck staged data on startup.
+- [ ] Recheck staged data on startup.
 
-### Milestone 4: Tracker Client — Done
+### Milestone 4: Tracker Client — Partial
 
-- [x] Implement HTTP tracker announce.
-- [x] Parse compact and non-compact peer lists if practical; compact can be first.
-- [x] Handle announce intervals.
-- [x] Surface tracker errors in torrent status.
+- [x] Build tracker announce paths.
+- [x] Parse compact and dictionary IPv4 peer lists.
+- [ ] Implement real plain-HTTP tracker announces.
+- [ ] Handle announce intervals in the daemon engine.
+- [ ] Surface tracker errors in torrent status.
 
-### Milestone 5: Peer Protocol — Done
+### Milestone 5: Peer Protocol — Partial
 
-- [x] Implement TCP peer handshake.
-- [x] Implement core peer messages: choke, unchoke, interested, not interested, have, bitfield, request, piece, cancel.
-- [x] Maintain per-peer state.
-- [x] Download pieces from peers.
-- [x] Verify completed pieces before marking them available.
+- [x] Implement peer handshake codec.
+- [x] Implement core peer message codecs: choke, unchoke, interested, not interested, have, bitfield, request, piece, cancel.
+- [x] Maintain basic per-peer protocol state.
+- [ ] Implement outbound TCP peer sockets.
+- [ ] Download blocks from peers.
+- [ ] Verify completed pieces before marking them available.
 
-### Milestone 6: Piece Selection and Download Loop — Done
+### Milestone 6: Piece Selection and Download Loop — Partial
 
-- [x] Start with simple rarest-first or sequential selection; prefer correctness over optimization.
-- [x] Avoid duplicate in-flight requests unless recovering from stalled peers.
-- [x] Handle peer disconnects and request timeouts.
-- [x] Complete a torrent when every piece is verified.
+- [x] Start with simple sequential piece selection; prefer correctness over optimization.
+- [x] Avoid duplicate in-flight piece requests in the current scheduler skeleton.
+- [ ] Add peer-aware piece selection.
+- [ ] Add block-level request scheduling.
+- [ ] Handle peer disconnects and request timeouts in the real engine.
+- [ ] Complete a torrent when every piece is verified.
 
-### Milestone 7: Handoff — Done
+### Milestone 7: Handoff — Partial
 
-- [x] Move verified completed content from staging area to final destination.
-- [x] Mark the torrent complete.
-- [x] Stop peer and tracker activity for that torrent.
-- [x] Preserve enough history for `list` / `show` to explain completion.
+- [x] Add helper for final destination paths.
+- [x] Add completion history data structure.
+- [ ] Move verified completed content from staging area to final destination as part of the daemon lifecycle.
+- [ ] Mark the torrent complete.
+- [ ] Stop peer and tracker activity for that torrent.
+- [ ] Persist enough history for `list` / `show` to explain completion after restart.
 
-### Milestone 8: CLI and Daemon Protocol — Done
+### Milestone 8: CLI and Daemon Protocol — Partial
 
-- [x] Implement Unix domain socket server in daemon.
-- [x] Implement JSON request/response protocol.
-- [x] Implement initial CLI commands.
-- [x] Ensure all state changes go through daemon commands.
+- [ ] Implement Unix domain socket server in daemon.
+- [x] Implement initial JSON request/response skeleton.
+- [ ] Replace hand-written JSON parsing with safe JSON handling.
+- [x] Implement initial CLI command parsing.
+- [ ] Implement real CLI socket transport.
+- [ ] Ensure all state changes go through daemon commands.
 
-### Milestone 9: Hardening — Done
+### Milestone 9: Hardening — Planned
 
-- [x] Add integration tests with local fake tracker and fake peers.
-- [x] Test daemon restart and staged-data recheck.
-- [x] Test corrupted piece recovery.
-- [x] Test duplicate torrent add by info hash.
-- [x] Add limits for peers per torrent and active torrents.
+- [ ] Add integration tests with local fake tracker and fake peers.
+- [ ] Test daemon restart and staged-data recheck.
+- [ ] Test corrupted piece recovery.
+- [x] Test duplicate torrent add by info hash at registry unit level.
+- [x] Add registry-level limits for peers per torrent and active torrents.
+- [ ] Enforce peer and active torrent limits in the daemon engine.
 
 ## Decisions
 
 - Target the Zig 0.16.0 release.
+- v2 introduces a TOML daemon configuration file for operational safety limits rather than hiding those limits as hard-coded implementation constants. See `docs/adr/0001-toml-configuration-file.md`.
 
 ## Open Questions
 
 These should be resolved before or during implementation:
 
-1. Should configuration use a file, environment variables, CLI flags, or a combination?
-2. What exact directory layout should the staging area use?
-3. What should `remove` mean for staged data: forget only, delete data, or ask for a mode?
-4. Should completed torrent history persist after handoff?
-5. What level of tracker compatibility is required for the first home-lab replacement?
-6. What observability is required: logs only, status command, metrics endpoint, or all later?
+1. What level of tracker compatibility is required beyond the v2 scope?
+2. What observability is required after v2: logs and status command only, metrics endpoint, or all later?

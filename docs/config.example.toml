@@ -1,0 +1,84 @@
+# Example Nix Torrent daemon configuration for v2.
+#
+# Configuration precedence, from highest to lowest:
+# 1. CLI flags
+# 2. Environment variables
+# 3. This TOML configuration file
+# 4. Built-in defaults
+
+[paths]
+# Client-owned incomplete content directory.
+staging_area = "/var/lib/nix-torrent/staging"
+
+# User-facing completed-content handoff directory.
+final_destination = "/srv/downloads"
+
+# Unix domain socket path for daemon control.
+socket_path = "/run/nix-torrent.sock"
+
+[limits]
+# Maximum size of a peer protocol message accepted from a peer.
+max_peer_message_bytes = 1048576
+
+# Maximum size of a .torrent metadata file accepted by the daemon.
+max_torrent_file_bytes = 16777216
+
+# Maximum total content bytes described by a torrent file.
+max_content_bytes = 1099511627776
+
+# Maximum number of files in a multi-file torrent.
+max_files_per_torrent = 10000
+
+# Maximum number of path components for any torrent file path.
+max_path_depth = 32
+
+# Maximum byte length of a single path component.
+max_path_component_bytes = 255
+
+# Maximum torrent piece length.
+max_piece_bytes = 67108864
+
+# Maximum number of pieces in a torrent.
+max_piece_count = 1000000
+
+# Maximum active torrents managed by the daemon.
+max_active_torrents = 20
+
+# Maximum connected peers per torrent.
+max_peers_per_torrent = 50
+
+# Maximum in-progress pieces per torrent.
+max_in_progress_pieces_per_torrent = 4
+
+# Maximum in-flight block requests per peer.
+max_in_flight_blocks_per_peer = 8
+
+[engine]
+# Size of each BitTorrent block request. The final block in a piece may be shorter.
+block_request_bytes = 16384
+
+[network]
+# Port value reported to trackers. v2 does not listen for inbound peer connections on this port.
+announce_port = 6881
+
+# Timeout for outbound peer TCP connection attempts.
+peer_connect_timeout_ms = 10000
+
+# Timeout for in-flight block requests to a peer.
+peer_request_timeout_ms = 30000
+
+# Timeout for HTTP tracker announce requests.
+tracker_request_timeout_ms = 10000
+
+# Minimum retry delay after a temporary tracker failure.
+tracker_retry_min_ms = 30000
+
+# Maximum retry delay after repeated temporary tracker failures.
+tracker_retry_max_ms = 300000
+
+[logging]
+# Supported v2 levels: "error", "warn", "info", "debug".
+level = "info"
+
+# v2 supports JSON structured logs.
+format = "json"
