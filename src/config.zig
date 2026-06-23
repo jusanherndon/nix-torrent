@@ -130,9 +130,9 @@ fn homeDir(allocator: std.mem.Allocator, environ_map: ?*const std.process.Enviro
 
 test "loads explicit paths from flags" {
     const cfg = try loadFromArgs(std.testing.allocator, &.{
-        "--staging-area", "var/staging",
+        "--staging-area",      "var/staging",
         "--final-destination", "srv/downloads",
-        "--socket-path", "run/nix-torrent.sock",
+        "--socket-path",       "run/nix-torrent.sock",
     });
     defer cfg.deinit(std.testing.allocator);
 

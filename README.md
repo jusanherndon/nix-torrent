@@ -6,15 +6,19 @@ The intended shape is a long-running daemon (`torrentd`) controlled by a CLI (`t
 
 ## Current status
 
-Milestone 1 skeleton:
+Milestones 1 and 2 are implemented:
 
 - Zig package with daemon and CLI executables
 - Basic config loading from environment/defaults
 - Staging area and final destination directory preparation in the daemon
 - JSON-line structured startup logs
 - Nix flake for building on NixOS/Nix systems
+- Bencode parser for integers, byte strings, lists, and dictionaries
+- `.torrent` metadata parser with raw `info` dictionary SHA-1 info-hash calculation
+- Validation for v1 single-file and multi-file torrent metadata
+- Small fixture torrents covered by unit tests
 
-The torrent protocol, persistence, and daemon socket are not implemented yet.
+Persistence, tracker/peer protocol, storage, and the daemon socket are not implemented yet.
 
 ## Build
 
@@ -46,6 +50,20 @@ torrentd \
   --staging-area /var/lib/nix-torrent/staging \
   --final-destination /srv/downloads \
   --socket-path /run/nix-torrent.sock
+```
+
+## Torrent metadata support
+
+Milestone 2 code lives in:
+
+- `src/bencode.zig`
+- `src/torrent.zig`
+- `src/fixtures/*.torrent`
+
+Run metadata and skeleton tests with:
+
+```sh
+zig build test
 ```
 
 ## CLI skeleton

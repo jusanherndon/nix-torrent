@@ -75,22 +75,22 @@ The daemon remains the only writer of torrent state.
 
 ## Suggested Implementation Milestones
 
-### Milestone 1: Project Skeleton
+### Milestone 1: Project Skeleton — Done
 
-- Create Zig package structure.
-- Add daemon executable.
-- Add CLI executable.
-- Add basic config loading for staging area, final destination, and socket path.
-- Add structured logging.
-- Add a .nix file, so this project can be easily built on nixos systems
+- [x] Create Zig package structure.
+- [x] Add daemon executable.
+- [x] Add CLI executable.
+- [x] Add basic config loading for staging area, final destination, and socket path.
+- [x] Add structured logging.
+- [x] Add a .nix file, so this project can be easily built on nixos systems.
 
-### Milestone 2: Torrent Metadata
+### Milestone 2: Torrent Metadata — Done
 
-- Implement bencode parser/encoder as needed.
-- Parse `.torrent` files.
-- Compute info hash from the raw `info` dictionary encoding.
-- Validate single-file and multi-file metadata.
-- Add tests using small fixture torrents.
+- [x] Implement bencode parser/encoder as needed. Current need is parsing only.
+- [x] Parse `.torrent` files.
+- [x] Compute info hash from the raw `info` dictionary encoding.
+- [x] Validate single-file and multi-file metadata.
+- [x] Add tests using small fixture torrents.
 
 ### Milestone 3: Storage Layout and Verification
 
