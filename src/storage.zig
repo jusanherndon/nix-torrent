@@ -10,6 +10,13 @@ pub const Segment = struct {
     length: usize,
 };
 
+pub const PathError = error{
+    ZeroLengthFile,
+    UnsafePath,
+    DuplicatePath,
+    PathCollision,
+};
+
 pub const Layout = struct {
     allocator: std.mem.Allocator,
     file_lengths: []u64,
@@ -89,6 +96,69 @@ pub fn stagingTorrentDir(allocator: std.mem.Allocator, staging_root: []const u8,
     return std.fs.path.join(allocator, &.{ staging_root, &hex });
 }
 
+pub fn validatePaths(allocator: std.mem.Allocator, meta: torrent.Metadata) !void {
+    var files: std.ArrayList([]u8) = .empty;
+    defer {
+        for (files.items) |p| allocator.free(p);
+        files.deinit(allocator);
+    }
+    var dirs: std.ArrayList([]u8) = .empty;
+    defer {
+        for (dirs.items) |p| allocator.free(p);
+        dirs.deinit(allocator);
+    }
+
+    switch (meta.mode) {
+        .single_file => |length| {
+            if (length == 0) return PathError.ZeroLengthFile;
+            try validateComponent(meta.name);
+            if (std.fs.path.isAbsolute(meta.name)) return PathError.UnsafePath;
+        },
+        .multi_file => |items| {
+            for (items) |file| {
+                if (file.length == 0) return PathError.ZeroLengthFile;
+                if (file.path.len == 0) return PathError.UnsafePath;
+                var partial: std.ArrayList([]const u8) = .empty;
+                defer partial.deinit(allocator);
+                for (file.path, 0..) |component, i| {
+                    try validateComponent(component);
+                    try partial.append(allocator, component);
+                    const joined = try std.fs.path.join(allocator, partial.items);
+                    if (i + 1 == file.path.len) {
+                        if (containsPath(dirs.items, joined)) {
+                            allocator.free(joined);
+                            return PathError.PathCollision;
+                        }
+                        if (containsPath(files.items, joined)) {
+                            allocator.free(joined);
+                            return PathError.DuplicatePath;
+                        }
+                        try files.append(allocator, joined);
+                    } else {
+                        if (containsPath(files.items, joined)) {
+                            allocator.free(joined);
+                            return PathError.PathCollision;
+                        }
+                        if (!containsPath(dirs.items, joined)) try dirs.append(allocator, joined) else allocator.free(joined);
+                    }
+                }
+            }
+        },
+    }
+}
+
+fn containsPath(paths: []const []u8, needle: []const u8) bool {
+    for (paths) |path| if (std.mem.eql(u8, path, needle)) return true;
+    return false;
+}
+
+fn validateComponent(component: []const u8) !void {
+    if (component.len == 0) return PathError.UnsafePath;
+    if (std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return PathError.UnsafePath;
+    if (std.mem.indexOfScalar(u8, component, '/') != null) return PathError.UnsafePath;
+    if (std.mem.indexOfScalar(u8, component, '\\') != null) return PathError.UnsafePath;
+}
+
 test "maps multi-file piece spans across file boundaries" {
     const meta_bytes = "d4:infod5:filesld6:lengthi3e4:pathl5:a.txteed6:lengthi5e4:pathl5:b.txteee4:name6:bundle12:piece lengthi4e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
     const meta = try torrent.Metadata.parseBytes(std.testing.allocator, meta_bytes);
@@ -101,6 +171,20 @@ test "maps multi-file piece spans across file boundaries" {
     try std.testing.expectEqual(@as(usize, 2), segments.len);
     try std.testing.expectEqual(@as(usize, 3), segments[0].length);
     try std.testing.expectEqual(@as(usize, 1), segments[1].length);
+}
+
+test "rejects unsafe storage paths" {
+    const meta_bytes = "d4:infod5:filesld6:lengthi1e4:pathl2:..5:a.txteee4:name6:bundle12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+    const meta = try torrent.Metadata.parseBytes(std.testing.allocator, meta_bytes);
+    defer meta.deinit();
+    try std.testing.expectError(PathError.UnsafePath, validatePaths(std.testing.allocator, meta));
+}
+
+test "rejects duplicate storage paths" {
+    const meta_bytes = "d4:infod5:filesld6:lengthi1e4:pathl5:a.txteed6:lengthi1e4:pathl5:a.txteee4:name6:bundle12:piece lengthi1e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
+    const meta = try torrent.Metadata.parseBytes(std.testing.allocator, meta_bytes);
+    defer meta.deinit();
+    try std.testing.expectError(PathError.DuplicatePath, validatePaths(std.testing.allocator, meta));
 }
 
 test "tracks verified missing and in-progress pieces in memory" {

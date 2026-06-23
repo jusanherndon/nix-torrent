@@ -6,19 +6,26 @@ The intended shape is a long-running daemon (`torrentd`) controlled by a CLI (`t
 
 ## Current status
 
-Milestones 1 and 2 are implemented:
+Implemented so far:
 
 - Zig package with daemon and CLI executables
 - Basic config loading from environment/defaults
 - Staging area and final destination directory preparation in the daemon
 - JSON-line structured startup logs
-- Nix flake for building on NixOS/Nix systems
+- Unix-domain-socket control transport between `torrent` and `torrentd`
+- Structured JSON request/response protocol with typed errors
+- Daemon lock and safe stale socket replacement
+- Stable daemon peer ID persisted under the staging area
+- In-memory active torrent registry loaded from per-torrent JSON state
+- `torrent add/list/show/pause/resume/remove/status` control commands
+- Torrent metadata persistence under `<staging>/<info-hash>/metadata.torrent`
+- Storage path safety validation before accepting a torrent
 - Bencode parser for integers, byte strings, lists, and dictionaries
 - `.torrent` metadata parser with raw `info` dictionary SHA-1 info-hash calculation
 - Validation for v1 single-file and multi-file torrent metadata
 - Small fixture torrents covered by unit tests
 
-Persistence, tracker/peer protocol, storage, and the daemon socket are not implemented yet.
+Tracker HTTP I/O, peer TCP I/O, real staged file writes/recheck, the download engine, and handoff are not implemented yet.
 
 ## Build
 
@@ -66,7 +73,7 @@ Run metadata and skeleton tests with:
 zig build test
 ```
 
-## CLI skeleton
+## CLI control surface
 
 ```sh
 torrent add file.torrent
@@ -75,4 +82,7 @@ torrent show <info-hash>
 torrent pause <info-hash>
 torrent resume <info-hash>
 torrent remove <info-hash>
+torrent status
 ```
+
+The CLI sends JSON-line requests to `torrentd` over the configured Unix domain socket and prints the structured JSON response.
