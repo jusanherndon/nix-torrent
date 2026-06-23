@@ -47,7 +47,7 @@ fn jsonString(writer: anytype, value: []const u8) !void {
             '\n' => try writer.writeAll("\\n"),
             '\r' => try writer.writeAll("\\r"),
             '\t' => try writer.writeAll("\\t"),
-            0...0x1f => try writer.print("\\u{x:0>4}", .{byte}),
+            0...8, 11...12, 14...0x1f => try writer.print("\\u{x:0>4}", .{byte}),
             else => try writer.writeByte(byte),
         }
     }
@@ -55,23 +55,23 @@ fn jsonString(writer: anytype, value: []const u8) !void {
 }
 
 test "writes json log event" {
-    var buffer = std.ArrayList(u8).init(std.testing.allocator);
+    var buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer buffer.deinit();
 
-    try event(buffer.writer(), .info, "test", "hello");
+    try event(&buffer.writer, .info, "test", "hello");
     try std.testing.expectEqualStrings(
         "{\"level\":\"info\",\"component\":\"test\",\"message\":\"hello\"}\n",
-        buffer.items,
+        buffer.writer.buffered(),
     );
 }
 
 test "escapes json strings" {
-    var buffer = std.ArrayList(u8).init(std.testing.allocator);
+    var buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer buffer.deinit();
 
-    try event(buffer.writer(), .warn, "quote", "a \"thing\"");
+    try event(&buffer.writer, .warn, "quote", "a \"thing\"");
     try std.testing.expectEqualStrings(
         "{\"level\":\"warn\",\"component\":\"quote\",\"message\":\"a \\\"thing\\\"\"}\n",
-        buffer.items,
+        buffer.writer.buffered(),
     );
 }

@@ -6,30 +6,38 @@ pub fn build(b: *std.Build) void {
 
     const daemon = b.addExecutable(.{
         .name = "torrentd",
-        .root_source_file = b.path("src/daemon.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/daemon.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
     b.installArtifact(daemon);
 
     const cli = b.addExecutable(.{
         .name = "torrent",
-        .root_source_file = b.path("src/cli.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cli.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
     b.installArtifact(cli);
 
     const config_tests = b.addTest(.{
-        .root_source_file = b.path("src/config.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/config.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
 
     const log_tests = b.addTest(.{
-        .root_source_file = b.path("src/log.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/log.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
 
     const test_step = b.step("test", "Run unit tests");

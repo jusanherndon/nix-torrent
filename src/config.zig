@@ -17,17 +17,20 @@ pub const ConfigError = error{
     UnknownFlag,
 };
 
-pub fn load(allocator: std.mem.Allocator) !Config {
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-    return loadFromArgs(allocator, args[1..]);
+pub fn load(allocator: std.mem.Allocator, process_args: std.process.Args, environ_map: *const std.process.Environ.Map) !Config {
+    const args = try process_args.toSlice(allocator);
+    return loadFromArgsWithEnv(allocator, args[1..], environ_map);
 }
 
 pub fn loadFromArgs(allocator: std.mem.Allocator, args: []const []const u8) !Config {
+    return loadFromArgsWithEnv(allocator, args, null);
+}
+
+pub fn loadFromArgsWithEnv(allocator: std.mem.Allocator, args: []const []const u8, environ_map: ?*const std.process.Environ.Map) !Config {
     var config = Config{
-        .staging_area = try envOrDefaultPath(allocator, "NIX_TORRENT_STAGING_AREA", &.{ "nix-torrent", "staging" }, .state),
-        .final_destination = try envOrDefaultPath(allocator, "NIX_TORRENT_FINAL_DESTINATION", &.{ "Downloads", "nix-torrent" }, .home),
-        .socket_path = try envOrDefaultPath(allocator, "NIX_TORRENT_SOCKET_PATH", &.{"nix-torrent.sock"}, .runtime),
+        .staging_area = try envOrDefaultPath(allocator, environ_map, "NIX_TORRENT_STAGING_AREA", &.{ "nix-torrent", "staging" }, .state),
+        .final_destination = try envOrDefaultPath(allocator, environ_map, "NIX_TORRENT_FINAL_DESTINATION", &.{ "Downloads", "nix-torrent" }, .home),
+        .socket_path = try envOrDefaultPath(allocator, environ_map, "NIX_TORRENT_SOCKET_PATH", &.{"nix-torrent.sock"}, .runtime),
     };
     errdefer config.deinit(allocator);
 
@@ -82,15 +85,12 @@ fn replaceValue(allocator: std.mem.Allocator, old_value: []const u8, new_value: 
 
 const Base = enum { home, state, runtime };
 
-fn envOrDefaultPath(allocator: std.mem.Allocator, env_name: []const u8, tail: []const []const u8, base: Base) ![]const u8 {
-    if (std.process.getEnvVarOwned(allocator, env_name)) |value| {
-        return value;
-    } else |err| switch (err) {
-        error.EnvironmentVariableNotFound => {},
-        else => return err,
+fn envOrDefaultPath(allocator: std.mem.Allocator, environ_map: ?*const std.process.Environ.Map, env_name: []const u8, tail: []const []const u8, base: Base) ![]const u8 {
+    if (environ_map) |map| {
+        if (map.get(env_name)) |value| return allocator.dupe(u8, value);
     }
 
-    const root = try defaultRoot(allocator, base);
+    const root = try defaultRoot(allocator, environ_map, base);
     defer allocator.free(root);
 
     var parts = try allocator.alloc([]const u8, tail.len + 1);
@@ -101,38 +101,31 @@ fn envOrDefaultPath(allocator: std.mem.Allocator, env_name: []const u8, tail: []
     return std.fs.path.join(allocator, parts);
 }
 
-fn defaultRoot(allocator: std.mem.Allocator, base: Base) ![]const u8 {
+fn defaultRoot(allocator: std.mem.Allocator, environ_map: ?*const std.process.Environ.Map, base: Base) ![]const u8 {
     switch (base) {
         .runtime => {
-            if (std.process.getEnvVarOwned(allocator, "XDG_RUNTIME_DIR")) |value| {
-                return value;
-            } else |err| switch (err) {
-                error.EnvironmentVariableNotFound => return allocator.dupe(u8, "/tmp"),
-                else => return err,
+            if (environ_map) |map| {
+                if (map.get("XDG_RUNTIME_DIR")) |value| return allocator.dupe(u8, value);
             }
+            return allocator.dupe(u8, "/tmp");
         },
         .state => {
-            if (std.process.getEnvVarOwned(allocator, "XDG_STATE_HOME")) |value| {
-                return value;
-            } else |err| switch (err) {
-                error.EnvironmentVariableNotFound => {},
-                else => return err,
+            if (environ_map) |map| {
+                if (map.get("XDG_STATE_HOME")) |value| return allocator.dupe(u8, value);
             }
-            const home = try homeDir(allocator);
+            const home = try homeDir(allocator, environ_map);
             defer allocator.free(home);
             return std.fs.path.join(allocator, &.{ home, ".local", "state" });
         },
-        .home => return homeDir(allocator),
+        .home => return homeDir(allocator, environ_map),
     }
 }
 
-fn homeDir(allocator: std.mem.Allocator) ![]const u8 {
-    if (std.process.getEnvVarOwned(allocator, "HOME")) |value| {
-        return value;
-    } else |err| switch (err) {
-        error.EnvironmentVariableNotFound => return allocator.dupe(u8, "."),
-        else => return err,
+fn homeDir(allocator: std.mem.Allocator, environ_map: ?*const std.process.Environ.Map) ![]const u8 {
+    if (environ_map) |map| {
+        if (map.get("HOME")) |value| return allocator.dupe(u8, value);
     }
+    return allocator.dupe(u8, ".");
 }
 
 test "loads explicit paths from flags" {

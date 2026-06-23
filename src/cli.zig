@@ -3,21 +3,22 @@ const std = @import("std");
 const config = @import("config.zig");
 const log = @import("log.zig");
 
-const Command = enum { add, list, show, pause, resume, remove, help };
+const Command = enum { add, list, show, pause, @"resume", remove, help };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
-    const stdout = std.io.getStdOut().writer();
-    const stderr = std.io.getStdErr().writer();
+    var stdout_buffer: [1024]u8 = undefined;
+    var stderr_buffer: [1024]u8 = undefined;
+    var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+    var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
+    const stdout = &stdout_writer.interface;
+    const stderr = &stderr_writer.interface;
 
     if (args.len < 2 or std.mem.eql(u8, args[1], "help") or std.mem.eql(u8, args[1], "--help")) {
         try usage(stdout);
+        try stdout.flush();
         return;
     }
 
@@ -26,9 +27,10 @@ pub fn main() !void {
         return error.UnknownCommand;
     };
 
-    const cfg = config.loadFromArgs(allocator, &.{}) catch |err| switch (err) {
+    const cfg = config.loadFromArgsWithEnv(allocator, &.{}, init.environ_map) catch |err| switch (err) {
         error.UnknownFlag, error.MissingFlagValue => {
             try config.usage("torrent", stderr);
+            try stderr.flush();
             return err;
         },
         else => return err,
@@ -38,9 +40,9 @@ pub fn main() !void {
     try log.configEvent(stderr, "cli", cfg.staging_area, cfg.final_destination, cfg.socket_path);
 
     switch (command) {
-        .add => try requireArity(args, 3, "add <torrent-file>"),
-        .show, .pause, .resume, .remove => try requireArity(args, 3, "<command> <info-hash>"),
-        .list => try requireArity(args, 2, "list"),
+        .add => try requireArity(stderr, args, 3, "add <torrent-file>"),
+        .show, .pause, .@"resume", .remove => try requireArity(stderr, args, 3, "<command> <info-hash>"),
+        .list => try requireArity(stderr, args, 2, "list"),
         .help => unreachable,
     }
 
@@ -48,6 +50,8 @@ pub fn main() !void {
         "torrent CLI skeleton: would send '{s}' to daemon socket {s}\n",
         .{ args[1], cfg.socket_path },
     );
+    try stdout.flush();
+    try stderr.flush();
 }
 
 fn parseCommand(value: []const u8) ?Command {
@@ -55,16 +59,16 @@ fn parseCommand(value: []const u8) ?Command {
     if (std.mem.eql(u8, value, "list")) return .list;
     if (std.mem.eql(u8, value, "show")) return .show;
     if (std.mem.eql(u8, value, "pause")) return .pause;
-    if (std.mem.eql(u8, value, "resume")) return .resume;
+    if (std.mem.eql(u8, value, "resume")) return .@"resume";
     if (std.mem.eql(u8, value, "remove")) return .remove;
     if (std.mem.eql(u8, value, "help")) return .help;
     return null;
 }
 
-fn requireArity(args: []const []const u8, expected: usize, shape: []const u8) !void {
+fn requireArity(stderr: anytype, args: []const []const u8, expected: usize, shape: []const u8) !void {
     if (args.len == expected) return;
-    const stderr = std.io.getStdErr().writer();
     try stderr.print("expected: torrent {s}\n", .{shape});
+    try stderr.flush();
     return error.InvalidArguments;
 }
 
