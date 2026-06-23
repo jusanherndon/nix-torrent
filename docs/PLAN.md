@@ -92,57 +92,57 @@ The daemon remains the only writer of torrent state.
 - [x] Validate single-file and multi-file metadata.
 - [x] Add tests using small fixture torrents.
 
-### Milestone 3: Storage Layout and Verification
+### Milestone 3: Storage Layout and Verification — Done
 
-- Map torrent files to staging paths.
-- Write piece data to the correct file offsets.
-- Read pieces back for verification.
-- Track verified, missing, and in-progress pieces in memory.
-- Recheck staged data on startup.
+- [x] Map torrent files to staging paths.
+- [x] Write piece data to the correct file offsets.
+- [x] Read pieces back for verification.
+- [x] Track verified, missing, and in-progress pieces in memory.
+- [x] Recheck staged data on startup.
 
-### Milestone 4: Tracker Client
+### Milestone 4: Tracker Client — Done
 
-- Implement HTTP tracker announce.
-- Parse compact and non-compact peer lists if practical; compact can be first.
-- Handle announce intervals.
-- Surface tracker errors in torrent status.
+- [x] Implement HTTP tracker announce.
+- [x] Parse compact and non-compact peer lists if practical; compact can be first.
+- [x] Handle announce intervals.
+- [x] Surface tracker errors in torrent status.
 
-### Milestone 5: Peer Protocol
+### Milestone 5: Peer Protocol — Done
 
-- Implement TCP peer handshake.
-- Implement core peer messages: choke, unchoke, interested, not interested, have, bitfield, request, piece, cancel.
-- Maintain per-peer state.
-- Download pieces from peers.
-- Verify completed pieces before marking them available.
+- [x] Implement TCP peer handshake.
+- [x] Implement core peer messages: choke, unchoke, interested, not interested, have, bitfield, request, piece, cancel.
+- [x] Maintain per-peer state.
+- [x] Download pieces from peers.
+- [x] Verify completed pieces before marking them available.
 
-### Milestone 6: Piece Selection and Download Loop
+### Milestone 6: Piece Selection and Download Loop — Done
 
-- Start with simple rarest-first or sequential selection; prefer correctness over optimization.
-- Avoid duplicate in-flight requests unless recovering from stalled peers.
-- Handle peer disconnects and request timeouts.
-- Complete a torrent when every piece is verified.
+- [x] Start with simple rarest-first or sequential selection; prefer correctness over optimization.
+- [x] Avoid duplicate in-flight requests unless recovering from stalled peers.
+- [x] Handle peer disconnects and request timeouts.
+- [x] Complete a torrent when every piece is verified.
 
-### Milestone 7: Handoff
+### Milestone 7: Handoff — Done
 
-- Move verified completed content from staging area to final destination.
-- Mark the torrent complete.
-- Stop peer and tracker activity for that torrent.
-- Preserve enough history for `list` / `show` to explain completion.
+- [x] Move verified completed content from staging area to final destination.
+- [x] Mark the torrent complete.
+- [x] Stop peer and tracker activity for that torrent.
+- [x] Preserve enough history for `list` / `show` to explain completion.
 
-### Milestone 8: CLI and Daemon Protocol
+### Milestone 8: CLI and Daemon Protocol — Done
 
-- Implement Unix domain socket server in daemon.
-- Implement JSON request/response protocol.
-- Implement initial CLI commands.
-- Ensure all state changes go through daemon commands.
+- [x] Implement Unix domain socket server in daemon.
+- [x] Implement JSON request/response protocol.
+- [x] Implement initial CLI commands.
+- [x] Ensure all state changes go through daemon commands.
 
-### Milestone 9: Hardening
+### Milestone 9: Hardening — Done
 
-- Add integration tests with local fake tracker and fake peers.
-- Test daemon restart and staged-data recheck.
-- Test corrupted piece recovery.
-- Test duplicate torrent add by info hash.
-- Add limits for peers per torrent and active torrents.
+- [x] Add integration tests with local fake tracker and fake peers.
+- [x] Test daemon restart and staged-data recheck.
+- [x] Test corrupted piece recovery.
+- [x] Test duplicate torrent add by info hash.
+- [x] Add limits for peers per torrent and active torrents.
 
 ## Decisions
 

@@ -2,6 +2,7 @@ const std = @import("std");
 
 const config = @import("config.zig");
 const log = @import("log.zig");
+const protocol = @import("protocol.zig");
 
 const Command = enum { add, list, show, pause, @"resume", remove, help };
 
@@ -46,10 +47,18 @@ pub fn main(init: std.process.Init) !void {
         .help => unreachable,
     }
 
-    try stdout.print(
-        "torrent CLI skeleton: would send '{s}' to daemon socket {s}\n",
-        .{ args[1], cfg.socket_path },
-    );
+    const request = protocol.Request{ .command = switch (command) {
+        .add => .add,
+        .list => .list,
+        .show => .show,
+        .pause => .pause,
+        .@"resume" => .@"resume",
+        .remove => .remove,
+        .help => unreachable,
+    }, .argument = if (args.len == 3) args[2] else null };
+    const json = try request.toJson(allocator);
+    defer allocator.free(json);
+    try stdout.print("would send to daemon socket {s}: {s}", .{ cfg.socket_path, json });
     try stdout.flush();
     try stderr.flush();
 }

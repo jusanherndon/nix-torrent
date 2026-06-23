@@ -56,9 +56,72 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const storage_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/storage.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const tracker_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tracker.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const peer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/peer.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const engine_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/engine.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const handoff_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/handoff.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const protocol_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/protocol.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const state_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/state.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(config_tests).step);
     test_step.dependOn(&b.addRunArtifact(log_tests).step);
     test_step.dependOn(&b.addRunArtifact(bencode_tests).step);
     test_step.dependOn(&b.addRunArtifact(torrent_tests).step);
+    test_step.dependOn(&b.addRunArtifact(storage_tests).step);
+    test_step.dependOn(&b.addRunArtifact(tracker_tests).step);
+    test_step.dependOn(&b.addRunArtifact(peer_tests).step);
+    test_step.dependOn(&b.addRunArtifact(engine_tests).step);
+    test_step.dependOn(&b.addRunArtifact(handoff_tests).step);
+    test_step.dependOn(&b.addRunArtifact(protocol_tests).step);
+    test_step.dependOn(&b.addRunArtifact(state_tests).step);
 }
