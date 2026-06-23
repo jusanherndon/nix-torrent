@@ -17,8 +17,11 @@ pub const ConfigError = error{
     UnknownFlag,
 };
 
-pub fn load(allocator: std.mem.Allocator, process_args: std.process.Args, environ_map: *const std.process.Environ.Map) !Config {
-    const args = try process_args.toSlice(allocator);
+pub fn load(allocator: std.mem.Allocator, process_args: std.process.Args, environ_map: ?*const std.process.Environ.Map) !Config {
+    var args_arena = std.heap.ArenaAllocator.init(allocator);
+    defer args_arena.deinit();
+
+    const args = try process_args.toSlice(args_arena.allocator());
     return loadFromArgsWithEnv(allocator, args[1..], environ_map);
 }
 
@@ -126,6 +129,16 @@ fn homeDir(allocator: std.mem.Allocator, environ_map: ?*const std.process.Enviro
         if (map.get("HOME")) |value| return allocator.dupe(u8, value);
     }
     return allocator.dupe(u8, ".");
+}
+
+test "load frees process argument slice" {
+    const argv = [_][*:0]const u8{ "torrentd", "--socket-path", "sock" };
+    const process_args = std.process.Args{ .vector = &argv };
+
+    const cfg = try load(std.testing.allocator, process_args, null);
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("sock", cfg.socket_path);
 }
 
 test "loads explicit paths from flags" {
