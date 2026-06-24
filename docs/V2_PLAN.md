@@ -64,7 +64,7 @@ torrent remove <info-hash>
 torrent status
 ```
 
-For v2, `remove` applies to active, paused, or failed torrents only. It means forget only: stop daemon activity and remove the torrent from the active daemon registry, but preserve the whole `<staging>/<info-hash>/` directory, including `metadata.torrent` and `content/`. Re-adding the same torrent computes the info hash from the provided torrent file, re-adopts the existing staged content directory if present, and rechecks it before downloading. Completed history is not removed by `remove` in v2.
+For v2, `remove` applies to active, paused, or failed torrents only. It means forget only: stop daemon activity and remove the torrent from the active daemon registry. The daemon deletes `<staging>/<info-hash>/state.json`, but preserves `<staging>/<info-hash>/metadata.torrent` and `<staging>/<info-hash>/content/`. Re-adding the same torrent computes the info hash from the provided torrent file, re-adopts the existing staged content directory if present, writes fresh metadata and active `state.json`, and rechecks staged content before downloading. Completed history is immutable and is not removed by `remove` in v2. If `pause`, `resume`, or `remove <info-hash>` targets completed history, return `already_completed` with a clear message such as `completed torrents cannot be paused, resumed, or removed in v2`. Return `not_found` only when an info hash is in neither active state nor completed history.
 
 ### Acceptance Criteria
 
@@ -95,7 +95,7 @@ Suggested response examples:
 - active torrent count
 - safe configured limit summary, not a raw dump of all config values
 
-`list` should return enough progress information for a control surface summary:
+`list` should return enough progress information for a control surface summary. It should include active daemon sessions and completed torrent history. Completed-history rows should use lifecycle status `complete`, verified bytes equal to total bytes, connected peer count `0`, and final path when known.
 
 - info hash
 - name
@@ -104,7 +104,7 @@ Suggested response examples:
 - total bytes
 - connected peer count
 
-`show` should include the summary fields plus detailed torrent status:
+`show` should first look up active daemon sessions, then completed torrent history. Active-session responses should include the summary fields plus detailed torrent status:
 
 - piece count
 - verified piece count
@@ -113,6 +113,8 @@ Suggested response examples:
 - tracker status or error
 - next announce time, when known
 - final path, when complete
+
+Completed-history responses should include info hash, name, lifecycle status `complete`, verified bytes equal to total bytes, total bytes, connected peer count `0`, final path, and completion time. They should not report live tracker or peer activity.
 
 v2 does not need download/upload rate accounting.
 
@@ -209,12 +211,14 @@ If `XDG_CONFIG_HOME` is unset, use:
 ~/.config/nix-torrent/config.toml
 ```
 
-Both daemon and CLI should accept an explicit config path:
+Both daemon and CLI should accept an explicit config path as the only runtime override:
 
 ```sh
 torrentd --config /path/to/config.toml
 torrent --config /path/to/config.toml list
 ```
+
+Configuration values should live in the TOML file. v2 removes the legacy path flags and environment-variable configuration surface, including `--staging-area`, `--final-destination`, `--socket-path`, `NIX_TORRENT_STAGING_AREA`, `NIX_TORRENT_FINAL_DESTINATION`, and `NIX_TORRENT_SOCKET_PATH`. These legacy flags and environment variables are silently ignored and should not appear in help text. The only supported flag that changes configuration loading is `--config`.
 
 The daemon should support config validation without starting the service:
 
@@ -229,12 +233,13 @@ The CLI should read configuration only to resolve daemon connection settings, es
 
 Configuration precedence, from highest to lowest:
 
-1. CLI flags
-2. Environment variables
-3. TOML configuration file
-4. Built-in defaults
+1. Explicit TOML configuration file selected with `--config`
+2. Default TOML configuration file
+3. Built-in defaults
 
-If the default configuration file path is missing, the daemon and CLI should continue with environment values and built-in defaults. If `--config /path/to/config.toml` is provided and that file is missing or unreadable, startup should fail with a clear configuration error.
+Individual configuration values are not overridden by CLI flags or environment variables in v2.
+
+If the default configuration file path is missing, the daemon and CLI should continue with built-in defaults. If `--config /path/to/config.toml` is provided and that file is missing or unreadable, startup should fail with a clear configuration error.
 
 The daemon may still have documented built-in defaults, but every safety limit above must be overrideable from the TOML configuration file. Engine, network, and logging behavior tunables, such as block request size, peer timeouts, tracker retry backoff, and log level, should also be exposed in the TOML configuration file rather than hidden in code.
 
@@ -246,8 +251,8 @@ Configuration acceptance criteria:
 - Missing default config file uses environment values and built-in defaults.
 - Missing or unreadable explicit `--config` fails with a clear error.
 - Config file values are loaded correctly.
-- Environment variables override config file values.
-- CLI flags override environment and config file values.
+- Legacy path flags and environment variables are silently ignored, do not appear in help text, and do not override config file values.
+- `--config` selects the configuration file for both daemon and CLI.
 - CLI config loading only needs to resolve the daemon socket path.
 
 ### Daemon State
@@ -272,12 +277,18 @@ TorrentSession {
 - Keep all torrent state inside the daemon.
 - Add active torrent sessions keyed by info hash.
 - Persist a small lifecycle status: `active`, `paused`, `complete`, or `failed`.
+- Use `failed` only for daemon-recoverable torrent-local failures, such as handoff destination conflicts or errors, storage write/read/recheck errors for that torrent, or persistent metadata/state corruption for that torrent.
+- Do not mark a torrent `failed` for temporary tracker errors, tracker retry backoff, peer disconnects, bad peer data, or peer request timeouts; keep it `active` and surface the latest runtime error and retry timing in `show`.
 - Expose richer derived activity in `show`, such as `rechecking`, `announcing`, `connecting`, `downloading`, `waiting_for_peers`, or `handing_off`.
 - Reject torrents at add time when they do not contain a usable top-level `http://` tracker `announce` URL.
+- Validate torrent metadata and safety limits at add time before accepting a torrent.
+- On daemon startup, re-validate every active torrent's persisted `metadata.torrent` against the current config. If an active torrent violates the current configured limits, keep the torrent in daemon state as `failed` with a clear config/metadata limit failure reason rather than starting tracker, peer, storage, or download work for it.
 - Accept private torrents when their top-level tracker `announce` URL is otherwise supported; v2 does not use DHT or peer exchange.
 - Persist enough state to resume after restart, including whether a torrent is paused.
 - Persist daemon-owned JSON state with atomic write-then-rename updates.
 - Persist completed torrent history after handoff.
+- After completion history is durably persisted, delete the active per-torrent `state.json` so completed torrents are sourced from `history.json` only.
+- Serve completed torrent history through `list` and `show <info-hash>` after the active daemon session has ended.
 - Acquire an exclusive daemon lock under the staging area, such as `<staging>/daemon.lock`, before loading or mutating daemon state.
 - Store original torrent metadata under staging.
 - Recheck staged data on daemon startup instead of trusting detailed piece state.
@@ -294,6 +305,8 @@ Suggested staging layout:
 <staging>/<info-hash>/content/...
 ```
 
+`history.json` is the daemon-owned source for completed torrents after handoff. It contains at most one immutable completion record per info hash. After handoff succeeds and completion history is durably persisted, the daemon removes the active per-torrent `state.json`. Completed torrents are not loaded as active sessions on restart, but `list` and `show <info-hash>` should still resolve them from completion history. Duplicate info hashes in `history.json` indicate daemon-owned state corruption and should fail startup with a clear state/configuration error rather than being merged or guessed. If the same info hash appears in both active per-torrent `state.json` and completed `history.json` at startup, the daemon should fail startup with a clear state corruption error; v2 must not guess whether to resume or treat it as completed.
+
 The daemon should generate `client-peer-id` once and reuse it across restarts. A suggested peer ID format is `-NT0002-` followed by 12 random bytes. TOML is for user-editable configuration; daemon-owned state and completion history should be persisted as JSON. State, history, and initial peer ID writes should use atomic write-then-rename updates where practical.
 
 #### Acceptance Criteria
@@ -303,12 +316,17 @@ The daemon should generate `client-peer-id` once and reuse it across restarts. A
 - The daemon persists and reuses a stable peer ID across restarts.
 - Restarting `torrentd` preserves added torrents.
 - Restarting `torrentd` preserves completed torrent history.
+- Duplicate info hashes in `history.json` fail daemon startup with a clear state/configuration error.
+- The same info hash appearing in both active state and completed history fails daemon startup with a clear state corruption error.
 - A crash during state update does not leave partially written JSON as the only state copy.
 - Duplicate active adds by info hash are rejected.
-- Adding a torrent whose info hash is already in completed history is rejected with a clear `already_completed` error.
+- Adding a torrent whose staging directory already exists without active state and without completed history re-adopts that staging directory, preserves `content/`, writes fresh `metadata.torrent` from the provided torrent file, creates fresh active state, and rechecks staged content.
+- If an existing staged `metadata.torrent` parses to an info hash that does not match its staging directory name, daemon startup or re-adoption fails with a clear state corruption error.
+- Adding a torrent whose info hash is already in completed history is rejected with a clear `already_completed` error before inspecting or mutating that torrent's staging directory.
 - Torrents with missing, invalid, `https://`, `udp://`, or only `announce-list` tracker metadata are rejected at add time with a clear error and no daemon session is created.
+- Existing active torrents are revalidated against current config on daemon startup; torrents that now violate limits become `failed` with a clear reason and do not start network or storage work.
 - Private torrents with supported plain-HTTP top-level tracker metadata are accepted.
-- `list` and `show` reflect daemon-owned state.
+- `list` and `show` reflect daemon-owned active state and completed history.
 - `show` reports both persisted lifecycle status and current derived activity when applicable.
 - Paused torrents remain paused after daemon restart.
 
@@ -328,7 +346,8 @@ Current storage code maps piece spans to files. v2 should perform actual staged 
   - reject file/directory path collisions
   - reject unsafe single-file torrent names
 - Create the staging file tree from torrent metadata.
-- Pre-create files or sparse files.
+- Pre-create staged files at their final lengths using sparse-file truncation where the filesystem supports it.
+- Do not manually write zeroes to allocate content; if the filesystem stores truncated files non-sparsely, that filesystem behavior is acceptable.
 - Write only hash-verified complete pieces to staged files.
 - Keep in-progress piece blocks in memory until the complete piece can be verified.
 - Write verified pieces to the correct file offsets.
@@ -339,6 +358,7 @@ Current storage code maps piece spans to files. v2 should perform actual staged 
 ### Acceptance Criteria
 
 - Unsafe torrent paths are rejected before any staged file is created.
+- Staged files are created at their final lengths before verified-piece writes begin.
 - Single-file verified-piece writes land at correct offsets.
 - Multi-file verified-piece writes can span file boundaries.
 - Unverified peer data is not written to staged files.
@@ -354,7 +374,11 @@ Current tracker code can build announce paths and parse responses. v2 should per
 - Parse the top-level tracker `announce` URL from torrent metadata.
 - Accept `http://` tracker URLs only.
 - Reject `https://` and other tracker URL schemes at add time with a clear unsupported-tracker-scheme error.
+- Store the original top-level tracker `announce` URL exactly as it appears in metadata.
+- Parse the announce URL into scheme, host, optional port, path, and existing query before sending announces.
 - Preserve tracker URL paths and existing query parameters, including passkeys embedded in the announce URL.
+- Append BitTorrent announce parameters with `?` when the announce URL has no existing query string and with `&` when it already has one.
+- Reject malformed host or port values at add time when they can be detected from metadata; otherwise surface URL/connectivity problems as tracker errors before the first announce.
 - Do not implement tracker cookies, custom headers, or redirect handling in v2.
 - Ignore or explicitly report unsupported `announce-list` multi-tracker metadata for v2.
 - Send HTTP GET announces.
@@ -379,7 +403,7 @@ Current tracker code can build announce paths and parse responses. v2 should per
 ### Acceptance Criteria
 
 - A fake local HTTP tracker can return compact IPv4 peers to the daemon.
-- Announce URLs with existing query parameters are preserved and extended correctly.
+- Announce URLs with existing query parameters are preserved and extended correctly using `&`, while URLs without query parameters use `?`.
 - Dictionary IPv4 peer responses are covered by parser tests.
 - The daemon schedules the next announce from the tracker interval.
 - Tracker failure does not crash the daemon.
@@ -425,7 +449,7 @@ PeerConnection {
   - `keepalive`
 - Track peer `interested` / `not interested` state if received, but do not upload data in v2.
 - Keep our side choking peers.
-- Ignore peer `request` messages or close the connection if a peer requires upload behavior.
+- Close the peer connection cleanly if the peer sends a `request` message; v2 never uploads and keeps our side choking.
 - Handle disconnects cleanly.
 
 ### Acceptance Criteria
@@ -435,12 +459,12 @@ PeerConnection {
 - `bitfield` and `have` update peer availability.
 - Peer disconnect does not crash the daemon.
 - Malformed or oversized peer messages close only that peer connection.
-- Peer `request` messages do not cause uploads in v2.
+- Peer `request` messages close only that peer connection and do not cause uploads in v2.
 - Unknown or extension peer messages are ignored or cause a clean peer disconnect; v2 does not advertise extension support.
 
 ## Milestone 6: Download Engine
 
-Implement a single coordinator loop that manages torrent sessions, trackers, peers, storage, and piece scheduling. Network sockets should be event-driven/nonblocking where practical. v2 may perform bounded disk reads/writes and SHA-1 piece verification inline in the coordinator loop; worker threads are deferred unless tests show the daemon becomes unusable.
+Implement a single coordinator loop that manages torrent sessions, trackers, peers, storage, and piece scheduling. Network sockets should be event-driven/nonblocking where practical. v2 may perform bounded disk reads/writes and SHA-1 piece verification inline in the coordinator loop. Worker threads are deferred unless integration tests show `torrent status` cannot respond within 500ms during active fake-peer downloads with default v2 limits.
 
 v2 pause semantics are persistent hard pause: paused torrents close peer connections, stop scheduling work, stop tracker activity after a best-effort `stopped` announce, and remain paused across daemon restarts.
 
@@ -458,8 +482,8 @@ v2 pause semantics are persistent hard pause: paused torrents close peer connect
 - Recover timed-out requests.
 - Stop work when a torrent completes.
 - On pause, drop in-memory in-flight block and partial-piece state, close peer connections for that torrent, and stop scheduling new tracker or peer work.
-- On resume, recheck staged data before scheduling new tracker or peer work. If the torrent was `failed`, clear the runtime error and retry after recheck; if the underlying problem remains, it may fail again.
-- On remove, stop tracker and peer activity, forget the torrent from the active registry, and preserve the whole per-torrent staging directory on disk.
+- On resume, re-read metadata and validate it against the current config before scheduling tracker, peer, storage, or download work. Then recheck staged data. If the torrent was `failed`, clear the recorded torrent-local failure only after current metadata/config validation passes, then retry the failed phase. If all pieces verify, retry handoff; otherwise download missing pieces. If the underlying problem remains, including still-violated config limits, it stays or becomes `failed` again with the current failure reason.
+- On remove, stop tracker and peer activity, forget the torrent from the active registry, delete the per-torrent `state.json`, and preserve the per-torrent `metadata.torrent` and `content/` staging data on disk.
 
 ### Initial Strategy
 
@@ -490,9 +514,10 @@ Prefer correctness over optimization:
 - Pausing a torrent closes its peer connections and survives daemon restart.
 - Resuming a paused or failed torrent rechecks staged data before downloading or retrying handoff.
 - Removing an active, paused, or failed torrent preserves `metadata.torrent` and staged content and allows later re-add/recheck by info hash.
+- `pause`, `resume`, and `remove` return `already_completed` when asked to operate on a completed-history torrent.
 - `remove` does not delete completed history in v2.
 - Completion changes torrent status to `complete`.
-- Inline hash and disk work is bounded by active piece limits and does not make the daemon unusable in integration tests.
+- Inline hash and disk work is bounded by active piece limits. During active fake-peer downloads with default v2 limits, `torrent status` over the Unix socket responds within 500ms in integration tests.
 
 ## Milestone 7: Handoff
 
@@ -507,7 +532,7 @@ When all pieces are verified, the daemon should finish ownership of the torrent 
   - single-file torrents move to `<final_destination>/<name>`
   - multi-file torrents move to `<final_destination>/<name>/...paths...`
 - Do not overwrite existing final destination paths; record a recoverable handoff error instead.
-- On handoff failure, preserve staged verified content, persist lifecycle status as `failed`, and report a `handoff_failed` error in `show`.
+- On handoff failure, preserve staged verified content, persist lifecycle status as `failed`, record the handoff failure as the torrent-local failure reason, and report a `handoff_failed` error in `show`.
 - Allow `resume <info-hash>` to recheck verified staged content and retry handoff.
 - Record persistent completion history with info hash, name, final path, completion time, and total bytes only after handoff succeeds.
 - Keep `list` and `show` useful after handoff and daemon restart.
@@ -520,9 +545,11 @@ When all pieces are verified, the daemon should finish ownership of the torrent 
 - Existing final destination paths are not overwritten.
 - Handoff failure preserves staged content and can be retried with `resume`.
 - Daemon no longer downloads completed torrents.
-- Re-adding a completed torrent is rejected unless a future explicit re-download mode is added.
+- Re-adding a completed torrent is rejected before staging inspection or mutation unless a future explicit re-download mode is added.
+- Completion history has at most one immutable record per info hash.
 - `torrent list` shows completed history.
 - Completed history survives daemon restart.
+- Completed torrents are not reloaded as active sessions after restart.
 
 ## Milestone 8: Integration Test Harness
 
@@ -563,11 +590,9 @@ Build controlled local components to test the daemon without relying on public t
 v2 is done when this workflow succeeds:
 
 ```sh
-torrentd --staging-area /tmp/nix-torrent/staging \
-         --final-destination /tmp/nix-torrent/done \
-         --socket-path /tmp/nix-torrent.sock
+torrentd --config /tmp/nix-torrent/config.toml
 
-torrent add ./some-single-file.torrent
+torrent --config /tmp/nix-torrent/config.toml add ./some-single-file.torrent
 torrent list
 torrent show <info-hash>
 ```
