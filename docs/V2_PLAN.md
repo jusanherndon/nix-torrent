@@ -17,7 +17,7 @@ The v2 daemon should:
 Current implementation progress:
 
 - Milestone 1 transport is implemented: daemon Unix socket, CLI client, JSON-line protocol, structured errors, stale socket handling, and controlled SIGINT/SIGTERM socket cleanup.
-- Milestone 2 is partially implemented: active torrent registry, stable peer ID, metadata/state persistence, tracker metadata validation for top-level `http://` announces, and daemon-owned `add/list/show/pause/resume/remove/status` state transitions. TOML configuration, completed history, and startup recheck are still pending.
+- Milestone 2 is partially implemented: active torrent registry, stable peer ID, metadata/state persistence, TOML configuration loading/validation, tracker metadata validation for top-level `http://` announces, and daemon-owned `add/list/show/pause/resume/remove/status` state transitions. Completed history and startup recheck are still pending.
 - Milestone 3 is partially implemented: storage span mapping and torrent path safety validation are covered by unit tests and `add` rejects unsafe paths before staging metadata. Actual staged file precreation, piece writes, and recheck are still pending.
 - Milestones 4-8 are still pending except for existing parser/codec building blocks.
 

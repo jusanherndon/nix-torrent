@@ -22,7 +22,7 @@ const Daemon = struct {
             .allocator = allocator,
             .io = io,
             .cfg = cfg,
-            .registry = state.Registry.init(allocator, 20, 50),
+            .registry = state.Registry.init(allocator, @intCast(cfg.limits.max_active_torrents), @intCast(cfg.limits.max_peers_per_torrent)),
             .peer_id = try loadOrCreatePeerId(io, allocator, cfg.staging_area),
         };
     }
@@ -44,15 +44,35 @@ pub fn main(init: std.process.Init) !void {
     var stderr_writer = std.Io.File.stderr().writer(init.io, &stderr_buffer);
     const stderr = &stderr_writer.interface;
 
-    const cfg = config.load(allocator, init.minimal.args, init.environ_map) catch |err| switch (err) {
+    const raw_args = try init.minimal.args.toSlice(init.arena.allocator());
+    const validate_config = hasArg(raw_args[1..], "--validate-config");
+    const cfg_args = try daemonConfigArgs(init.arena.allocator(), raw_args[1..]);
+
+    const cfg = config.loadFromArgsWithEnvAndIo(allocator, init.io, cfg_args, init.environ_map) catch |err| switch (err) {
         error.UnknownFlag, error.MissingFlagValue => {
             try config.usage("torrentd", stderr);
+            try stderr.flush();
+            return err;
+        },
+        error.MissingExplicitConfig => {
+            try stderr.writeAll("configuration error: explicit --config file is missing or unreadable\n");
+            try stderr.flush();
+            return err;
+        },
+        error.InvalidConfig => {
+            try stderr.writeAll("configuration error: invalid configuration values\n");
             try stderr.flush();
             return err;
         },
         else => return err,
     };
     defer cfg.deinit(allocator);
+
+    if (validate_config) {
+        try stderr.writeAll("configuration OK\n");
+        try stderr.flush();
+        return;
+    }
 
     try ensureDirectory(init.io, cfg.staging_area);
     try ensureDirectory(init.io, cfg.final_destination);
@@ -104,6 +124,21 @@ pub fn main(init: std.process.Init) !void {
     try stderr.flush();
 }
 
+fn hasArg(args: []const []const u8, needle: []const u8) bool {
+    for (args) |arg| if (std.mem.eql(u8, arg, needle)) return true;
+    return false;
+}
+
+fn daemonConfigArgs(allocator: std.mem.Allocator, args: []const []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    for (args, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "--validate-config")) continue;
+        try out.append(allocator, arg);
+        _ = i;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn handleConnection(daemon: *Daemon, stream: net.Stream, started: i64) !void {
     const io = daemon.io;
     const allocator = daemon.allocator;
@@ -145,7 +180,12 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
             _ = started;
             try root.put(allocator, "uptime_seconds", .{ .integer = 0 });
             try root.put(allocator, "active_torrent_count", .{ .integer = @intCast(daemon.registry.records.items.len) });
-            try root.put(allocator, "limits", .{ .string = "v2 socket transport only; torrent engine limits not loaded yet" });
+            var limits: std.json.ObjectMap = .empty;
+            errdefer limits.deinit(allocator);
+            try limits.put(allocator, "max_active_torrents", .{ .integer = @intCast(daemon.cfg.limits.max_active_torrents) });
+            try limits.put(allocator, "max_peers_per_torrent", .{ .integer = @intCast(daemon.cfg.limits.max_peers_per_torrent) });
+            try limits.put(allocator, "max_torrent_file_bytes", .{ .integer = @intCast(daemon.cfg.limits.max_torrent_file_bytes) });
+            try root.put(allocator, "limits", .{ .object = limits });
             return .{ .success = .{ .object = root } };
         },
         .list => return listResponse(daemon),

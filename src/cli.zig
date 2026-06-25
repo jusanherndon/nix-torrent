@@ -37,9 +37,19 @@ pub fn main(init: std.process.Init) !void {
         return error.UnknownCommand;
     };
 
-    const cfg = config.loadFromArgsWithEnv(allocator, config_args, init.environ_map) catch |err| switch (err) {
+    const cfg = config.loadFromArgsWithEnvAndIo(allocator, init.io, config_args, init.environ_map) catch |err| switch (err) {
         error.UnknownFlag, error.MissingFlagValue => {
             try config.usage("torrent", stderr);
+            try stderr.flush();
+            return err;
+        },
+        error.MissingExplicitConfig => {
+            try stderr.writeAll("configuration error: explicit --config file is missing or unreadable\n");
+            try stderr.flush();
+            return err;
+        },
+        error.InvalidConfig => {
+            try stderr.writeAll("configuration error: invalid configuration values\n");
             try stderr.flush();
             return err;
         },
@@ -102,7 +112,7 @@ fn findCommand(args: []const []const u8) ?usize {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (parseCommand(args[i]) != null) return i;
-        if (std.mem.eql(u8, args[i], "--staging-area") or std.mem.eql(u8, args[i], "--final-destination") or std.mem.eql(u8, args[i], "--socket-path")) i += 1;
+        if (std.mem.eql(u8, args[i], "--config") or std.mem.eql(u8, args[i], "--staging-area") or std.mem.eql(u8, args[i], "--final-destination") or std.mem.eql(u8, args[i], "--socket-path")) i += 1;
     }
     return null;
 }
@@ -131,9 +141,7 @@ fn usage(writer: anytype) !void {
         \\Usage: torrent [options] <command>
         \\
         \\Options:
-        \\  --staging-area PATH
-        \\  --final-destination PATH
-        \\  --socket-path PATH
+        \\  --config PATH
         \\
         \\Commands:
         \\  add <torrent-file>

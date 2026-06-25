@@ -44,20 +44,15 @@ nix develop
 
 ## Configuration
 
-Both executables understand these environment variables:
-
-- `NIX_TORRENT_STAGING_AREA`
-- `NIX_TORRENT_FINAL_DESTINATION`
-- `NIX_TORRENT_SOCKET_PATH`
-
-The daemon also accepts:
+v2 configuration is TOML-based. Both executables accept `--config /path/to/config.toml`; otherwise they try `$XDG_CONFIG_HOME/nix-torrent/config.toml` and fall back to built-in defaults.
 
 ```sh
-torrentd \
-  --staging-area /var/lib/nix-torrent/staging \
-  --final-destination /srv/downloads \
-  --socket-path /run/nix-torrent.sock
+torrentd --config /tmp/nix-torrent/config.toml
+torrent --config /tmp/nix-torrent/config.toml list
+torrentd --validate-config
 ```
+
+Legacy v1 path flags and `NIX_TORRENT_*` environment variables are ignored.
 
 ## Torrent metadata support
 

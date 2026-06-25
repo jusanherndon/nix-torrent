@@ -1,10 +1,11 @@
 # Example Nix Torrent daemon configuration for v2.
 #
 # Configuration precedence, from highest to lowest:
-# 1. CLI flags
-# 2. Environment variables
-# 3. This TOML configuration file
-# 4. Built-in defaults
+# 1. Explicit TOML selected with --config
+# 2. Default TOML at $XDG_CONFIG_HOME/nix-torrent/config.toml
+# 3. Built-in defaults
+#
+# Legacy v1 path flags and NIX_TORRENT_* environment variables are ignored in v2.
 
 [paths]
 # Client-owned incomplete content directory.
