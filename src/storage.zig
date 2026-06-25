@@ -17,6 +17,11 @@ pub const PathError = error{
     PathCollision,
 };
 
+pub const IOError = error{
+    PieceHashMismatch,
+    ShortRead,
+};
+
 pub const Layout = struct {
     allocator: std.mem.Allocator,
     file_lengths: []u64,
@@ -159,6 +164,110 @@ fn validateComponent(component: []const u8) !void {
     if (std.mem.indexOfScalar(u8, component, '\\') != null) return PathError.UnsafePath;
 }
 
+pub fn createStagedFiles(io: std.Io, allocator: std.mem.Allocator, content_root: []const u8, meta: torrent.Metadata) !void {
+    try validatePaths(allocator, meta);
+    try std.Io.Dir.cwd().createDirPath(io, content_root);
+    switch (meta.mode) {
+        .single_file => |length| {
+            const path = try std.fs.path.join(allocator, &.{ content_root, meta.name });
+            defer allocator.free(path);
+            try createSizedFile(io, path, length);
+        },
+        .multi_file => |files| {
+            for (files) |file| {
+                const rel = try relativePath(allocator, file.path);
+                defer allocator.free(rel);
+                const full = try std.fs.path.join(allocator, &.{ content_root, rel });
+                defer allocator.free(full);
+                if (std.fs.path.dirname(full)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
+                try createSizedFile(io, full, file.length);
+            }
+        },
+    }
+}
+
+pub fn writeVerifiedPiece(io: std.Io, allocator: std.mem.Allocator, content_root: []const u8, meta: torrent.Metadata, layout: *Layout, piece_index: usize, data: []const u8) !void {
+    const span = layout.pieceSpan(piece_index);
+    if (data.len != span.length) return IOError.ShortRead;
+    if (!pieceHashMatches(meta, piece_index, data)) return IOError.PieceHashMismatch;
+
+    const segments = try layout.mapPiece(allocator, piece_index);
+    defer allocator.free(segments);
+    for (segments) |segment| {
+        const path = try filePathForIndex(allocator, content_root, meta, segment.file_index);
+        defer allocator.free(path);
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write, .allow_directory = false });
+        defer file.close(io);
+        try file.writePositionalAll(io, data[segment.piece_offset..][0..segment.length], segment.file_offset);
+    }
+    layout.mark(piece_index, .verified);
+}
+
+pub fn readPiece(io: std.Io, allocator: std.mem.Allocator, content_root: []const u8, meta: torrent.Metadata, layout: Layout, piece_index: usize) ![]u8 {
+    const span = layout.pieceSpan(piece_index);
+    const out = try allocator.alloc(u8, span.length);
+    errdefer allocator.free(out);
+    const segments = try layout.mapPiece(allocator, piece_index);
+    defer allocator.free(segments);
+    for (segments) |segment| {
+        const path = try filePathForIndex(allocator, content_root, meta, segment.file_index);
+        defer allocator.free(path);
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only, .allow_directory = false });
+        defer file.close(io);
+        const got = try file.readPositionalAll(io, out[segment.piece_offset..][0..segment.length], segment.file_offset);
+        if (got != segment.length) return IOError.ShortRead;
+    }
+    return out;
+}
+
+pub fn recheck(io: std.Io, allocator: std.mem.Allocator, content_root: []const u8, meta: torrent.Metadata, layout: *Layout) !void {
+    for (layout.piece_states, 0..) |_, i| {
+        const bytes = readPiece(io, allocator, content_root, meta, layout.*, i) catch |err| switch (err) {
+            error.FileNotFound, IOError.ShortRead => {
+                layout.mark(i, .missing);
+                continue;
+            },
+            else => return err,
+        };
+        defer allocator.free(bytes);
+        layout.mark(i, if (pieceHashMatches(meta, i, bytes)) .verified else .missing);
+    }
+}
+
+fn createSizedFile(io: std.Io, path: []const u8, length: u64) !void {
+    if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false });
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size == length) return;
+    if (length == 0) return PathError.ZeroLengthFile;
+    if (length > 0) {
+        try file.writePositionalAll(io, &.{0}, length - 1);
+    }
+}
+
+fn filePathForIndex(allocator: std.mem.Allocator, content_root: []const u8, meta: torrent.Metadata, file_index: usize) ![]u8 {
+    switch (meta.mode) {
+        .single_file => return std.fs.path.join(allocator, &.{ content_root, meta.name }),
+        .multi_file => |files| {
+            const rel = try relativePath(allocator, files[file_index].path);
+            defer allocator.free(rel);
+            return std.fs.path.join(allocator, &.{ content_root, rel });
+        },
+    }
+}
+
+fn relativePath(allocator: std.mem.Allocator, components: []const []const u8) ![]u8 {
+    return std.fs.path.join(allocator, components);
+}
+
+fn pieceHashMatches(meta: torrent.Metadata, piece_index: usize, data: []const u8) bool {
+    var digest: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(data, &digest, .{});
+    const expected = meta.pieces[piece_index * 20 ..][0..20];
+    return std.mem.eql(u8, &digest, expected);
+}
+
 test "maps multi-file piece spans across file boundaries" {
     const meta_bytes = "d4:infod5:filesld6:lengthi3e4:pathl5:a.txteed6:lengthi5e4:pathl5:b.txteee4:name6:bundle12:piece lengthi4e6:pieces20:aaaaaaaaaaaaaaaaaaaaee";
     const meta = try torrent.Metadata.parseBytes(std.testing.allocator, meta_bytes);
@@ -199,4 +308,63 @@ test "tracks verified missing and in-progress pieces in memory" {
     layout.mark(0, .verified);
     layout.mark(1, .verified);
     try std.testing.expect(layout.complete());
+}
+
+fn testTorrentBytes(allocator: std.mem.Allocator, name: []const u8, piece_length: u64, length: u64, content: []const u8) ![]u8 {
+    var hash: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash(content, &hash, .{});
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(allocator);
+    const prefix = try std.fmt.allocPrint(allocator, "d4:infod6:lengthi{d}e4:name{d}:{s}12:piece lengthi{d}e6:pieces20:", .{ length, name.len, name, piece_length });
+    defer allocator.free(prefix);
+    try bytes.appendSlice(allocator, prefix);
+    try bytes.appendSlice(allocator, &hash);
+    try bytes.appendSlice(allocator, "ee");
+    return bytes.toOwnedSlice(allocator);
+}
+
+fn tmpContentRoot(allocator: std.mem.Allocator, tmp: std.testing.TmpDir) ![]u8 {
+    return std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/content", .{tmp.sub_path});
+}
+
+test "creates staged single-file tree and writes verified piece" {
+    const meta_bytes = try testTorrentBytes(std.testing.allocator, "tiny.txt", 4, 4, "abcd");
+    defer std.testing.allocator.free(meta_bytes);
+    const meta = try torrent.Metadata.parseBytes(std.testing.allocator, meta_bytes);
+    defer meta.deinit();
+    var layout = try Layout.init(std.testing.allocator, meta);
+    defer layout.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpContentRoot(std.testing.allocator, tmp);
+    defer std.testing.allocator.free(root);
+
+    try createStagedFiles(std.testing.io, std.testing.allocator, root, meta);
+    try writeVerifiedPiece(std.testing.io, std.testing.allocator, root, meta, &layout, 0, "abcd");
+    const piece = try readPiece(std.testing.io, std.testing.allocator, root, meta, layout, 0);
+    defer std.testing.allocator.free(piece);
+
+    try std.testing.expectEqualStrings("abcd", piece);
+    try std.testing.expectEqual(PieceState.verified, layout.piece_states[0]);
+}
+
+test "recheck detects corrupt staged data" {
+    const meta_bytes = try testTorrentBytes(std.testing.allocator, "tiny.txt", 4, 4, "abcd");
+    defer std.testing.allocator.free(meta_bytes);
+    const meta = try torrent.Metadata.parseBytes(std.testing.allocator, meta_bytes);
+    defer meta.deinit();
+    var layout = try Layout.init(std.testing.allocator, meta);
+    defer layout.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmpContentRoot(std.testing.allocator, tmp);
+    defer std.testing.allocator.free(root);
+
+    try createStagedFiles(std.testing.io, std.testing.allocator, root, meta);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ root, "tiny.txt" });
+    defer std.testing.allocator.free(path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "wxyz", .flags = .{ .truncate = true } });
+
+    try recheck(std.testing.io, std.testing.allocator, root, meta, &layout);
+    try std.testing.expectEqual(PieceState.missing, layout.piece_states[0]);
 }

@@ -10,6 +10,7 @@ pub const TorrentRecord = struct {
     tracker_url: ?[]const u8 = null,
     tracker_error: ?[]const u8 = null,
     total_bytes: u64 = 0,
+    piece_length: u64 = 0,
     piece_count: usize = 0,
     verified_piece_count: usize = 0,
 };
@@ -69,6 +70,7 @@ pub fn cloneRecord(allocator: std.mem.Allocator, record: TorrentRecord) !Torrent
         .tracker_url = if (record.tracker_url) |s| try allocator.dupe(u8, s) else null,
         .tracker_error = if (record.tracker_error) |s| try allocator.dupe(u8, s) else null,
         .total_bytes = record.total_bytes,
+        .piece_length = record.piece_length,
         .piece_count = record.piece_count,
         .verified_piece_count = record.verified_piece_count,
     };
@@ -109,6 +111,7 @@ fn recordJson(allocator: std.mem.Allocator, record: TorrentRecord) ![]u8 {
     try jw.objectField("status"); try jw.write(@tagName(record.status));
     try jw.objectField("tracker_url"); if (record.tracker_url) |s| try jw.write(s) else try jw.write(null);
     try jw.objectField("total_bytes"); try jw.write(record.total_bytes);
+    try jw.objectField("piece_length"); try jw.write(record.piece_length);
     try jw.objectField("piece_count"); try jw.write(record.piece_count);
     try jw.objectField("verified_piece_count"); try jw.write(record.verified_piece_count);
     try jw.endObject();
@@ -125,6 +128,7 @@ pub fn readTorrentState(io: std.Io, allocator: std.mem.Allocator, path: []const 
         status: []const u8,
         tracker_url: ?[]const u8 = null,
         total_bytes: u64 = 0,
+        piece_length: u64 = 0,
         piece_count: usize = 0,
         verified_piece_count: usize = 0,
     };
@@ -136,6 +140,7 @@ pub fn readTorrentState(io: std.Io, allocator: std.mem.Allocator, path: []const 
         .status = parseStatus(parsed.value.status) orelse .failed,
         .tracker_url = if (parsed.value.tracker_url) |s| try allocator.dupe(u8, s) else null,
         .total_bytes = parsed.value.total_bytes,
+        .piece_length = parsed.value.piece_length,
         .piece_count = parsed.value.piece_count,
         .verified_piece_count = parsed.value.verified_piece_count,
     };

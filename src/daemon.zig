@@ -245,6 +245,7 @@ fn addTorrent(daemon: *Daemon, path: []const u8) !protocol.Response {
     const content_dir = try std.fs.path.join(allocator, &.{ dir, "content" });
     defer allocator.free(content_dir);
     try std.Io.Dir.cwd().createDirPath(daemon.io, content_dir);
+    storage.createStagedFiles(daemon.io, allocator, content_dir, meta) catch return .{ .failure = .{ .code = .storage_error, .message = "failed to create staged content files" } };
 
     const rec = state.TorrentRecord{
         .info_hash_hex = hex,
@@ -252,6 +253,7 @@ fn addTorrent(daemon: *Daemon, path: []const u8) !protocol.Response {
         .status = .active,
         .tracker_url = announce,
         .total_bytes = state.totalBytes(meta),
+        .piece_length = meta.piece_length,
         .piece_count = meta.pieces.len / 20,
     };
     try daemon.registry.add(rec);
@@ -299,10 +301,37 @@ fn summaryObject(allocator: std.mem.Allocator, rec: state.TorrentRecord) !std.js
     try obj.put(allocator, "info_hash", .{ .string = rec.info_hash_hex });
     try obj.put(allocator, "name", .{ .string = rec.name });
     try obj.put(allocator, "lifecycle_status", .{ .string = @tagName(rec.status) });
-    try obj.put(allocator, "verified_bytes", .{ .integer = 0 });
+    try obj.put(allocator, "verified_bytes", .{ .integer = @intCast(verifiedBytes(rec)) });
     try obj.put(allocator, "total_bytes", .{ .integer = @intCast(rec.total_bytes) });
     try obj.put(allocator, "connected_peer_count", .{ .integer = 0 });
     return obj;
+}
+
+fn verifiedBytes(rec: state.TorrentRecord) u64 {
+    if (rec.verified_piece_count == 0 or rec.piece_length == 0) return 0;
+    const full = @as(u64, @intCast(rec.verified_piece_count)) * rec.piece_length;
+    return @min(full, rec.total_bytes);
+}
+
+fn recheckPersistedSession(daemon: *Daemon, info_hash_hex: []const u8, rec: *state.TorrentRecord) !void {
+    const metadata_path = try std.fs.path.join(daemon.allocator, &.{ daemon.cfg.staging_area, info_hash_hex, "metadata.torrent" });
+    defer daemon.allocator.free(metadata_path);
+    const meta = try torrent.Metadata.parseFile(daemon.allocator, daemon.io, metadata_path);
+    defer meta.deinit();
+    const parsed_hex = state.infoHashHex(meta.info_hash);
+    if (!std.mem.eql(u8, &parsed_hex, info_hash_hex)) return error.StateCorruption;
+    var layout = try storage.Layout.init(daemon.allocator, meta);
+    defer layout.deinit();
+    const content_dir = try std.fs.path.join(daemon.allocator, &.{ daemon.cfg.staging_area, info_hash_hex, "content" });
+    defer daemon.allocator.free(content_dir);
+    try storage.recheck(daemon.io, daemon.allocator, content_dir, meta, &layout);
+    rec.verified_piece_count = 0;
+    for (layout.piece_states) |piece_state| {
+        if (piece_state == .verified) rec.verified_piece_count += 1;
+    }
+    rec.piece_length = meta.piece_length;
+    rec.piece_count = meta.pieces.len / 20;
+    rec.total_bytes = state.totalBytes(meta);
 }
 
 fn loadPersistedSessions(daemon: *Daemon) !void {
@@ -313,13 +342,14 @@ fn loadPersistedSessions(daemon: *Daemon) !void {
         if (entry.kind != .directory or entry.name.len != 40) continue;
         const state_path = try std.fs.path.join(daemon.allocator, &.{ daemon.cfg.staging_area, entry.name, "state.json" });
         defer daemon.allocator.free(state_path);
-        const rec = state.readTorrentState(daemon.io, daemon.allocator, state_path) catch continue;
-        errdefer state.deinitRecord(daemon.allocator, rec);
-        daemon.registry.add(rec) catch {
-            state.deinitRecord(daemon.allocator, rec);
-            continue;
+        var rec = state.readTorrentState(daemon.io, daemon.allocator, state_path) catch continue;
+        defer state.deinitRecord(daemon.allocator, rec);
+        recheckPersistedSession(daemon, entry.name, &rec) catch |err| {
+            rec.status = .failed;
+            if (rec.tracker_error) |old| daemon.allocator.free(old);
+            rec.tracker_error = try std.fmt.allocPrint(daemon.allocator, "startup recheck failed: {s}", .{@errorName(err)});
         };
-        state.deinitRecord(daemon.allocator, rec);
+        daemon.registry.add(rec) catch continue;
     }
 }
 
