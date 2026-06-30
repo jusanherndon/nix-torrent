@@ -1,4 +1,5 @@
 const std = @import("std");
+const torrent = @import("torrent.zig");
 
 pub const Completion = struct {
     info_hash_hex: []const u8,
@@ -32,9 +33,43 @@ pub fn finalPath(allocator: std.mem.Allocator, final_root: []const u8, name: []c
 }
 
 pub fn moveCompletedTree(src: []const u8, dst: []const u8) !void {
-    // Atomic rename on the same filesystem. Cross-device fallback can be added
-    // when the storage layer starts exercising real staged trees in integration tests.
     try std.fs.cwd().rename(src, dst);
+}
+
+pub fn moveCompletedContent(io: std.Io, allocator: std.mem.Allocator, content_dir: []const u8, meta: torrent.Metadata, final_root: []const u8) ![]u8 {
+    try std.Io.Dir.cwd().createDirPath(io, final_root);
+    switch (meta.mode) {
+        .single_file => {
+            const src = try std.fs.path.join(allocator, &.{ content_dir, meta.name });
+            defer allocator.free(src);
+            const dst = try std.fs.path.join(allocator, &.{ final_root, meta.name });
+            errdefer allocator.free(dst);
+            if (pathExists(io, dst)) return error.DestinationExists;
+            try renamePath(io, src, dst);
+            return dst;
+        },
+        .multi_file => {
+            const dst = try std.fs.path.join(allocator, &.{ final_root, meta.name });
+            errdefer allocator.free(dst);
+            if (pathExists(io, dst)) return error.DestinationExists;
+            try renamePath(io, content_dir, dst);
+            return dst;
+        },
+    }
+}
+
+fn pathExists(io: std.Io, path: []const u8) bool {
+    _ = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
+    return true;
+}
+
+fn renamePath(io: std.Io, src: []const u8, dst: []const u8) !void {
+    if (std.fs.path.dirname(dst)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
+    if (std.fs.path.isAbsolute(src) and std.fs.path.isAbsolute(dst)) {
+        try std.Io.Dir.renameAbsolute(src, dst, io);
+    } else {
+        try std.Io.Dir.cwd().rename(src, std.Io.Dir.cwd(), dst, io);
+    }
 }
 
 test "records completed torrent history for list and show" {
@@ -49,4 +84,27 @@ test "builds final destination path" {
     const path = try finalPath(std.testing.allocator, "/srv/downloads", "tiny.txt");
     defer std.testing.allocator.free(path);
     try std.testing.expectEqualStrings("/srv/downloads/tiny.txt", path);
+}
+
+test "refuses to overwrite existing final destination paths" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const final_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/final", .{tmp.sub_path});
+    defer std.testing.allocator.free(final_root);
+    const content = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/content", .{tmp.sub_path});
+    defer std.testing.allocator.free(content);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, final_root);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, content);
+    const existing = try std.fs.path.join(std.testing.allocator, &.{ final_root, "tiny.txt" });
+    defer std.testing.allocator.free(existing);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = existing, .data = "taken" });
+
+    const meta_bytes = @embedFile("fixtures/single-file.torrent");
+    const meta = try torrent.Metadata.parseBytes(std.testing.allocator, meta_bytes);
+    defer meta.deinit();
+    const staged = try std.fs.path.join(std.testing.allocator, &.{ content, "tiny.txt" });
+    defer std.testing.allocator.free(staged);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = staged, .data = "abcd" });
+
+    try std.testing.expectError(error.DestinationExists, moveCompletedContent(std.testing.io, std.testing.allocator, content, meta, final_root));
 }

@@ -65,6 +65,8 @@ pub const PeerState = struct {
 pub const Connection = struct {
     allocator: std.mem.Allocator,
     stream: net.Stream,
+    peer_ip: [4]u8,
+    peer_port: u16,
     state: PeerState,
     recv_buffer: std.ArrayList(u8),
     handshake_done: bool = false,
@@ -72,11 +74,13 @@ pub const Connection = struct {
 
     pub fn connect(io: std.Io, allocator: std.mem.Allocator, ip: [4]u8, port: u16, timeout_ms: u64) !Connection {
         const addr = net.IpAddress{ .ip4 = .{ .bytes = ip, .port = port } };
-        const stream = try net.connect(&addr, io, .{});
+        const stream = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
         _ = timeout_ms;
         return .{
             .allocator = allocator,
             .stream = stream,
+            .peer_ip = ip,
+            .peer_port = port,
             .state = .{},
             .recv_buffer = .empty,
         };
@@ -137,13 +141,10 @@ pub const Connection = struct {
     fn readMore(self: *Connection, io: std.Io) !usize {
         var buf: [4096]u8 = undefined;
         var reader = self.stream.reader(io, &buf);
-        const chunk = reader.interface.readSliceShort(&buf) catch |err| switch (err) {
-            error.ReadFailed, error.EndOfStream => return 0,
-            else => return err,
-        };
-        if (chunk.len == 0) return 0;
-        try self.recv_buffer.appendSlice(self.allocator, chunk);
-        return chunk.len;
+        const n = try reader.interface.readSliceShort(&buf);
+        if (n == 0) return 0;
+        try self.recv_buffer.appendSlice(self.allocator, buf[0..n]);
+        return n;
     }
 
     fn tryDecodeMessage(self: *Connection, max_message_bytes: u64) !?Message {
@@ -231,10 +232,7 @@ fn readExact(io: std.Io, stream: net.Stream, buf: []u8) !void {
     var read_buffer: [256]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
     while (got < buf.len) {
-        const n = reader.interface.readSliceShort(buf[got..]) catch |err| switch (err) {
-            error.ReadFailed, error.EndOfStream => return error.ShortMessage,
-            else => return err,
-        };
+        const n = reader.interface.readSliceShort(buf[got..]) catch return error.ShortMessage;
         if (n == 0) return error.ShortMessage;
         got += n;
     }
@@ -285,6 +283,8 @@ test "rejects oversized peer messages" {
     var conn = Connection{
         .allocator = std.testing.allocator,
         .stream = undefined,
+        .peer_ip = .{ 127, 0, 0, 1 },
+        .peer_port = 6881,
         .state = .{},
         .recv_buffer = .empty,
     };
@@ -300,6 +300,8 @@ test "closes peer connection when peer sends request" {
     var conn = Connection{
         .allocator = std.testing.allocator,
         .stream = undefined,
+        .peer_ip = .{ 127, 0, 0, 1 },
+        .peer_port = 6881,
         .state = .{},
         .recv_buffer = .empty,
     };

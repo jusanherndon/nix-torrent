@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const config = @import("config.zig");
+const engine_mod = @import("engine.zig");
 const log = @import("log.zig");
 const protocol = @import("protocol.zig");
 const state = @import("state.zig");
@@ -14,8 +15,9 @@ const Daemon = struct {
     io: std.Io,
     cfg: config.Config,
     registry: state.Registry,
+    engine: engine_mod.Engine,
     peer_id: [20]u8,
-    started: i64 = 0,
+    started_ms: i64 = 0,
 
     fn init(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config) !Daemon {
         return .{
@@ -23,11 +25,13 @@ const Daemon = struct {
             .io = io,
             .cfg = cfg,
             .registry = state.Registry.init(allocator, @intCast(cfg.limits.max_active_torrents), @intCast(cfg.limits.max_peers_per_torrent)),
+            .engine = engine_mod.Engine.init(allocator),
             .peer_id = try loadOrCreatePeerId(io, allocator, cfg.staging_area),
         };
     }
 
     fn deinit(self: *Daemon) void {
+        self.engine.deinit(self.io);
         self.registry.deinit();
     }
 };
@@ -84,6 +88,7 @@ pub fn main(init: std.process.Init) !void {
     var daemon = try Daemon.init(allocator, init.io, cfg);
     defer daemon.deinit();
     try loadPersistedSessions(&daemon);
+    try daemon.engine.loadFromRegistry(daemon.io, daemon.cfg, &daemon.registry);
 
     try prepareSocketPath(init.io, cfg.socket_path);
 
@@ -105,23 +110,29 @@ pub fn main(init: std.process.Init) !void {
     try log.event(stderr, .info, "daemon", "control socket listening");
     try stderr.flush();
 
-    const started: i64 = 0;
+    daemon.started_ms = nowMs(init.io);
+
     while (!shutting_down) {
-        const stream = server.accept(init.io) catch |err| {
-            if (shutting_down) break;
-            switch (err) {
-                error.SocketNotListening, error.Canceled => break,
-                else => return err,
-            }
-        };
-        handleConnection(&daemon, stream, started) catch |err| {
-            try stderr.print("{{\"level\":\"error\",\"component\":\"daemon\",\"message\":\"connection failed: {s}\"}}\n", .{@errorName(err)});
+        const now_ms = nowMs(init.io);
+        daemon.engine.tick(daemon.io, daemon.cfg, &daemon.registry, daemon.peer_id, now_ms) catch |err| {
+            try stderr.print("{{\"level\":\"error\",\"component\":\"engine\",\"message\":\"tick failed: {s}\"}}\n", .{@errorName(err)});
             try stderr.flush();
         };
+
+        if (try acceptWithTimeout(&server, init.io, 100)) |stream| {
+            handleConnection(&daemon, stream, daemon.started_ms) catch |err| {
+                try stderr.print("{{\"level\":\"error\",\"component\":\"daemon\",\"message\":\"connection failed: {s}\"}}\n", .{@errorName(err)});
+                try stderr.flush();
+            };
+        }
     }
 
     try log.event(stderr, .info, "daemon", "controlled shutdown complete");
     try stderr.flush();
+}
+
+fn nowMs(io: std.Io) i64 {
+    return std.Io.Timestamp.now(io, .real).toMilliseconds();
 }
 
 fn hasArg(args: []const []const u8, needle: []const u8) bool {
@@ -177,8 +188,8 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
             errdefer root.deinit(allocator);
             try root.put(allocator, "daemon_version", .{ .string = "0.2.0" });
             try root.put(allocator, "control_protocol_version", .{ .integer = protocol.CONTROL_PROTOCOL_VERSION });
-            _ = started;
-            try root.put(allocator, "uptime_seconds", .{ .integer = 0 });
+            const uptime = @max(@as(i64, 0), @divFloor(nowMs(daemon.io) - started, 1000));
+            try root.put(allocator, "uptime_seconds", .{ .integer = uptime });
             try root.put(allocator, "active_torrent_count", .{ .integer = @intCast(daemon.registry.records.items.len) });
             var limits: std.json.ObjectMap = .empty;
             errdefer limits.deinit(allocator);
@@ -203,6 +214,7 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
             };
             rec.status = .paused;
             try state.writeTorrentState(daemon.io, allocator, daemon.cfg.staging_area, rec.*);
+            daemon.engine.removeSession(daemon.io, info_hash);
             return showResponse(daemon, rec.*);
         },
         .@"resume" => {
@@ -212,7 +224,12 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
                 return .{ .failure = .{ .code = .not_found, .message = "torrent is not known to this daemon" } };
             };
             rec.status = .active;
+            if (rec.tracker_error) |old| {
+                daemon.allocator.free(old);
+                rec.tracker_error = null;
+            }
             try state.writeTorrentState(daemon.io, allocator, daemon.cfg.staging_area, rec.*);
+            try daemon.engine.addSession(daemon.io, daemon.cfg, &daemon.registry, rec);
             return showResponse(daemon, rec.*);
         },
         .remove => {
@@ -221,6 +238,7 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
                 if (daemon.registry.findCompletion(info_hash) != null) return .{ .failure = .{ .code = .already_completed, .message = "completed torrents cannot be paused, resumed, or removed in v2" } };
                 return .{ .failure = .{ .code = .not_found, .message = "torrent is not known to this daemon" } };
             }
+            daemon.engine.removeSession(daemon.io, info_hash);
             deleteTorrentStateFile(daemon, info_hash) catch {};
             var root: std.json.ObjectMap = .empty;
             errdefer root.deinit(allocator);
@@ -295,6 +313,7 @@ fn addTorrent(daemon: *Daemon, path: []const u8) !protocol.Response {
     try daemon.registry.add(rec);
     const stored = daemon.registry.find(hex).?;
     try state.writeTorrentState(daemon.io, allocator, daemon.cfg.staging_area, stored.*);
+    try daemon.engine.addSession(daemon.io, daemon.cfg, &daemon.registry, stored);
     return showResponse(daemon, stored.*);
 }
 
@@ -308,7 +327,7 @@ fn listResponse(daemon: *Daemon) !protocol.Response {
     const allocator = daemon.allocator;
     var torrents = std.json.Array.init(allocator);
     errdefer torrents.deinit();
-    for (daemon.registry.records.items) |rec| try torrents.append(try summaryValue(allocator, rec));
+    for (daemon.registry.records.items) |rec| try torrents.append(try summaryValue(daemon, allocator, rec));
     for (daemon.registry.history.items) |rec| try torrents.append(try completionSummaryValue(allocator, rec));
     var root: std.json.ObjectMap = .empty;
     errdefer root.deinit(allocator);
@@ -318,18 +337,19 @@ fn listResponse(daemon: *Daemon) !protocol.Response {
 
 fn showResponse(daemon: *Daemon, rec: state.TorrentRecord) !protocol.Response {
     const allocator = daemon.allocator;
-    var root = try summaryObject(allocator, rec);
+    var root = try summaryObject(daemon, allocator, rec);
     errdefer root.deinit(allocator);
     try root.put(allocator, "piece_count", .{ .integer = @intCast(rec.piece_count) });
     try root.put(allocator, "verified_piece_count", .{ .integer = @intCast(rec.verified_piece_count) });
-    try root.put(allocator, "derived_activity", .{ .string = if (rec.status == .active) "waiting_for_peers" else @tagName(rec.status) });
+    try root.put(allocator, "derived_activity", .{ .string = derivedActivity(daemon, rec) });
+    try root.put(allocator, "connected_peer_count", .{ .integer = connectedPeerCount(daemon, rec.info_hash_hex) });
     if (rec.tracker_url) |url| try root.put(allocator, "tracker_announce_url", .{ .string = url });
     try root.put(allocator, "tracker_status", .{ .string = rec.tracker_error orelse "not_announced" });
     return .{ .success = .{ .object = root } };
 }
 
-fn summaryValue(allocator: std.mem.Allocator, rec: state.TorrentRecord) !std.json.Value {
-    return .{ .object = try summaryObject(allocator, rec) };
+fn summaryValue(daemon: *Daemon, allocator: std.mem.Allocator, rec: state.TorrentRecord) !std.json.Value {
+    return .{ .object = try summaryObject(daemon, allocator, rec) };
 }
 
 fn showCompletionResponse(daemon: *Daemon, rec: state.CompletionRecord) !protocol.Response {
@@ -356,7 +376,7 @@ fn completionSummaryObject(allocator: std.mem.Allocator, rec: state.CompletionRe
     return obj;
 }
 
-fn summaryObject(allocator: std.mem.Allocator, rec: state.TorrentRecord) !std.json.ObjectMap {
+fn summaryObject(daemon: *Daemon, allocator: std.mem.Allocator, rec: state.TorrentRecord) !std.json.ObjectMap {
     var obj: std.json.ObjectMap = .empty;
     errdefer obj.deinit(allocator);
     try obj.put(allocator, "info_hash", .{ .string = rec.info_hash_hex });
@@ -364,8 +384,37 @@ fn summaryObject(allocator: std.mem.Allocator, rec: state.TorrentRecord) !std.js
     try obj.put(allocator, "lifecycle_status", .{ .string = @tagName(rec.status) });
     try obj.put(allocator, "verified_bytes", .{ .integer = @intCast(verifiedBytes(rec)) });
     try obj.put(allocator, "total_bytes", .{ .integer = @intCast(rec.total_bytes) });
-    try obj.put(allocator, "connected_peer_count", .{ .integer = 0 });
+    try obj.put(allocator, "connected_peer_count", .{ .integer = connectedPeerCount(daemon, rec.info_hash_hex) });
     return obj;
+}
+
+fn connectedPeerCount(daemon: *Daemon, info_hash_hex: []const u8) i64 {
+    if (daemon.engine.findSession(info_hash_hex)) |session| return @intCast(session.peers.items.len);
+    return 0;
+}
+
+fn derivedActivity(daemon: *Daemon, rec: state.TorrentRecord) []const u8 {
+    if (rec.status != .active) return @tagName(rec.status);
+    if (daemon.engine.findSession(rec.info_hash_hex)) |session| {
+        if (session.active_piece != null) return "downloading";
+        if (session.peers.items.len > 0) return "connecting";
+        if (session.tracker_state.last_error != null) return "announcing";
+    }
+    return "waiting_for_peers";
+}
+
+fn acceptWithTimeout(server: *net.Server, io: std.Io, timeout_ms: i32) !?net.Stream {
+    var fds = [_]std.posix.pollfd{.{
+        .fd = server.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    const n = try std.posix.poll(&fds, timeout_ms);
+    if (n == 0) return null;
+    return server.accept(io) catch |err| switch (err) {
+        error.WouldBlock => return null,
+        else => |e| return e,
+    };
 }
 
 fn verifiedBytes(rec: state.TorrentRecord) u64 {

@@ -123,7 +123,7 @@ pub fn announceGet(
         .bytes = try resolveHost(io, parsed.host),
         .port = parsed.port,
     } };
-    var stream = try net.connect(&addr, io, .{});
+    var stream = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
     defer stream.close(io);
 
     var req_buf: [4096]u8 = undefined;
@@ -164,7 +164,8 @@ pub fn announceGet(
 }
 
 fn resolveHost(_: std.Io, host: []const u8) ![4]u8 {
-    return net.Ip4Address.parse(host, 0) catch return error.InvalidTrackerUrl;
+    const ip4 = try net.Ip4Address.parse(host, 0);
+    return ip4.bytes;
 }
 
 pub fn parseAnnounceResponse(allocator: std.mem.Allocator, bytes: []const u8) !Announce {
