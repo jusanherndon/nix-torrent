@@ -236,6 +236,8 @@ fn addTorrent(daemon: *Daemon, path: []const u8) !protocol.Response {
     const meta = torrent.Metadata.parseFile(allocator, daemon.io, path) catch return .{ .failure = .{ .code = .torrent_parse_error, .message = "failed to parse torrent file" } };
     defer meta.deinit();
 
+    torrent.validateLimits(meta, daemon.cfg.limits, meta.bytes.len) catch return .{ .failure = .{ .code = .config_error, .message = "torrent exceeds configured safety limits" } };
+
     storage.validatePaths(allocator, meta) catch return .{ .failure = .{ .code = .storage_error, .message = "torrent contains unsafe or unsupported file paths" } };
 
     const announce = validateTracker(meta) catch |err| switch (err) {
@@ -249,16 +251,34 @@ fn addTorrent(daemon: *Daemon, path: []const u8) !protocol.Response {
 
     const dir = try std.fs.path.join(allocator, &.{ daemon.cfg.staging_area, hex });
     defer allocator.free(dir);
+    const state_path = try std.fs.path.join(allocator, &.{ dir, "state.json" });
+    defer allocator.free(state_path);
+    const adopting = stagingDirExistsWithoutState(daemon.io, dir, state_path) catch |err| switch (err) {
+        error.FileNotFound => false,
+        else => return err,
+    };
+
     try std.Io.Dir.cwd().createDirPath(daemon.io, dir);
     const metadata_path = try std.fs.path.join(allocator, &.{ dir, "metadata.torrent" });
     defer allocator.free(metadata_path);
+    if (adopting) {
+        if (std.Io.Dir.cwd().readFileAlloc(daemon.io, metadata_path, allocator, .limited(16 * 1024 * 1024))) |existing_bytes| {
+            defer allocator.free(existing_bytes);
+            const existing = torrent.Metadata.parseBytes(allocator, existing_bytes) catch return .{ .failure = .{ .code = .storage_error, .message = "existing staged metadata is corrupt" } };
+            defer existing.deinit();
+            const existing_hex = state.infoHashHex(existing.info_hash);
+            if (!std.mem.eql(u8, &existing_hex, hex)) return .{ .failure = .{ .code = .storage_error, .message = "staged metadata info hash does not match staging directory" } };
+        } else |_| {}
+    }
     try std.Io.Dir.cwd().writeFile(daemon.io, .{ .sub_path = metadata_path, .data = meta.bytes, .flags = .{ .truncate = true } });
     const content_dir = try std.fs.path.join(allocator, &.{ dir, "content" });
     defer allocator.free(content_dir);
     try std.Io.Dir.cwd().createDirPath(daemon.io, content_dir);
-    storage.createStagedFiles(daemon.io, allocator, content_dir, meta) catch return .{ .failure = .{ .code = .storage_error, .message = "failed to create staged content files" } };
+    if (!adopting) {
+        storage.createStagedFiles(daemon.io, allocator, content_dir, meta) catch return .{ .failure = .{ .code = .storage_error, .message = "failed to create staged content files" } };
+    }
 
-    const rec = state.TorrentRecord{
+    var rec = state.TorrentRecord{
         .info_hash_hex = hex,
         .name = meta.name,
         .status = .active,
@@ -267,6 +287,11 @@ fn addTorrent(daemon: *Daemon, path: []const u8) !protocol.Response {
         .piece_length = meta.piece_length,
         .piece_count = meta.pieces.len / 20,
     };
+    recheckSession(daemon, hex, &rec) catch |err| switch (err) {
+        error.StateCorruption => return .{ .failure = .{ .code = .storage_error, .message = "staged metadata info hash does not match staging directory" } },
+        else => return .{ .failure = .{ .code = .storage_error, .message = "failed to recheck staged content" } },
+    };
+
     try daemon.registry.add(rec);
     const stored = daemon.registry.find(hex).?;
     try state.writeTorrentState(daemon.io, allocator, daemon.cfg.staging_area, stored.*);
@@ -349,7 +374,17 @@ fn verifiedBytes(rec: state.TorrentRecord) u64 {
     return @min(full, rec.total_bytes);
 }
 
-fn recheckPersistedSession(daemon: *Daemon, info_hash_hex: []const u8, rec: *state.TorrentRecord) !void {
+fn stagingDirExistsWithoutState(io: std.Io, dir: []const u8, state_path: []const u8) !bool {
+    _ = try std.Io.Dir.cwd().statFile(io, dir, .{ .follow_symlinks = false });
+    const state_stat = std.Io.Dir.cwd().statFile(io, state_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return true,
+        else => return err,
+    };
+    _ = state_stat;
+    return false;
+}
+
+fn recheckSession(daemon: *Daemon, info_hash_hex: []const u8, rec: *state.TorrentRecord) !void {
     const metadata_path = try std.fs.path.join(daemon.allocator, &.{ daemon.cfg.staging_area, info_hash_hex, "metadata.torrent" });
     defer daemon.allocator.free(metadata_path);
     const meta = try torrent.Metadata.parseFile(daemon.allocator, daemon.io, metadata_path);
@@ -370,6 +405,22 @@ fn recheckPersistedSession(daemon: *Daemon, info_hash_hex: []const u8, rec: *sta
     rec.total_bytes = state.totalBytes(meta);
 }
 
+fn validatePersistedSession(daemon: *Daemon, info_hash_hex: []const u8, rec: *state.TorrentRecord) !void {
+    const metadata_path = try std.fs.path.join(daemon.allocator, &.{ daemon.cfg.staging_area, info_hash_hex, "metadata.torrent" });
+    defer daemon.allocator.free(metadata_path);
+    const meta = try torrent.Metadata.parseFile(daemon.allocator, daemon.io, metadata_path);
+    defer meta.deinit();
+    const parsed_hex = state.infoHashHex(meta.info_hash);
+    if (!std.mem.eql(u8, &parsed_hex, info_hash_hex)) return error.StateCorruption;
+    torrent.validateLimits(meta, daemon.cfg.limits, meta.bytes.len) catch {
+        rec.status = .failed;
+        if (rec.tracker_error) |old| daemon.allocator.free(old);
+        rec.tracker_error = try daemon.allocator.dupe(u8, "torrent metadata exceeds configured safety limits");
+        return;
+    };
+    try recheckSession(daemon, info_hash_hex, rec);
+}
+
 fn loadPersistedSessions(daemon: *Daemon) !void {
     const history = state.readHistory(daemon.io, daemon.allocator, daemon.cfg.staging_area) catch |err| switch (err) {
         error.DuplicateCompletion => return error.StateCorruption,
@@ -388,12 +439,17 @@ fn loadPersistedSessions(daemon: *Daemon) !void {
         var rec = state.readTorrentState(daemon.io, daemon.allocator, state_path) catch continue;
         defer state.deinitRecord(daemon.allocator, rec);
         if (daemon.registry.findCompletion(rec.info_hash_hex) != null) return error.StateCorruption;
-        recheckPersistedSession(daemon, entry.name, &rec) catch |err| {
-            rec.status = .failed;
-            if (rec.tracker_error) |old| daemon.allocator.free(old);
-            rec.tracker_error = try std.fmt.allocPrint(daemon.allocator, "startup recheck failed: {s}", .{@errorName(err)});
+        validatePersistedSession(daemon, entry.name, &rec) catch |err| switch (err) {
+            error.StateCorruption => return err,
+            else => {
+                rec.status = .failed;
+                if (rec.tracker_error) |old| daemon.allocator.free(old);
+                rec.tracker_error = try std.fmt.allocPrint(daemon.allocator, "startup validation failed: {s}", .{@errorName(err)});
+            },
         };
-        daemon.registry.add(rec) catch continue;
+        try daemon.registry.add(rec);
+        const stored = daemon.registry.find(entry.name).?;
+        try state.writeTorrentState(daemon.io, daemon.allocator, daemon.cfg.staging_area, stored.*);
     }
 }
 

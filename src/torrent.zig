@@ -1,5 +1,6 @@
 const std = @import("std");
 const bencode = @import("bencode.zig");
+const config = @import("config.zig");
 
 pub const InfoHash = [20]u8;
 
@@ -64,6 +65,50 @@ pub const Error = error{
     InvalidFilePath,
     AmbiguousFileMode,
 };
+
+pub const LimitError = error{
+    TorrentFileTooLarge,
+    ContentTooLarge,
+    TooManyFiles,
+    PathTooDeep,
+    PathComponentTooLong,
+    PieceTooLarge,
+    TooManyPieces,
+};
+
+pub fn contentBytes(meta: Metadata) u64 {
+    return switch (meta.mode) {
+        .single_file => |len| len,
+        .multi_file => |files| blk: {
+            var total: u64 = 0;
+            for (files) |file| total += file.length;
+            break :blk total;
+        },
+    };
+}
+
+pub fn validateLimits(meta: Metadata, limits: config.Limits, torrent_file_bytes: usize) LimitError!void {
+    if (torrent_file_bytes > limits.max_torrent_file_bytes) return LimitError.TorrentFileTooLarge;
+    const total = contentBytes(meta);
+    if (total > limits.max_content_bytes) return LimitError.ContentTooLarge;
+    if (meta.piece_length > limits.max_piece_bytes) return LimitError.PieceTooLarge;
+    const piece_count = meta.pieces.len / 20;
+    if (piece_count > limits.max_piece_count) return LimitError.TooManyPieces;
+    switch (meta.mode) {
+        .single_file => {
+            if (meta.name.len > limits.max_path_component_bytes) return LimitError.PathComponentTooLong;
+        },
+        .multi_file => |files| {
+            if (files.len > limits.max_files_per_torrent) return LimitError.TooManyFiles;
+            for (files) |file| {
+                if (file.path.len > limits.max_path_depth) return LimitError.PathTooDeep;
+                for (file.path) |component| {
+                    if (component.len > limits.max_path_component_bytes) return LimitError.PathComponentTooLong;
+                }
+            }
+        },
+    }
+}
 
 fn parseOwnedBytes(allocator: std.mem.Allocator, bytes: []const u8) !Metadata {
     const root = try bencode.parse(allocator, bytes);
@@ -194,4 +239,13 @@ test "parses multi-file fixture" {
 
 test "rejects invalid pieces length" {
     try std.testing.expectError(Error.InvalidPieces, Metadata.parseBytes(std.testing.allocator, "d4:infod6:lengthi1e4:name1:x12:piece lengthi1e6:pieces3:abcee"));
+}
+
+test "rejects torrent metadata that exceeds configured limits" {
+    const fixture = @embedFile("fixtures/single-file.torrent");
+    const metadata = try Metadata.parseBytes(std.testing.allocator, fixture);
+    defer metadata.deinit();
+    var limits = config.Limits{};
+    limits.max_content_bytes = 1;
+    try std.testing.expectError(LimitError.ContentTooLarge, validateLimits(metadata, limits, fixture.len));
 }
