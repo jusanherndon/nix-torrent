@@ -1,4 +1,6 @@
-# Nix Torrent v2 Plan
+# Nix Torrent v2 Plan — Foundation
+
+Program v2 is split across two plans. This document covers milestones 1–8: the download daemon foundation. Network and discovery features (UDP trackers, DHT, protocol encryption, and magnet links) are in [V2_NETWORK_PLAN.md](V2_NETWORK_PLAN.md) as milestones 9–13.
 
 ## Goal
 
@@ -21,17 +23,17 @@ Current implementation progress:
 - Milestone 3 library work is implemented: storage span mapping, torrent path safety validation, staged file precreation, verified-piece writes, and recheck are covered by unit tests; `add` rejects unsafe paths and creates staged files. Daemon integration beyond `createStagedFiles` on add (recheck on re-add, `writeVerifiedPiece` from the download engine) is still pending.
 - Milestones 4-8 are still pending except for existing parser/codec building blocks.
 
-Out of scope for v2:
+Out of scope for this foundation plan:
 
-- Magnet links
-- DHT
-- UDP trackers
+- Magnet links — see [V2_NETWORK_PLAN.md](V2_NETWORK_PLAN.md) milestone 12
+- DHT — see [V2_NETWORK_PLAN.md](V2_NETWORK_PLAN.md) milestone 10
+- UDP trackers — see [V2_NETWORK_PLAN.md](V2_NETWORK_PLAN.md) milestone 9
+- Protocol encryption — see [V2_NETWORK_PLAN.md](V2_NETWORK_PLAN.md) milestone 11
+- BitTorrent extension protocol — minimal `ut_metadata` only, in [V2_NETWORK_PLAN.md](V2_NETWORK_PLAN.md) milestone 12
 - HTTPS trackers
 - IPv6 peers
 - Inbound BitTorrent peer listener
 - Seeding
-- Protocol encryption
-- BitTorrent extension protocol
 - Web UI
 - Partial file selection
 - Zero-length torrent files
@@ -91,7 +93,7 @@ Suggested response examples:
 `status` should return daemon health information:
 
 - daemon version
-- control protocol version, starting at `1` for v2
+- control protocol version: `1` for foundation milestones 1–8; bumps to `2` with network milestones per [V2_NETWORK_PLAN.md](V2_NETWORK_PLAN.md)
 - uptime
 - active torrent count
 - safe configured limit summary, not a raw dump of all config values
@@ -591,9 +593,11 @@ Build controlled local components to test the daemon without relying on public t
 7. Handoff (wire `state.appendHistoryRecord`, consolidate with `handoff.zig`).
 8. Integration test harness (Milestone 8).
 
+Then continue with [V2_NETWORK_PLAN.md](V2_NETWORK_PLAN.md) milestones 9–13.
+
 ## Definition of Done
 
-v2 is done when this workflow succeeds:
+The foundation milestones are done when this workflow succeeds:
 
 ```sh
 torrentd --config /tmp/nix-torrent/config.toml
@@ -604,3 +608,5 @@ torrent show <info-hash>
 ```
 
 The daemon must be able to download the torrent from at least a controlled local tracker and fake peer setup, verify all pieces, and move the result to the final destination.
+
+Full program v2 is not complete until the foundation milestones and [V2_NETWORK_PLAN.md](V2_NETWORK_PLAN.md) milestones 9–13 are all satisfied.

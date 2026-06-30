@@ -14,7 +14,23 @@ _Avoid_: Frontend, client app
 
 **Torrent File**:
 A metadata file that describes the content to be downloaded, the piece hashes used to verify it, and how peers may be discovered.
-_Avoid_: Magnet link, download file
+_Avoid_: Download file
+
+**Magnet Link**:
+A URI that identifies a torrent by info hash and optional discovery hints before Torrent File metadata is available.
+_Avoid_: Torrent file, torrent URL
+
+**Tracker**:
+A peer discovery service identified by an announce URL that tells the torrent client which peers may have content for an info hash.
+_Avoid_: Search engine, indexer, peer, tracker set
+
+**Private Torrent**:
+A torrent whose metadata forbids distributed peer discovery such as DHT; it may only use Trackers named in its metadata.
+_Avoid_: Public torrent, unlisted torrent
+
+**DHT**:
+Distributed peer discovery used to find peers for an info hash without relying on a Tracker. In v2 the daemon shares one routing table but each DHT-eligible torrent uses its own UDP socket and port.
+_Avoid_: Tracker, magnet link, per-torrent routing table
 
 **Staging Area**:
 The client-owned location where incomplete torrent content is kept before it is ready for handoff.
@@ -39,10 +55,6 @@ _Avoid_: Torrent ID, name, file path
 **Peer ID**:
 The BitTorrent protocol identity presented by this torrent client when announcing to trackers and handshaking with peers.
 _Avoid_: Info hash, user ID, process ID
-
-**Tracker**:
-A peer discovery service named by torrent metadata that tells the torrent client which peers may have content for an info hash.
-_Avoid_: Search engine, indexer, peer
 
 **Peer**:
 A remote BitTorrent participant that the torrent client connects to for torrent content exchange.
