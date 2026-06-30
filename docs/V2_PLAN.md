@@ -16,9 +16,9 @@ The v2 daemon should:
 
 Current implementation progress:
 
-- Milestone 1 transport is implemented: daemon Unix socket, CLI client, JSON-line protocol, structured errors, stale socket handling, and controlled SIGINT/SIGTERM socket cleanup.
-- Milestone 2 is partially implemented: active torrent registry, stable peer ID, metadata/state persistence, TOML configuration loading/validation, tracker metadata validation for top-level `http://` announces, and daemon-owned `add/list/show/pause/resume/remove/status` state transitions. Completed history and startup recheck are still pending.
-- Milestone 3 is partially implemented: storage span mapping and torrent path safety validation are covered by unit tests and `add` rejects unsafe paths before staging metadata. Actual staged file precreation, piece writes, and recheck are still pending.
+- Milestone 1 transport shutdown is implemented: daemon Unix socket, CLI client, JSON-line protocol, structured errors, stale socket handling, and controlled SIGINT/SIGTERM transport shutdown (stop accepting connections, remove owned socket file). Engine-level shutdown behavior (tracker `stopped` announces, peer teardown, state/history flush) is deferred to Milestone 6.
+- Milestone 2 is partially implemented: active torrent registry, stable peer ID, metadata/state persistence, TOML configuration loading/validation, tracker metadata validation for top-level `http://` announces, startup recheck, daemon-owned `add/list/show/pause/resume/remove/status` state transitions, and completed-history read/write/list/show guards are implemented. Still pending: config-limit validation at add and startup, re-add staging-directory adoption with recheck, engine-level pause/resume semantics, persisting startup recheck results, and wiring handoff completion into the daemon lifecycle.
+- Milestone 3 library work is implemented: storage span mapping, torrent path safety validation, staged file precreation, verified-piece writes, and recheck are covered by unit tests; `add` rejects unsafe paths and creates staged files. Daemon integration beyond `createStagedFiles` on add (recheck on re-add, `writeVerifiedPiece` from the download engine) is still pending.
 - Milestones 4-8 are still pending except for existing parser/codec building blocks.
 
 Out of scope for v2:
@@ -50,7 +50,8 @@ Implement the control surface transport so the CLI talks to the daemon instead o
 - Start with one request per connection.
 - Ensure stale socket files are handled safely on daemon startup: acquire the staging-area daemon lock first, try connecting to an existing socket path, fail if a daemon responds, otherwise unlink the stale socket and bind.
 - Remove the socket file on clean shutdown if it is still owned by this daemon.
-- Handle SIGINT/SIGTERM with a controlled shutdown path: stop accepting CLI connections, best-effort send tracker `stopped` for active torrents, close peer sockets, flush state/history, remove the owned socket file, and release the staging-area daemon lock.
+- Handle SIGINT/SIGTERM with controlled transport shutdown: stop accepting CLI connections and remove the owned socket file.
+- On engine shutdown (Milestone 6), extend the shutdown path with best-effort tracker `stopped` announces for active torrents, peer socket teardown, and state/history flush before releasing the staging-area daemon lock.
 
 ### Commands
 
@@ -68,14 +69,14 @@ For v2, `remove` applies to active, paused, or failed torrents only. It means fo
 
 ### Acceptance Criteria
 
-- `torrentd` creates and listens on `NIX_TORRENT_SOCKET_PATH`.
+- `torrentd` creates and listens on the configured `socket_path`.
 - Existing live daemon sockets are not unlinked by a second daemon startup.
 - Stale socket files are removed and replaced safely after the staging-area daemon lock is acquired.
 - `torrent list` talks to the daemon and returns a real response.
 - CLI no longer prints `would send...`.
 - `torrent status` returns daemon health and protocol information, including control protocol version.
 - Invalid commands return structured errors.
-- SIGINT/SIGTERM triggers controlled shutdown without leaving a live-owned socket file behind.
+- SIGINT/SIGTERM triggers controlled transport shutdown without leaving a live-owned socket file behind.
 - Paths, torrent names, and error messages containing JSON-special characters round-trip safely.
 
 ### Response Shape
@@ -237,9 +238,9 @@ Configuration precedence, from highest to lowest:
 2. Default TOML configuration file
 3. Built-in defaults
 
-Individual configuration values are not overridden by CLI flags or environment variables in v2.
+Individual configuration values are not overridden by CLI flags or legacy `NIX_TORRENT_*` environment variables in v2. Standard XDG environment variables (`XDG_CONFIG_HOME`, `XDG_STATE_HOME`, `XDG_RUNTIME_DIR`, `HOME`) may still influence default path resolution when no TOML file is present.
 
-If the default configuration file path is missing, the daemon and CLI should continue with built-in defaults. If `--config /path/to/config.toml` is provided and that file is missing or unreadable, startup should fail with a clear configuration error.
+If the default configuration file path is missing, the daemon and CLI should continue with XDG-based path defaults and built-in limit defaults. If `--config /path/to/config.toml` is provided and that file is missing or unreadable, startup should fail with a clear configuration error.
 
 The daemon may still have documented built-in defaults, but every safety limit above must be overrideable from the TOML configuration file. Engine, network, and logging behavior tunables, such as block request size, peer timeouts, tracker retry backoff, and log level, should also be exposed in the TOML configuration file rather than hidden in code.
 
@@ -248,7 +249,7 @@ Configuration acceptance criteria:
 - `torrentd` validates daemon config values at startup and fails fast with clear errors for invalid values, such as zero block size, invalid announce port, retry minimum greater than retry maximum, or impossible limit relationships.
 - `torrentd --validate-config` validates configuration and exits without starting the daemon.
 - The CLI validates only enough configuration to resolve and connect to the daemon socket.
-- Missing default config file uses environment values and built-in defaults.
+- Missing default config file uses XDG-based path defaults and built-in limit defaults.
 - Missing or unreadable explicit `--config` fails with a clear error.
 - Config file values are loaded correctly.
 - Legacy path flags and environment variables are silently ignored, do not appear in help text, and do not override config file values.
@@ -333,6 +334,8 @@ The daemon should generate `client-peer-id` once and reuse it across restarts. A
 ## Milestone 3: Real Storage Read/Write
 
 Current storage code maps piece spans to files. v2 should perform actual staged file IO. Storage must reject unsafe torrent paths before creating staged files.
+
+Storage IO functions in `src/storage.zig` are complete at the library level. Daemon wiring beyond `createStagedFiles` on `add` waits on the download engine (Milestone 6).
 
 ### Tasks
 
@@ -487,6 +490,8 @@ v2 pause semantics are persistent hard pause: paused torrents close peer connect
 
 ### Initial Strategy
 
+Current `src/engine.zig` only implements sequential piece selection. The peer-aware skip-ahead strategy below is still to be built in this milestone.
+
 Prefer correctness over optimization:
 
 - Sequential piece selection is acceptable for v2, but it must be peer-aware.
@@ -527,6 +532,7 @@ When all pieces are verified, the daemon should finish ownership of the torrent 
 
 - Stop tracker and peer activity for the completed torrent.
 - After all pieces verify, send a best-effort tracker `event=completed` before handoff.
+- Persist completion history through `state.appendHistoryRecord` / `history.json`. Consolidate on `state.CompletionRecord` for durable records and keep `handoff.zig` focused on filesystem moves (`moveCompletedTree`, path helpers). Fold or remove the separate in-memory `handoff.History` type once lifecycle wiring lands.
 - Move staged content to the final destination.
 - Use standard final destination layout:
   - single-file torrents move to `<final_destination>/<name>`
@@ -576,14 +582,14 @@ Build controlled local components to test the daemon without relying on public t
 
 ## Suggested Implementation Order
 
-1. Socket server/client.
-2. Daemon in-memory session model.
-3. Storage IO and recheck.
-4. Fake-peer-driven engine test, before tracker integration.
+1. Socket server/client — done.
+2. Daemon session model and persistence — mostly done.
+3. Storage IO and recheck — library done; daemon `add` creates staged files.
+4. Fake-peer-driven download engine, before tracker integration — next.
 5. Peer TCP layer.
 6. HTTP tracker client.
-7. Handoff.
-8. Persistence and restart hardening.
+7. Handoff (wire `state.appendHistoryRecord`, consolidate with `handoff.zig`).
+8. Integration test harness (Milestone 8).
 
 ## Definition of Done
 

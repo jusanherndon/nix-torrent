@@ -191,26 +191,36 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
         .list => return listResponse(daemon),
         .show => {
             const info_hash = req.argument orelse return .{ .failure = .{ .code = .invalid_arguments, .message = "info hash argument is required" } };
-            const rec = daemon.registry.find(info_hash) orelse return .{ .failure = .{ .code = .not_found, .message = "torrent is not known to this daemon" } };
-            return showResponse(daemon, rec.*);
+            if (daemon.registry.find(info_hash)) |rec| return showResponse(daemon, rec.*);
+            if (daemon.registry.findCompletion(info_hash)) |rec| return showCompletionResponse(daemon, rec.*);
+            return .{ .failure = .{ .code = .not_found, .message = "torrent is not known to this daemon" } };
         },
         .pause => {
             const info_hash = req.argument orelse return .{ .failure = .{ .code = .invalid_arguments, .message = "info hash argument is required" } };
-            const rec = daemon.registry.find(info_hash) orelse return .{ .failure = .{ .code = .not_found, .message = "torrent is not known to this daemon" } };
+            const rec = daemon.registry.find(info_hash) orelse {
+                if (daemon.registry.findCompletion(info_hash) != null) return .{ .failure = .{ .code = .already_completed, .message = "completed torrents cannot be paused, resumed, or removed in v2" } };
+                return .{ .failure = .{ .code = .not_found, .message = "torrent is not known to this daemon" } };
+            };
             rec.status = .paused;
             try state.writeTorrentState(daemon.io, allocator, daemon.cfg.staging_area, rec.*);
             return showResponse(daemon, rec.*);
         },
         .@"resume" => {
             const info_hash = req.argument orelse return .{ .failure = .{ .code = .invalid_arguments, .message = "info hash argument is required" } };
-            const rec = daemon.registry.find(info_hash) orelse return .{ .failure = .{ .code = .not_found, .message = "torrent is not known to this daemon" } };
+            const rec = daemon.registry.find(info_hash) orelse {
+                if (daemon.registry.findCompletion(info_hash) != null) return .{ .failure = .{ .code = .already_completed, .message = "completed torrents cannot be paused, resumed, or removed in v2" } };
+                return .{ .failure = .{ .code = .not_found, .message = "torrent is not known to this daemon" } };
+            };
             rec.status = .active;
             try state.writeTorrentState(daemon.io, allocator, daemon.cfg.staging_area, rec.*);
             return showResponse(daemon, rec.*);
         },
         .remove => {
             const info_hash = req.argument orelse return .{ .failure = .{ .code = .invalid_arguments, .message = "info hash argument is required" } };
-            if (!daemon.registry.remove(info_hash)) return .{ .failure = .{ .code = .not_found, .message = "torrent is not known to this daemon" } };
+            if (!daemon.registry.remove(info_hash)) {
+                if (daemon.registry.findCompletion(info_hash) != null) return .{ .failure = .{ .code = .already_completed, .message = "completed torrents cannot be paused, resumed, or removed in v2" } };
+                return .{ .failure = .{ .code = .not_found, .message = "torrent is not known to this daemon" } };
+            }
             deleteTorrentStateFile(daemon, info_hash) catch {};
             var root: std.json.ObjectMap = .empty;
             errdefer root.deinit(allocator);
@@ -234,6 +244,7 @@ fn addTorrent(daemon: *Daemon, path: []const u8) !protocol.Response {
     };
     const hex_buf = state.infoHashHex(meta.info_hash);
     const hex = &hex_buf;
+    if (daemon.registry.findCompletion(hex) != null) return .{ .failure = .{ .code = .already_completed, .message = "torrent already completed and cannot be re-added in v2" } };
     if (daemon.registry.find(hex) != null) return .{ .failure = .{ .code = .duplicate_torrent, .message = "torrent is already active" } };
 
     const dir = try std.fs.path.join(allocator, &.{ daemon.cfg.staging_area, hex });
@@ -273,6 +284,7 @@ fn listResponse(daemon: *Daemon) !protocol.Response {
     var torrents = std.json.Array.init(allocator);
     errdefer torrents.deinit();
     for (daemon.registry.records.items) |rec| try torrents.append(try summaryValue(allocator, rec));
+    for (daemon.registry.history.items) |rec| try torrents.append(try completionSummaryValue(allocator, rec));
     var root: std.json.ObjectMap = .empty;
     errdefer root.deinit(allocator);
     try root.put(allocator, "torrents", .{ .array = torrents });
@@ -293,6 +305,30 @@ fn showResponse(daemon: *Daemon, rec: state.TorrentRecord) !protocol.Response {
 
 fn summaryValue(allocator: std.mem.Allocator, rec: state.TorrentRecord) !std.json.Value {
     return .{ .object = try summaryObject(allocator, rec) };
+}
+
+fn showCompletionResponse(daemon: *Daemon, rec: state.CompletionRecord) !protocol.Response {
+    var root = try completionSummaryObject(daemon.allocator, rec);
+    errdefer root.deinit(daemon.allocator);
+    try root.put(daemon.allocator, "completed_at", .{ .string = rec.completed_at });
+    return .{ .success = .{ .object = root } };
+}
+
+fn completionSummaryValue(allocator: std.mem.Allocator, rec: state.CompletionRecord) !std.json.Value {
+    return .{ .object = try completionSummaryObject(allocator, rec) };
+}
+
+fn completionSummaryObject(allocator: std.mem.Allocator, rec: state.CompletionRecord) !std.json.ObjectMap {
+    var obj: std.json.ObjectMap = .empty;
+    errdefer obj.deinit(allocator);
+    try obj.put(allocator, "info_hash", .{ .string = rec.info_hash_hex });
+    try obj.put(allocator, "name", .{ .string = rec.name });
+    try obj.put(allocator, "lifecycle_status", .{ .string = "complete" });
+    try obj.put(allocator, "verified_bytes", .{ .integer = @intCast(rec.total_bytes) });
+    try obj.put(allocator, "total_bytes", .{ .integer = @intCast(rec.total_bytes) });
+    try obj.put(allocator, "connected_peer_count", .{ .integer = 0 });
+    try obj.put(allocator, "final_path", .{ .string = rec.final_path });
+    return obj;
 }
 
 fn summaryObject(allocator: std.mem.Allocator, rec: state.TorrentRecord) !std.json.ObjectMap {
@@ -335,6 +371,13 @@ fn recheckPersistedSession(daemon: *Daemon, info_hash_hex: []const u8, rec: *sta
 }
 
 fn loadPersistedSessions(daemon: *Daemon) !void {
+    const history = state.readHistory(daemon.io, daemon.allocator, daemon.cfg.staging_area) catch |err| switch (err) {
+        error.DuplicateCompletion => return error.StateCorruption,
+        else => return err,
+    };
+    defer state.freeHistory(daemon.allocator, history);
+    for (history) |record| try daemon.registry.addCompletion(record);
+
     var dir = std.Io.Dir.cwd().openDir(daemon.io, daemon.cfg.staging_area, .{ .iterate = true }) catch return;
     defer dir.close(daemon.io);
     var it = dir.iterate();
@@ -344,6 +387,7 @@ fn loadPersistedSessions(daemon: *Daemon) !void {
         defer daemon.allocator.free(state_path);
         var rec = state.readTorrentState(daemon.io, daemon.allocator, state_path) catch continue;
         defer state.deinitRecord(daemon.allocator, rec);
+        if (daemon.registry.findCompletion(rec.info_hash_hex) != null) return error.StateCorruption;
         recheckPersistedSession(daemon, entry.name, &rec) catch |err| {
             rec.status = .failed;
             if (rec.tracker_error) |old| daemon.allocator.free(old);

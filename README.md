@@ -9,7 +9,7 @@ The intended shape is a long-running daemon (`torrentd`) controlled by a CLI (`t
 Implemented so far:
 
 - Zig package with daemon and CLI executables
-- Basic config loading from environment/defaults
+- TOML configuration loading with XDG default path and built-in fallbacks
 - Staging area and final destination directory preparation in the daemon
 - JSON-line structured startup logs
 - Unix-domain-socket control transport between `torrent` and `torrentd`
@@ -17,6 +17,7 @@ Implemented so far:
 - Daemon lock and safe stale socket replacement
 - Stable daemon peer ID persisted under the staging area
 - In-memory active torrent registry loaded from per-torrent JSON state
+- Completion history read from/written to daemon-owned `history.json` and surfaced through `list`/`show`
 - `torrent add/list/show/pause/resume/remove/status` control commands
 - Torrent metadata persistence under `<staging>/<info-hash>/metadata.torrent`
 - Storage path safety validation before accepting a torrent
@@ -25,7 +26,7 @@ Implemented so far:
 - Validation for v1 single-file and multi-file torrent metadata
 - Small fixture torrents covered by unit tests
 
-Tracker HTTP I/O, peer TCP I/O, real staged file writes/recheck, the download engine, and handoff are not implemented yet.
+Tracker HTTP I/O, peer TCP I/O, download-engine integration, and handoff are not implemented yet.
 
 ## Build
 
