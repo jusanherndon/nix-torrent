@@ -1,5 +1,6 @@
 const std = @import("std");
 const torrent = @import("torrent.zig");
+const encryption = @import("encryption.zig");
 
 const net = std.Io.net;
 
@@ -71,6 +72,8 @@ pub const Connection = struct {
     recv_buffer: std.ArrayList(u8),
     handshake_done: bool = false,
     closed: bool = false,
+    encryption_mode: encryption.Mode = .plaintext,
+    crypto: ?encryption.Session = null,
 
     pub fn connect(io: std.Io, allocator: std.mem.Allocator, ip: [4]u8, port: u16, timeout_ms: u64) !Connection {
         const addr = net.IpAddress{ .ip4 = .{ .bytes = ip, .port = port } };
@@ -99,16 +102,69 @@ pub const Connection = struct {
         }
     }
 
-    pub fn performHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8) !void {
+    pub fn performHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8, policy: encryption.Policy) !void {
+        switch (policy) {
+            .disable => try self.plaintextHandshake(io, info_hash, peer_id),
+            .prefer => {
+                if (try self.tryEncryptedHandshake(io, info_hash, peer_id)) {
+                    self.handshake_done = true;
+                    return;
+                }
+                self.crypto = null;
+                self.encryption_mode = .plaintext;
+                try self.plaintextHandshake(io, info_hash, peer_id);
+            },
+            .require => {
+                if (!try self.tryEncryptedHandshake(io, info_hash, peer_id)) return error.EncryptionRequired;
+                self.handshake_done = true;
+            },
+        }
+    }
+
+    fn plaintextHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8) !void {
         var out: [68]u8 = undefined;
         encodeHandshake(&out, info_hash, peer_id);
-        try self.sendRaw(io, &out);
-
+        try self.sendRawPlain(io, &out);
         var in: [68]u8 = undefined;
         try readExact(io, self.stream, &in);
         const decoded = try decodeHandshake(&in);
         if (!std.mem.eql(u8, &decoded.info_hash, &info_hash)) return error.InfoHashMismatch;
         self.handshake_done = true;
+    }
+
+    fn tryEncryptedHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8) !bool {
+        const keys = try encryption.generateKeyPair(self.allocator);
+        defer self.allocator.free(keys.private);
+        const init_payload = try encryption.buildInitiatorPayload(self.allocator, keys.public);
+        defer self.allocator.free(init_payload);
+        try self.sendRawPlain(io, init_payload);
+
+        var resp_buf: [700]u8 = undefined;
+        const n = try readSome(io, self.stream, &resp_buf);
+        const resp = resp_buf[0..n];
+        if (resp.len >= 1 and resp[0] == 19) return false;
+        const remote_pub = encryption.extractRemotePublic(resp) orelse return error.MalformedEncryption;
+        if (!encryption.supportsRc4(resp)) return error.UnsupportedEncryption;
+        const select = try encryption.buildSelectPayload(self.allocator);
+        defer self.allocator.free(select);
+        try self.sendRawPlain(io, select);
+
+        const shared = try encryption.sharedSecret(self.allocator, keys.private, remote_pub);
+        defer self.allocator.free(shared);
+        self.crypto = try encryption.Session.derive(self.allocator, shared, true);
+        self.encryption_mode = .encrypted;
+
+        var hs: [68]u8 = undefined;
+        encodeHandshake(&hs, info_hash, peer_id);
+        self.crypto.?.encrypt.crypt(&hs);
+        try self.sendRawPlain(io, &hs);
+
+        var in: [68]u8 = undefined;
+        try readExact(io, self.stream, &in);
+        self.crypto.?.decrypt.crypt(&in);
+        const decoded = try decodeHandshake(&in);
+        if (!std.mem.eql(u8, &decoded.info_hash, &info_hash)) return error.InfoHashMismatch;
+        return true;
     }
 
     pub fn sendInterested(self: *Connection, io: std.Io) !void {
@@ -124,6 +180,18 @@ pub const Connection = struct {
     }
 
     pub fn sendRaw(self: *Connection, io: std.Io, bytes: []const u8) !void {
+        if (self.crypto) |*session| {
+            var scratch: std.ArrayList(u8) = .empty;
+            defer scratch.deinit(self.allocator);
+            try scratch.appendSlice(self.allocator, bytes);
+            session.encrypt.crypt(scratch.items);
+            try self.sendRawPlain(io, scratch.items);
+            return;
+        }
+        try self.sendRawPlain(io, bytes);
+    }
+
+    fn sendRawPlain(self: *Connection, io: std.Io, bytes: []const u8) !void {
         var write_buffer: [4096]u8 = undefined;
         var writer = self.stream.writer(io, &write_buffer);
         try writer.interface.writeAll(bytes);
@@ -143,6 +211,7 @@ pub const Connection = struct {
         var reader = self.stream.reader(io, &buf);
         const n = try reader.interface.readSliceShort(&buf);
         if (n == 0) return 0;
+        if (self.crypto) |*session| session.decrypt.crypt(buf[0..n]);
         try self.recv_buffer.appendSlice(self.allocator, buf[0..n]);
         return n;
     }
@@ -225,6 +294,12 @@ pub fn decodeMessage(bytes: []const u8) !Message {
         .cancel => .{ .cancel = parseBlockRef(payload) },
         .piece => .{ .piece = .{ .index = std.mem.readInt(u32, payload[0..4], .big), .begin = std.mem.readInt(u32, payload[4..8], .big), .block = payload[8..] } },
     };
+}
+
+fn readSome(io: std.Io, stream: net.Stream, buf: []u8) !usize {
+    var read_buffer: [256]u8 = undefined;
+    var reader = stream.reader(io, &read_buffer);
+    return reader.interface.readSliceShort(buf);
 }
 
 fn readExact(io: std.Io, stream: net.Stream, buf: []u8) !void {

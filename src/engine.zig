@@ -302,7 +302,7 @@ fn tickSession(
                 if (session.peers.items.len >= cfg.limits.max_peers_per_torrent) break;
                 if (hasPeer(session, tp.ip, tp.port)) continue;
                 var conn = peer.Connection.connect(io, engine.allocator, tp.ip, tp.port, cfg.network.peer_connect_timeout_ms) catch continue;
-                conn.performHandshake(io, session.meta.info_hash, peer_id) catch {
+                conn.performHandshake(io, session.meta.info_hash, peer_id, config.encryptionPolicy(cfg.network)) catch {
                     conn.deinit(io);
                     continue;
                 };
@@ -388,7 +388,7 @@ fn announceTrackerEndpoint(
         if (session.peers.items.len >= cfg.limits.max_peers_per_torrent) break;
         if (hasPeer(session, tp.ip, tp.port)) continue;
         var conn = peer.Connection.connect(io, engine.allocator, tp.ip, tp.port, cfg.network.peer_connect_timeout_ms) catch continue;
-        conn.performHandshake(io, session.meta.info_hash, peer_id) catch {
+        conn.performHandshake(io, session.meta.info_hash, peer_id, config.encryptionPolicy(cfg.network)) catch {
             conn.deinit(io);
             continue;
         };

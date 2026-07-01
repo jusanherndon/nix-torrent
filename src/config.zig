@@ -29,6 +29,10 @@ const default_bootstrap_nodes = [_][]const u8{
     "dht.transmissionbt.com:6881",
 };
 
+pub const Encryption = struct {
+    policy: []const u8 = "prefer",
+};
+
 pub const Network = struct {
     dht_base_port: u64 = 6881,
     peer_connect_timeout_ms: u64 = 10_000,
@@ -37,6 +41,7 @@ pub const Network = struct {
     tracker_retry_min_ms: u64 = 30_000,
     tracker_retry_max_ms: u64 = 300_000,
     dht: Dht = .{},
+    encryption: Encryption = .{},
 };
 pub const Logging = struct { level: []const u8 = "info", format: []const u8 = "json" };
 
@@ -55,6 +60,7 @@ pub const Config = struct {
         allocator.free(self.socket_path);
         if (!std.mem.eql(u8, self.logging.level, "info")) allocator.free(self.logging.level);
         if (!std.mem.eql(u8, self.logging.format, "json")) allocator.free(self.logging.format);
+        if (!std.mem.eql(u8, self.network.encryption.policy, "prefer")) allocator.free(self.network.encryption.policy);
         for (self.network.dht.bootstrap_nodes) |node| {
             if (!isDefaultBootstrapNode(node)) allocator.free(node);
         }
@@ -197,7 +203,7 @@ fn isDefaultBootstrapNode(node: []const u8) bool {
 }
 
 fn parseTomlInto(allocator: std.mem.Allocator, cfg: *Config, bytes: []const u8) !void {
-    var section: enum { root, paths, limits, engine, network, network_dht, logging } = .root;
+    var section: enum { root, paths, limits, engine, network, network_dht, network_encryption, logging } = .root;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |raw_line| {
         const no_comment = if (std.mem.indexOfScalar(u8, raw_line, '#')) |n| raw_line[0..n] else raw_line;
@@ -205,7 +211,7 @@ fn parseTomlInto(allocator: std.mem.Allocator, cfg: *Config, bytes: []const u8) 
         if (line.len == 0) continue;
         if (line[0] == '[' and line[line.len - 1] == ']') {
             const name = line[1 .. line.len - 1];
-            section = if (std.mem.eql(u8, name, "paths")) .paths else if (std.mem.eql(u8, name, "limits")) .limits else if (std.mem.eql(u8, name, "engine")) .engine else if (std.mem.eql(u8, name, "network.dht")) .network_dht else if (std.mem.eql(u8, name, "network")) .network else if (std.mem.eql(u8, name, "logging")) .logging else return ConfigError.InvalidConfig;
+            section = if (std.mem.eql(u8, name, "paths")) .paths else if (std.mem.eql(u8, name, "limits")) .limits else if (std.mem.eql(u8, name, "engine")) .engine else if (std.mem.eql(u8, name, "network.dht")) .network_dht else if (std.mem.eql(u8, name, "network.encryption")) .network_encryption else if (std.mem.eql(u8, name, "network")) .network else if (std.mem.eql(u8, name, "logging")) .logging else return ConfigError.InvalidConfig;
             continue;
         }
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse return ConfigError.InvalidConfig;
@@ -217,6 +223,7 @@ fn parseTomlInto(allocator: std.mem.Allocator, cfg: *Config, bytes: []const u8) 
             .engine => try parseEngine(&cfg.engine, key, value),
             .network => try parseNetwork(&cfg.network, key, value),
             .network_dht => try parseDht(allocator, &cfg.network.dht, key, value),
+            .network_encryption => try parseEncryption(allocator, &cfg.network.encryption, key, value),
             .logging => try parseLogging(allocator, &cfg.logging, key, value),
             .root => return ConfigError.InvalidConfig,
         }
@@ -262,6 +269,17 @@ fn parseNetwork(n: *Network, key: []const u8, value: []const u8) !void {
     else if (std.mem.eql(u8, key, "tracker_retry_max_ms")) n.tracker_retry_max_ms = v
     else return ConfigError.InvalidConfig;
 }
+
+pub fn encryptionPolicy(network: Network) @import("encryption.zig").Policy {
+    return @import("encryption.zig").parsePolicy(network.encryption.policy) orelse .prefer;
+}
+fn parseEncryption(allocator: std.mem.Allocator, enc: *Encryption, key: []const u8, value: []const u8) !void {
+    if (!std.mem.eql(u8, key, "policy")) return ConfigError.InvalidConfig;
+    const s = try parseString(value);
+    if (!std.mem.eql(u8, enc.policy, "prefer")) allocator.free(enc.policy);
+    enc.policy = if (std.mem.eql(u8, s, "prefer")) "prefer" else try allocator.dupe(u8, s);
+}
+
 fn parseDht(allocator: std.mem.Allocator, dht_cfg: *Dht, key: []const u8, value: []const u8) !void {
     if (std.mem.eql(u8, key, "enabled")) {
         const s = try parseString(value);
