@@ -18,7 +18,10 @@ pub const Announce = struct {
 
 pub const Event = enum { none, started, stopped, completed };
 
+pub const Scheme = enum { http, udp };
+
 pub const AnnounceUrl = struct {
+    scheme: Scheme,
     host: []const u8,
     port: u16,
     path: []const u8,
@@ -28,6 +31,11 @@ pub const AnnounceUrl = struct {
         allocator.free(self.host);
         allocator.free(self.path);
     }
+};
+
+pub const UdpSession = struct {
+    connection_id: i64 = 0,
+    connection_expires_ms: i64 = 0,
 };
 
 pub const TrackerState = struct {
@@ -61,23 +69,35 @@ pub const TrackerState = struct {
     }
 };
 
+pub fn isSupportedTrackerScheme(url: []const u8) bool {
+    return std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "udp://");
+}
+
 pub fn parseAnnounceUrl(allocator: std.mem.Allocator, url: []const u8) !AnnounceUrl {
-    if (!std.mem.startsWith(u8, url, "http://")) return error.UnsupportedTrackerScheme;
-    const rest = url[7..];
-    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.InvalidTrackerUrl;
+    const scheme: Scheme = if (std.mem.startsWith(u8, url, "http://"))
+        .http
+    else if (std.mem.startsWith(u8, url, "udp://"))
+        .udp
+    else
+        return error.UnsupportedTrackerScheme;
+    const prefix_len: usize = if (scheme == .http) 7 else 6;
+    const rest = url[prefix_len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse if (scheme == .udp) rest.len else return error.InvalidTrackerUrl;
     const authority = rest[0..slash];
-    const path_part = rest[slash..];
+    const path_part = if (slash < rest.len) rest[slash..] else "/";
     const colon = std.mem.indexOfScalar(u8, authority, ':');
     const host: []const u8 = if (colon) |c| authority[0..c] else authority;
     if (host.len == 0) return error.InvalidTrackerUrl;
-    const port: u16 = if (colon) |c| std.fmt.parseInt(u16, authority[c + 1 ..], 10) catch return error.InvalidTrackerUrl else 80;
+    const default_port: u16 = if (scheme == .http) 80 else 80;
+    const port: u16 = if (colon) |c| std.fmt.parseInt(u16, authority[c + 1 ..], 10) catch return error.InvalidTrackerUrl else default_port;
     const q = std.mem.indexOfScalar(u8, path_part, '?');
-    const path = if (q) |qi| path_part[0..qi] else path_part;
-    if (path.len == 0) return error.InvalidTrackerUrl;
+    const path = if (scheme == .http) path_part else if (q) |qi| path_part[0..qi] else path_part;
+    if (scheme == .http and path.len == 0) return error.InvalidTrackerUrl;
     return .{
+        .scheme = scheme,
         .host = try allocator.dupe(u8, host),
         .port = port,
-        .path = try allocator.dupe(u8, path_part),
+        .path = try allocator.dupe(u8, if (path.len == 0) "/" else path),
         .has_query = q != null,
     };
 }
@@ -161,6 +181,171 @@ pub fn announceGet(
     }
     _ = timeout_ms;
     return parseAnnounceResponse(allocator, body.items);
+}
+
+const udp_connect_magic: i64 = 0x0000041727101980;
+const udp_connection_ttl_ms: i64 = 50_000;
+
+var udp_tx_seed: u32 = 1;
+fn nextTransactionId() u32 {
+    udp_tx_seed +%= 1;
+    return udp_tx_seed;
+}
+
+pub fn announce(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    parsed: AnnounceUrl,
+    udp_session: *UdpSession,
+    info_hash: torrent.InfoHash,
+    peer_id: [20]u8,
+    port: u16,
+    uploaded: u64,
+    downloaded: u64,
+    left: u64,
+    event: Event,
+    timeout_ms: u64,
+    now_ms: i64,
+) !Announce {
+    return switch (parsed.scheme) {
+        .http => {
+            const path = try buildAnnouncePath(allocator, parsed.path, parsed.has_query, info_hash, peer_id, port, uploaded, downloaded, left, event);
+            defer allocator.free(path);
+            return announceGet(io, allocator, parsed, path, timeout_ms);
+        },
+        .udp => announceUdp(io, allocator, parsed, udp_session, info_hash, peer_id, port, uploaded, downloaded, left, event, timeout_ms, now_ms),
+    };
+}
+
+fn announceUdp(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    parsed: AnnounceUrl,
+    udp_session: *UdpSession,
+    info_hash: torrent.InfoHash,
+    peer_id: [20]u8,
+    port: u16,
+    uploaded: u64,
+    downloaded: u64,
+    left: u64,
+    event: Event,
+    timeout_ms: u64,
+    now_ms: i64,
+) !Announce {
+    if (udp_session.connection_id == 0 or now_ms >= udp_session.connection_expires_ms) {
+        const conn_id = try udpConnect(io, allocator, parsed, timeout_ms);
+        udp_session.connection_id = conn_id;
+        udp_session.connection_expires_ms = now_ms + udp_connection_ttl_ms;
+    }
+    return try udpAnnounce(io, allocator, parsed, udp_session.connection_id, info_hash, peer_id, port, uploaded, downloaded, left, event, timeout_ms);
+}
+
+fn udpConnect(io: std.Io, allocator: std.mem.Allocator, parsed: AnnounceUrl, timeout_ms: u64) !i64 {
+    const transaction_id: u32 = nextTransactionId();
+    var req: [16]u8 = undefined;
+    std.mem.writeInt(i64, req[0..8], udp_connect_magic, .big);
+    std.mem.writeInt(u32, req[8..12], 0, .big);
+    std.mem.writeInt(u32, req[12..16], transaction_id, .big);
+    const resp = try udpTransact(io, allocator, parsed, &req, timeout_ms);
+    defer resp.deinit();
+    if (resp.bytes.len < 16) return error.InvalidTrackerResponse;
+    const action = std.mem.readInt(u32, resp.bytes[0..4], .big);
+    const tx = std.mem.readInt(u32, resp.bytes[4..8], .big);
+    if (action == 3) return error.TrackerFailure;
+    if (action != 0 or tx != transaction_id) return error.InvalidTrackerResponse;
+    return std.mem.readInt(i64, resp.bytes[8..16], .big);
+}
+
+fn udpAnnounce(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    parsed: AnnounceUrl,
+    connection_id: i64,
+    info_hash: torrent.InfoHash,
+    peer_id: [20]u8,
+    port: u16,
+    uploaded: u64,
+    downloaded: u64,
+    left: u64,
+    event: Event,
+    timeout_ms: u64,
+) !Announce {
+    const transaction_id: u32 = nextTransactionId();
+    const event_code: u32 = switch (event) {
+        .none => 0,
+        .completed => 1,
+        .started => 2,
+        .stopped => 3,
+    };
+    var req: [98]u8 = undefined;
+    std.mem.writeInt(i64, req[0..8], connection_id, .big);
+    std.mem.writeInt(u32, req[8..12], 1, .big);
+    std.mem.writeInt(u32, req[12..16], transaction_id, .big);
+    @memcpy(req[16..36], &info_hash);
+    @memcpy(req[36..56], &peer_id);
+    std.mem.writeInt(u64, req[56..64], downloaded, .big);
+    std.mem.writeInt(u64, req[64..72], left, .big);
+    std.mem.writeInt(u64, req[72..80], uploaded, .big);
+    std.mem.writeInt(u32, req[80..84], event_code, .big);
+    std.mem.writeInt(u32, req[84..88], 0, .big);
+    std.mem.writeInt(u32, req[88..92], nextTransactionId(), .big);
+    std.mem.writeInt(u32, req[92..96], 50, .big);
+    std.mem.writeInt(u16, req[96..98], port, .big);
+    const resp = try udpTransact(io, allocator, parsed, &req, timeout_ms);
+    defer resp.deinit();
+    return parseUdpAnnounceResponse(allocator, resp.bytes, transaction_id);
+}
+
+const UdpResponse = struct {
+    bytes: []u8,
+    allocator: std.mem.Allocator,
+    fn deinit(self: UdpResponse) void {
+        self.allocator.free(self.bytes);
+    }
+};
+
+fn udpTransact(io: std.Io, allocator: std.mem.Allocator, parsed: AnnounceUrl, request: []const u8, timeout_ms: u64) !UdpResponse {
+    const addr = net.IpAddress{ .ip4 = .{
+        .bytes = try resolveHost(io, parsed.host),
+        .port = parsed.port,
+    } };
+    const bind_addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = 0 } };
+    var socket = try net.IpAddress.bind(&bind_addr, io, .{ .mode = .dgram });
+    defer socket.close(io);
+    try socket.send(io, &addr, request);
+    var buf: [1500]u8 = undefined;
+    const timeout: std.Io.Timeout = .{ .duration = .{
+        .clock = .awake,
+        .raw = .fromNanoseconds(timeout_ms * std.time.ns_per_ms),
+    } };
+    const message = try socket.receiveTimeout(io, &buf, timeout);
+    const data = try allocator.dupe(u8, message.data);
+    return .{ .bytes = data, .allocator = allocator };
+}
+
+pub fn parseUdpAnnounceResponse(allocator: std.mem.Allocator, bytes: []const u8, transaction_id: u32) !Announce {
+    if (bytes.len < 8) return error.InvalidTrackerResponse;
+    const action = std.mem.readInt(u32, bytes[0..4], .big);
+    const tx = std.mem.readInt(u32, bytes[4..8], .big);
+    if (action == 3) {
+        const reason = if (bytes.len > 8) bytes[8..] else "tracker error";
+        return .{
+            .interval = 0,
+            .peers = try allocator.alloc(Peer, 0),
+            .failure_reason = try allocator.dupe(u8, reason),
+        };
+    }
+    if (action != 1 or tx != transaction_id or bytes.len < 20) return error.InvalidTrackerResponse;
+    const interval = std.mem.readInt(u32, bytes[8..12], .big);
+    const peers_bytes = bytes[20..];
+    const peers = try parseCompactPeers(allocator, peers_bytes);
+    return .{ .interval = interval, .peers = peers };
+}
+
+pub fn trackerShowStatus(tr: TrackerState) []const u8 {
+    if (tr.last_error != null) return "error";
+    if (tr.started_sent) return "ok";
+    return "pending";
 }
 
 fn resolveHost(_: std.Io, host: []const u8) ![4]u8 {
@@ -251,10 +436,10 @@ test "parses compact tracker peers" {
 
 test "parses announce interval and compact peers" {
     const response = "d8:intervali1800e5:peers6:\x7f\x00\x00\x01\x1a\xe1e";
-    const announce = try parseAnnounceResponse(std.testing.allocator, response);
-    defer announce.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 1800), announce.interval);
-    try std.testing.expectEqual(@as(u8, 127), announce.peers[0].ip[0]);
+    const result = try parseAnnounceResponse(std.testing.allocator, response);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 1800), result.interval);
+    try std.testing.expectEqual(@as(u8, 127), result.peers[0].ip[0]);
 }
 
 test "builds announce path with and without existing query parameters" {
@@ -282,9 +467,33 @@ test "parses http tracker announce url" {
 
 test "parses dictionary ipv4 peer responses" {
     const response = "d8:intervali60e5:peersld2:ip13:192.168.0.1004:porti6881eeee";
-    const announce = try parseAnnounceResponse(std.testing.allocator, response);
-    defer announce.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), announce.peers.len);
-    try std.testing.expectEqual(@as(u8, 192), announce.peers[0].ip[0]);
-    try std.testing.expectEqual(@as(u16, 6881), announce.peers[0].port);
+    const dict_result = try parseAnnounceResponse(std.testing.allocator, response);
+    defer dict_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), dict_result.peers.len);
+    try std.testing.expectEqual(@as(u8, 192), dict_result.peers[0].ip[0]);
+    try std.testing.expectEqual(@as(u16, 6881), dict_result.peers[0].port);
+}
+
+test "parses udp tracker announce url" {
+    const parsed = try parseAnnounceUrl(std.testing.allocator, "udp://tracker.example:6969/announce");
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Scheme.udp, parsed.scheme);
+    try std.testing.expectEqualStrings("tracker.example", parsed.host);
+    try std.testing.expectEqual(@as(u16, 6969), parsed.port);
+    try std.testing.expectEqualStrings("/announce", parsed.path);
+}
+
+test "parses udp announce response" {
+    var buf: [26]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], 1, .big);
+    std.mem.writeInt(u32, buf[4..8], 42, .big);
+    std.mem.writeInt(u32, buf[8..12], 1800, .big);
+    std.mem.writeInt(u32, buf[12..16], 0, .big);
+    std.mem.writeInt(u32, buf[16..20], 0, .big);
+    @memcpy(buf[20..26], &[_]u8{ 127, 0, 0, 1, 0x1A, 0xE1 });
+    const udp_result = try parseUdpAnnounceResponse(std.testing.allocator, &buf, 42);
+    defer udp_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 1800), udp_result.interval);
+    try std.testing.expectEqual(@as(usize, 1), udp_result.peers.len);
+    try std.testing.expectEqual(@as(u16, 6881), udp_result.peers[0].port);
 }

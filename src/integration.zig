@@ -8,8 +8,9 @@ const config = @import("config.zig");
 test "integration: rejects duplicate torrent add by info hash" {
     var registry = state.Registry.init(std.testing.allocator, 4, 20);
     defer registry.deinit();
-    try registry.add(.{ .info_hash_hex = "deadbeef", .name = "one" });
-    try std.testing.expectError(error.DuplicateTorrent, registry.add(.{ .info_hash_hex = "deadbeef", .name = "two" }));
+    var trackers = [_]state.TrackerRecord{.{ .url = "http://127.0.0.1/announce" }};
+    try registry.add(.{ .info_hash_hex = "deadbeef", .name = "one", .trackers = trackers[0..] });
+    try std.testing.expectError(error.DuplicateTorrent, registry.add(.{ .info_hash_hex = "deadbeef", .name = "two", .trackers = trackers[0..] }));
 }
 
 test "integration: engine startup recheck reports zero verified bytes for empty staging" {
@@ -33,11 +34,12 @@ test "integration: engine startup recheck reports zero verified bytes for empty 
 
     var registry = state.Registry.init(allocator, 4, 20);
     defer registry.deinit();
+    var trackers = [_]state.TrackerRecord{.{ .url = "http://127.0.0.1/announce" }};
     try registry.add(.{
         .info_hash_hex = &hex,
         .name = meta.name,
         .status = .active,
-        .tracker_url = "http://127.0.0.1/announce",
+        .trackers = trackers[0..],
         .total_bytes = state.totalBytes(meta),
         .piece_length = meta.piece_length,
         .piece_count = meta.pieces.len / 20,

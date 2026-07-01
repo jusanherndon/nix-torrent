@@ -37,13 +37,26 @@ pub const PieceDownload = struct {
     }
 };
 
+pub const TrackerEndpoint = struct {
+    raw_url: []const u8,
+    parsed: tracker.AnnounceUrl,
+    state: tracker.TrackerState,
+    udp: tracker.UdpSession,
+
+    pub fn deinit(self: *TrackerEndpoint, allocator: std.mem.Allocator) void {
+        allocator.free(self.raw_url);
+        self.state.deinit(allocator);
+        self.parsed.deinit(allocator);
+    }
+};
+
 pub const TorrentSession = struct {
     info_hash_hex: []const u8,
     meta: torrent.Metadata,
     layout: storage.Layout,
     content_dir: []const u8,
-    tracker_state: tracker.TrackerState,
-    announce_url: tracker.AnnounceUrl,
+    trackers: std.ArrayList(TrackerEndpoint),
+    announce_port: u16,
     peers: std.ArrayList(peer.Connection),
     active_piece: ?PieceDownload,
     failure_reason: ?[]const u8 = null,
@@ -55,8 +68,8 @@ pub const TorrentSession = struct {
         self.layout.deinit();
         self.meta.deinit();
         allocator.free(self.content_dir);
-        self.tracker_state.deinit(allocator);
-        self.announce_url.deinit(allocator);
+        for (self.trackers.items) |*tr| tr.deinit(allocator);
+        self.trackers.deinit(allocator);
         if (self.failure_reason) |s| allocator.free(s);
     }
 };
@@ -99,18 +112,38 @@ pub const Engine = struct {
         for (layout.piece_states) |ps| {
             if (ps == .verified) rec.verified_piece_count += 1;
         }
-        const announce_url = if (rec.tracker_url) |url| try tracker.parseAnnounceUrl(self.allocator, url) else return error.MissingTracker;
+        if (rec.trackers.len == 0) return error.MissingTracker;
+
+        var trackers: std.ArrayList(TrackerEndpoint) = .empty;
+        errdefer {
+            for (trackers.items) |*tr| tr.deinit(self.allocator);
+            trackers.deinit(self.allocator);
+        }
+        for (rec.trackers) |*tr_rec| {
+            const parsed = try tracker.parseAnnounceUrl(self.allocator, tr_rec.url);
+            errdefer parsed.deinit(self.allocator);
+            try trackers.append(self.allocator, .{
+                .raw_url = try self.allocator.dupe(u8, tr_rec.url),
+                .parsed = parsed,
+                .state = .{
+                    .next_announce_ms = tr_rec.next_announce_ms,
+                    .last_error = if (tr_rec.last_error) |s| try self.allocator.dupe(u8, s) else null,
+                    .started_sent = tr_rec.started_sent,
+                    .retry_min_ms = @intCast(cfg.network.tracker_retry_min_ms),
+                    .retry_max_ms = @intCast(cfg.network.tracker_retry_max_ms),
+                    .retry_ms = @intCast(cfg.network.tracker_retry_min_ms),
+                },
+                .udp = .{},
+            });
+        }
+
         const session = TorrentSession{
             .info_hash_hex = rec.info_hash_hex,
             .meta = meta,
             .layout = layout,
             .content_dir = content_dir,
-            .tracker_state = .{
-                .retry_min_ms = @intCast(cfg.network.tracker_retry_min_ms),
-                .retry_max_ms = @intCast(cfg.network.tracker_retry_max_ms),
-                .retry_ms = @intCast(cfg.network.tracker_retry_min_ms),
-            },
-            .announce_url = announce_url,
+            .trackers = trackers,
+            .announce_port = @intCast(cfg.network.dht_base_port),
             .peers = .empty,
             .active_piece = null,
         };
@@ -134,57 +167,99 @@ pub const Engine = struct {
         return null;
     }
 
+    pub fn sendTrackerEvent(
+        self: *Engine,
+        io: std.Io,
+        cfg: config.Config,
+        session: *TorrentSession,
+        rec: *state.TorrentRecord,
+        peer_id: [20]u8,
+        event: tracker.Event,
+        now_ms: i64,
+    ) void {
+        for (session.trackers.items, 0..) |*endpoint, i| {
+            if (event == .stopped and !endpoint.state.started_sent) continue;
+            if (event == .started and endpoint.state.started_sent) continue;
+            const left = leftBytes(session.layout, rec.total_bytes);
+            const response = tracker.announce(
+                io,
+                self.allocator,
+                endpoint.parsed,
+                &endpoint.udp,
+                session.meta.info_hash,
+                peer_id,
+                session.announce_port,
+                0,
+                rec.total_bytes - left,
+                left,
+                event,
+                cfg.network.tracker_request_timeout_ms,
+                now_ms,
+            ) catch continue;
+            response.deinit(self.allocator);
+            if (event == .started) endpoint.state.started_sent = true;
+            if (event == .stopped) endpoint.state.started_sent = false;
+            syncTrackerRecord(self.allocator, rec, i, endpoint);
+        }
+    }
+
     pub fn tick(self: *Engine, io: std.Io, cfg: config.Config, registry: *state.Registry, peer_id: [20]u8, now_ms: i64) !void {
         for (self.sessions.items) |*session| {
             const rec = registry.find(session.info_hash_hex) orelse continue;
             try tickSession(self, io, cfg, registry, session, rec, peer_id, now_ms);
         }
     }
-
-    fn tickSession(
-        engine: *Engine,
-        io: std.Io,
-        cfg: config.Config,
-        registry: *state.Registry,
-        session: *TorrentSession,
-        rec: *state.TorrentRecord,
-        peer_id: [20]u8,
-        now_ms: i64,
-    ) !void {
-        if (rec.status == .paused or rec.status == .failed or rec.status == .complete) {
-            if (rec.status == .paused or rec.status == .failed) closePeers(session, io);
-            return;
-        }
-
-        if (session.layout.complete()) {
-            try completeTorrent(engine, io, cfg, registry, session, rec, peer_id, now_ms);
-            return;
-        }
-
-        if (session.tracker_state.due(now_ms)) {
-            try announceTracker(engine, io, cfg, session, rec, peer_id, now_ms);
-        }
-
-        try maintainPeers(io, cfg, session, peer_id, now_ms);
-        try pollPeers(io, cfg, session, rec, now_ms);
-        try scheduleDownloads(io, cfg, session, rec, now_ms);
-        rec.verified_piece_count = countVerified(session.layout);
-        rec.tracker_error = if (session.tracker_state.last_error) |s| try engine.allocator.dupe(u8, s) else null;
-        if (rec.tracker_error != null and session.tracker_state.last_error == null) {
-            if (rec.tracker_error) |old| engine.allocator.free(old);
-            rec.tracker_error = null;
-        }
-        try state.writeTorrentState(io, engine.allocator, cfg.staging_area, rec.*);
-    }
-
-    fn countVerified(layout: storage.Layout) usize {
-        var n: usize = 0;
-        for (layout.piece_states) |ps| {
-            if (ps == .verified) n += 1;
-        }
-        return n;
-    }
 };
+
+fn syncTrackerRecord(allocator: std.mem.Allocator, rec: *state.TorrentRecord, index: usize, endpoint: *TrackerEndpoint) void {
+    if (index >= rec.trackers.len) return;
+    const tr = &rec.trackers[index];
+    tr.next_announce_ms = endpoint.state.next_announce_ms;
+    tr.started_sent = endpoint.state.started_sent;
+    if (tr.last_error) |old| allocator.free(old);
+    tr.last_error = if (endpoint.state.last_error) |s| allocator.dupe(u8, s) catch null else null;
+}
+
+fn tickSession(
+    engine: *Engine,
+    io: std.Io,
+    cfg: config.Config,
+    registry: *state.Registry,
+    session: *TorrentSession,
+    rec: *state.TorrentRecord,
+    peer_id: [20]u8,
+    now_ms: i64,
+) !void {
+    if (rec.status == .paused or rec.status == .failed or rec.status == .complete) {
+        if (rec.status == .paused or rec.status == .failed) closePeers(session, io);
+        return;
+    }
+
+    if (session.layout.complete()) {
+        try completeTorrent(engine, io, cfg, registry, session, rec, peer_id, now_ms);
+        return;
+    }
+
+    for (session.trackers.items, 0..) |*endpoint, i| {
+        if (endpoint.state.due(now_ms)) {
+            try announceTrackerEndpoint(engine, io, cfg, session, rec, endpoint, i, peer_id, now_ms);
+        }
+    }
+
+    try maintainPeers(io, cfg, session, peer_id, now_ms);
+    try pollPeers(io, cfg, session, rec, now_ms);
+    try scheduleDownloads(io, cfg, session, rec, now_ms);
+    rec.verified_piece_count = countVerified(session.layout);
+    try state.writeTorrentState(io, engine.allocator, cfg.staging_area, rec.*);
+}
+
+fn countVerified(layout: storage.Layout) usize {
+    var n: usize = 0;
+    for (layout.piece_states) |ps| {
+        if (ps == .verified) n += 1;
+    }
+    return n;
+}
 
 fn closePeers(session: *TorrentSession, io: std.Io) void {
     for (session.peers.items) |*p| p.close(io);
@@ -195,51 +270,51 @@ fn closePeers(session: *TorrentSession, io: std.Io) void {
     }
 }
 
-fn announceTracker(
+fn announceTrackerEndpoint(
     engine: *Engine,
     io: std.Io,
     cfg: config.Config,
     session: *TorrentSession,
     rec: *state.TorrentRecord,
+    endpoint: *TrackerEndpoint,
+    tracker_index: usize,
     peer_id: [20]u8,
     now_ms: i64,
 ) !void {
     const left = leftBytes(session.layout, rec.total_bytes);
-    const event: tracker.Event = if (!session.tracker_state.started_sent) .started else .none;
-    const path = try tracker.buildAnnouncePath(
+    const event: tracker.Event = if (!endpoint.state.started_sent) .started else .none;
+    const response = tracker.announce(
+        io,
         engine.allocator,
-        session.announce_url.path,
-        session.announce_url.has_query,
+        endpoint.parsed,
+        &endpoint.udp,
         session.meta.info_hash,
         peer_id,
-        @intCast(cfg.network.announce_port),
+        session.announce_port,
         0,
         rec.total_bytes - left,
         left,
         event,
-    );
-    defer engine.allocator.free(path);
-    const response = tracker.announceGet(io, engine.allocator, session.announce_url, path, cfg.network.tracker_request_timeout_ms) catch |err| {
+        cfg.network.tracker_request_timeout_ms,
+        now_ms,
+    ) catch |err| {
         const msg = try std.fmt.allocPrint(engine.allocator, "tracker announce failed: {s}", .{@errorName(err)});
         defer engine.allocator.free(msg);
-        try session.tracker_state.scheduleFailure(now_ms, msg, engine.allocator);
-        if (rec.tracker_error) |old| engine.allocator.free(old);
-        rec.tracker_error = try engine.allocator.dupe(u8, msg);
+        try endpoint.state.scheduleFailure(now_ms, msg, engine.allocator);
+        syncTrackerRecord(engine.allocator, rec, tracker_index, endpoint);
         return;
     };
     defer response.deinit(engine.allocator);
     if (response.failure_reason) |reason| {
-        try session.tracker_state.scheduleFailure(now_ms, reason, engine.allocator);
-        if (rec.tracker_error) |old| engine.allocator.free(old);
-        rec.tracker_error = try engine.allocator.dupe(u8, reason);
+        try endpoint.state.scheduleFailure(now_ms, reason, engine.allocator);
+        syncTrackerRecord(engine.allocator, rec, tracker_index, endpoint);
         return;
     }
-    if (rec.tracker_error) |old| engine.allocator.free(old);
-    rec.tracker_error = null;
-    if (session.tracker_state.last_error) |old| engine.allocator.free(old);
-    session.tracker_state.last_error = null;
-    session.tracker_state.started_sent = true;
-    session.tracker_state.scheduleSuccess(now_ms, response.interval);
+    if (endpoint.state.last_error) |old| engine.allocator.free(old);
+    endpoint.state.last_error = null;
+    endpoint.state.started_sent = true;
+    endpoint.state.scheduleSuccess(now_ms, response.interval);
+    syncTrackerRecord(engine.allocator, rec, tracker_index, endpoint);
     for (response.peers) |tp| {
         if (session.peers.items.len >= cfg.limits.max_peers_per_torrent) break;
         if (hasPeer(session, tp.ip, tp.port)) continue;
@@ -426,32 +501,11 @@ fn completeTorrent(
     peer_id: [20]u8,
     now_ms: i64,
 ) !void {
-    _ = now_ms;
     closePeers(session, io);
-    const left = leftBytes(session.layout, rec.total_bytes);
-    if (left == 0 and !session.tracker_state.started_sent) {
-        // still announce completed below
-    }
-    const path = try tracker.buildAnnouncePath(
-        engine.allocator,
-        session.announce_url.path,
-        session.announce_url.has_query,
-        session.meta.info_hash,
-        peer_id,
-        @intCast(cfg.network.announce_port),
-        0,
-        rec.total_bytes,
-        0,
-        .completed,
-    );
-    defer engine.allocator.free(path);
-    _ = tracker.announceGet(io, engine.allocator, session.announce_url, path, cfg.network.tracker_request_timeout_ms) catch {};
+    engine.sendTrackerEvent(io, cfg, session, rec, peer_id, .completed, now_ms);
 
-    const final_path = handoff.moveCompletedContent(io, engine.allocator, session.content_dir, session.meta, cfg.final_destination) catch |err| {
+    const final_path = handoff.moveCompletedContent(io, engine.allocator, session.content_dir, session.meta, cfg.final_destination) catch {
         rec.status = .failed;
-        if (rec.tracker_error) |old| engine.allocator.free(old);
-        rec.tracker_error = try std.fmt.allocPrint(engine.allocator, "handoff failed: {s}", .{@errorName(err)});
-        try state.writeTorrentState(io, engine.allocator, cfg.staging_area, rec.*);
         return;
     };
     defer engine.allocator.free(final_path);
@@ -514,12 +568,13 @@ test "selects peer-available missing pieces ahead of unavailable sequential piec
         .meta = undefined,
         .layout = layout,
         .content_dir = "content",
-        .tracker_state = .{},
-        .announce_url = .{ .host = "127.0.0.1", .port = 80, .path = "/a", .has_query = false },
+        .trackers = .empty,
+        .announce_port = 6881,
         .peers = .empty,
         .active_piece = null,
     };
     defer session.peers.deinit(std.testing.allocator);
+    defer session.trackers.deinit(std.testing.allocator);
     try session.peers.append(std.testing.allocator, conn);
     try std.testing.expectEqual(@as(?usize, 2), pickPiece(&session));
 }

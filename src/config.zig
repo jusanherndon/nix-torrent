@@ -17,7 +17,7 @@ pub const Limits = struct {
 
 pub const Engine = struct { block_request_bytes: u64 = 16_384 };
 pub const Network = struct {
-    announce_port: u64 = 6881,
+    dht_base_port: u64 = 6881,
     peer_connect_timeout_ms: u64 = 10_000,
     peer_request_timeout_ms: u64 = 30_000,
     tracker_request_timeout_ms: u64 = 10_000,
@@ -154,7 +154,8 @@ pub fn validateDaemon(cfg: Config) !void {
     if (cfg.limits.max_piece_bytes == 0 or cfg.limits.max_piece_count == 0 or cfg.limits.max_active_torrents == 0) return ConfigError.InvalidConfig;
     if (cfg.limits.max_peers_per_torrent == 0 or cfg.limits.max_in_progress_pieces_per_torrent == 0 or cfg.limits.max_in_flight_blocks_per_peer == 0) return ConfigError.InvalidConfig;
     if (cfg.engine.block_request_bytes == 0 or cfg.engine.block_request_bytes > cfg.limits.max_piece_bytes) return ConfigError.InvalidConfig;
-    if (cfg.network.announce_port == 0 or cfg.network.announce_port > 65535) return ConfigError.InvalidConfig;
+    if (cfg.network.dht_base_port == 0 or cfg.network.dht_base_port > 65535) return ConfigError.InvalidConfig;
+    if (cfg.network.dht_base_port + cfg.limits.max_active_torrents > 65535) return ConfigError.InvalidConfig;
     if (cfg.network.tracker_retry_min_ms > cfg.network.tracker_retry_max_ms) return ConfigError.InvalidConfig;
     if (!std.mem.eql(u8, cfg.logging.format, "json")) return ConfigError.InvalidConfig;
 }
@@ -223,6 +224,10 @@ fn parseEngine(e: *Engine, key: []const u8, value: []const u8) !void {
 }
 fn parseNetwork(n: *Network, key: []const u8, value: []const u8) !void {
     const v = try parseInt(value);
+    if (std.mem.eql(u8, key, "announce_port")) {
+        n.dht_base_port = v;
+        return;
+    }
     inline for (@typeInfo(Network).@"struct".fields) |field| {
         if (std.mem.eql(u8, key, field.name)) { @field(n, field.name) = v; return; }
     }

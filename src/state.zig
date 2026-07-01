@@ -3,12 +3,32 @@ const torrent = @import("torrent.zig");
 
 pub const Status = enum { active, paused, complete, failed };
 
+pub const TrackerRecord = struct {
+    url: []const u8,
+    last_error: ?[]const u8 = null,
+    next_announce_ms: i64 = 0,
+    started_sent: bool = false,
+
+    pub fn deinit(self: *TrackerRecord, allocator: std.mem.Allocator) void {
+        allocator.free(self.url);
+        if (self.last_error) |s| allocator.free(s);
+    }
+
+    pub fn clone(allocator: std.mem.Allocator, record: TrackerRecord) !TrackerRecord {
+        return .{
+            .url = try allocator.dupe(u8, record.url),
+            .last_error = if (record.last_error) |s| try allocator.dupe(u8, s) else null,
+            .next_announce_ms = record.next_announce_ms,
+            .started_sent = record.started_sent,
+        };
+    }
+};
+
 pub const TorrentRecord = struct {
     info_hash_hex: []const u8,
     name: []const u8,
     status: Status = .active,
-    tracker_url: ?[]const u8 = null,
-    tracker_error: ?[]const u8 = null,
+    trackers: []TrackerRecord,
     total_bytes: u64 = 0,
     piece_length: u64 = 0,
     piece_count: usize = 0,
@@ -99,12 +119,17 @@ pub fn totalBytes(meta: torrent.Metadata) u64 {
 }
 
 pub fn cloneRecord(allocator: std.mem.Allocator, record: TorrentRecord) !TorrentRecord {
+    const trackers = try allocator.alloc(TrackerRecord, record.trackers.len);
+    errdefer {
+        for (trackers) |*tr| tr.deinit(allocator);
+        allocator.free(trackers);
+    }
+    for (record.trackers, 0..) |tr, i| trackers[i] = try TrackerRecord.clone(allocator, tr);
     return .{
         .info_hash_hex = try allocator.dupe(u8, record.info_hash_hex),
         .name = try allocator.dupe(u8, record.name),
         .status = record.status,
-        .tracker_url = if (record.tracker_url) |s| try allocator.dupe(u8, s) else null,
-        .tracker_error = if (record.tracker_error) |s| try allocator.dupe(u8, s) else null,
+        .trackers = trackers,
         .total_bytes = record.total_bytes,
         .piece_length = record.piece_length,
         .piece_count = record.piece_count,
@@ -115,8 +140,13 @@ pub fn cloneRecord(allocator: std.mem.Allocator, record: TorrentRecord) !Torrent
 pub fn deinitRecord(allocator: std.mem.Allocator, record: TorrentRecord) void {
     allocator.free(record.info_hash_hex);
     allocator.free(record.name);
-    if (record.tracker_url) |s| allocator.free(s);
-    if (record.tracker_error) |s| allocator.free(s);
+    for (record.trackers) |*tr| tr.deinit(allocator);
+    allocator.free(record.trackers);
+}
+
+pub fn findTracker(record: *TorrentRecord, url: []const u8) ?*TrackerRecord {
+    for (record.trackers) |*tr| if (std.mem.eql(u8, tr.url, url)) return tr;
+    return null;
 }
 
 pub fn writeTorrentState(io: std.Io, allocator: std.mem.Allocator, staging_root: []const u8, record: TorrentRecord) !void {
@@ -148,8 +178,25 @@ fn recordJson(allocator: std.mem.Allocator, record: TorrentRecord) ![]u8 {
     try jw.write(record.name);
     try jw.objectField("status");
     try jw.write(@tagName(record.status));
-    try jw.objectField("tracker_url");
-    if (record.tracker_url) |s| try jw.write(s) else try jw.write(null);
+    try jw.objectField("tracker_announce_urls");
+    try jw.beginArray();
+    for (record.trackers) |tr| try jw.write(tr.url);
+    try jw.endArray();
+    try jw.objectField("trackers");
+    try jw.beginArray();
+    for (record.trackers) |tr| {
+        try jw.beginObject();
+        try jw.objectField("url");
+        try jw.write(tr.url);
+        try jw.objectField("started_sent");
+        try jw.write(tr.started_sent);
+        try jw.objectField("next_announce_ms");
+        try jw.write(tr.next_announce_ms);
+        try jw.objectField("last_error");
+        if (tr.last_error) |s| try jw.write(s) else try jw.write(null);
+        try jw.endObject();
+    }
+    try jw.endArray();
     try jw.objectField("total_bytes");
     try jw.write(record.total_bytes);
     try jw.objectField("piece_length");
@@ -254,11 +301,19 @@ fn historyJson(allocator: std.mem.Allocator, history: []const CompletionRecord) 
 pub fn readTorrentState(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !TorrentRecord {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
     defer allocator.free(bytes);
+    const WireTracker = struct {
+        url: []const u8,
+        started_sent: bool = false,
+        next_announce_ms: i64 = 0,
+        last_error: ?[]const u8 = null,
+    };
     const Wire = struct {
         info_hash: []const u8,
         name: []const u8,
         status: []const u8,
         tracker_url: ?[]const u8 = null,
+        tracker_announce_urls: ?[][]const u8 = null,
+        trackers: ?[]WireTracker = null,
         total_bytes: u64 = 0,
         piece_length: u64 = 0,
         piece_count: usize = 0,
@@ -266,11 +321,34 @@ pub fn readTorrentState(io: std.Io, allocator: std.mem.Allocator, path: []const 
     };
     const parsed = try std.json.parseFromSlice(Wire, allocator, bytes, .{});
     defer parsed.deinit();
+
+    const url_count = if (parsed.value.tracker_announce_urls) |urls| urls.len else if (parsed.value.tracker_url != null) 1 else if (parsed.value.trackers) |trs| trs.len else 0;
+    const trackers = try allocator.alloc(TrackerRecord, url_count);
+    errdefer {
+        for (trackers) |*tr| tr.deinit(allocator);
+        allocator.free(trackers);
+    }
+
+    if (parsed.value.trackers) |wire_trackers| {
+        for (wire_trackers, 0..) |wt, i| {
+            trackers[i] = .{
+                .url = try allocator.dupe(u8, wt.url),
+                .last_error = if (wt.last_error) |s| try allocator.dupe(u8, s) else null,
+                .next_announce_ms = wt.next_announce_ms,
+                .started_sent = wt.started_sent,
+            };
+        }
+    } else if (parsed.value.tracker_announce_urls) |urls| {
+        for (urls, 0..) |url, i| trackers[i] = .{ .url = try allocator.dupe(u8, url) };
+    } else if (parsed.value.tracker_url) |url| {
+        trackers[0] = .{ .url = try allocator.dupe(u8, url) };
+    }
+
     return .{
         .info_hash_hex = try allocator.dupe(u8, parsed.value.info_hash),
         .name = try allocator.dupe(u8, parsed.value.name),
         .status = parseStatus(parsed.value.status) orelse .failed,
-        .tracker_url = if (parsed.value.tracker_url) |s| try allocator.dupe(u8, s) else null,
+        .trackers = trackers,
         .total_bytes = parsed.value.total_bytes,
         .piece_length = parsed.value.piece_length,
         .piece_count = parsed.value.piece_count,
@@ -286,15 +364,17 @@ fn parseStatus(s: []const u8) ?Status {
 test "rejects duplicate torrent by info hash" {
     var registry = Registry.init(std.testing.allocator, 4, 20);
     defer registry.deinit();
-    try registry.add(.{ .info_hash_hex = "abcd", .name = "one" });
-    try std.testing.expectError(error.DuplicateTorrent, registry.add(.{ .info_hash_hex = "abcd", .name = "two" }));
+    var trackers = [_]TrackerRecord{.{ .url = "http://127.0.0.1/announce" }};
+    try registry.add(.{ .info_hash_hex = "abcd", .name = "one", .trackers = trackers[0..] });
+    try std.testing.expectError(error.DuplicateTorrent, registry.add(.{ .info_hash_hex = "abcd", .name = "two", .trackers = trackers[0..] }));
 }
 
 test "enforces active torrent limits" {
     var registry = Registry.init(std.testing.allocator, 1, 20);
     defer registry.deinit();
-    try registry.add(.{ .info_hash_hex = "a", .name = "one" });
-    try std.testing.expectError(error.ActiveTorrentLimit, registry.add(.{ .info_hash_hex = "b", .name = "two" }));
+    var trackers = [_]TrackerRecord{.{ .url = "http://127.0.0.1/announce" }};
+    try registry.add(.{ .info_hash_hex = "a", .name = "one", .trackers = trackers[0..] });
+    try std.testing.expectError(error.ActiveTorrentLimit, registry.add(.{ .info_hash_hex = "b", .name = "two", .trackers = trackers[0..] }));
 }
 
 test "loads completion history and rejects duplicate info hashes" {

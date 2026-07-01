@@ -6,6 +6,7 @@ const log = @import("log.zig");
 const protocol = @import("protocol.zig");
 const state = @import("state.zig");
 const torrent = @import("torrent.zig");
+const tracker = @import("tracker.zig");
 const storage = @import("storage.zig");
 
 const net = std.Io.net;
@@ -212,6 +213,9 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
                 if (daemon.registry.findCompletion(info_hash) != null) return .{ .failure = .{ .code = .already_completed, .message = "completed torrents cannot be paused, resumed, or removed in v2" } };
                 return .{ .failure = .{ .code = .not_found, .message = "torrent is not known to this daemon" } };
             };
+            if (daemon.engine.findSession(info_hash)) |session| {
+                daemon.engine.sendTrackerEvent(daemon.io, daemon.cfg, session, rec, daemon.peer_id, .stopped, nowMs(daemon.io));
+            }
             rec.status = .paused;
             try state.writeTorrentState(daemon.io, allocator, daemon.cfg.staging_area, rec.*);
             daemon.engine.removeSession(daemon.io, info_hash);
@@ -223,17 +227,28 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
                 if (daemon.registry.findCompletion(info_hash) != null) return .{ .failure = .{ .code = .already_completed, .message = "completed torrents cannot be paused, resumed, or removed in v2" } };
                 return .{ .failure = .{ .code = .not_found, .message = "torrent is not known to this daemon" } };
             };
-            rec.status = .active;
-            if (rec.tracker_error) |old| {
-                daemon.allocator.free(old);
-                rec.tracker_error = null;
+            for (rec.trackers) |*tr| {
+                if (tr.last_error) |old| {
+                    daemon.allocator.free(old);
+                    tr.last_error = null;
+                }
             }
+            rec.status = .active;
             try state.writeTorrentState(daemon.io, allocator, daemon.cfg.staging_area, rec.*);
             try daemon.engine.addSession(daemon.io, daemon.cfg, &daemon.registry, rec);
+            if (daemon.engine.findSession(info_hash)) |session| {
+                daemon.engine.sendTrackerEvent(daemon.io, daemon.cfg, session, rec, daemon.peer_id, .started, nowMs(daemon.io));
+            }
             return showResponse(daemon, rec.*);
         },
         .remove => {
             const info_hash = req.argument orelse return .{ .failure = .{ .code = .invalid_arguments, .message = "info hash argument is required" } };
+            const rec = daemon.registry.find(info_hash);
+            if (rec) |r| {
+                if (daemon.engine.findSession(info_hash)) |session| {
+                    daemon.engine.sendTrackerEvent(daemon.io, daemon.cfg, session, r, daemon.peer_id, .stopped, nowMs(daemon.io));
+                }
+            }
             if (!daemon.registry.remove(info_hash)) {
                 if (daemon.registry.findCompletion(info_hash) != null) return .{ .failure = .{ .code = .already_completed, .message = "completed torrents cannot be paused, resumed, or removed in v2" } };
                 return .{ .failure = .{ .code = .not_found, .message = "torrent is not known to this daemon" } };
@@ -259,9 +274,11 @@ fn addTorrent(daemon: *Daemon, path: []const u8) !protocol.Response {
     storage.validatePaths(allocator, meta) catch return .{ .failure = .{ .code = .storage_error, .message = "torrent contains unsafe or unsupported file paths" } };
 
     const announce = validateTracker(meta) catch |err| switch (err) {
-        error.UnsupportedTrackerScheme => return .{ .failure = .{ .code = .unsupported_tracker_scheme, .message = "only plain http:// trackers are supported in v2" } },
+        error.UnsupportedTrackerScheme => return .{ .failure = .{ .code = .unsupported_tracker_scheme, .message = "only plain http:// and udp:// trackers are supported in v2" } },
         else => return .{ .failure = .{ .code = .unsupported_tracker_metadata, .message = "torrent requires a usable top-level announce tracker" } },
     };
+    const tracker_records = try buildTrackerRecords(daemon.allocator, &.{announce});
+    defer freeTrackerRecords(daemon.allocator, tracker_records);
     const hex_buf = state.infoHashHex(meta.info_hash);
     const hex = &hex_buf;
     if (daemon.registry.findCompletion(hex) != null) return .{ .failure = .{ .code = .already_completed, .message = "torrent already completed and cannot be re-added in v2" } };
@@ -300,7 +317,7 @@ fn addTorrent(daemon: *Daemon, path: []const u8) !protocol.Response {
         .info_hash_hex = hex,
         .name = meta.name,
         .status = .active,
-        .tracker_url = announce,
+        .trackers = tracker_records,
         .total_bytes = state.totalBytes(meta),
         .piece_length = meta.piece_length,
         .piece_count = meta.pieces.len / 20,
@@ -319,8 +336,20 @@ fn addTorrent(daemon: *Daemon, path: []const u8) !protocol.Response {
 
 fn validateTracker(meta: torrent.Metadata) ![]const u8 {
     const announce = meta.announce orelse return error.UnsupportedTrackerMetadata;
-    if (!std.mem.startsWith(u8, announce, "http://")) return error.UnsupportedTrackerScheme;
+    if (!tracker.isSupportedTrackerScheme(announce)) return error.UnsupportedTrackerScheme;
     return announce;
+}
+
+fn buildTrackerRecords(allocator: std.mem.Allocator, urls: []const []const u8) ![]state.TrackerRecord {
+    const records = try allocator.alloc(state.TrackerRecord, urls.len);
+    errdefer allocator.free(records);
+    for (urls, 0..) |url, i| records[i] = .{ .url = try allocator.dupe(u8, url) };
+    return records;
+}
+
+fn freeTrackerRecords(allocator: std.mem.Allocator, records: []state.TrackerRecord) void {
+    for (records) |*tr| tr.deinit(allocator);
+    allocator.free(records);
 }
 
 fn listResponse(daemon: *Daemon) !protocol.Response {
@@ -343,9 +372,32 @@ fn showResponse(daemon: *Daemon, rec: state.TorrentRecord) !protocol.Response {
     try root.put(allocator, "verified_piece_count", .{ .integer = @intCast(rec.verified_piece_count) });
     try root.put(allocator, "derived_activity", .{ .string = derivedActivity(daemon, rec) });
     try root.put(allocator, "connected_peer_count", .{ .integer = connectedPeerCount(daemon, rec.info_hash_hex) });
-    if (rec.tracker_url) |url| try root.put(allocator, "tracker_announce_url", .{ .string = url });
-    try root.put(allocator, "tracker_status", .{ .string = rec.tracker_error orelse "not_announced" });
+    try root.put(allocator, "trackers", .{ .array = try trackersShowArray(daemon, allocator, rec) });
     return .{ .success = .{ .object = root } };
+}
+
+fn trackersShowArray(daemon: *Daemon, allocator: std.mem.Allocator, rec: state.TorrentRecord) !std.json.Array {
+    var arr = std.json.Array.init(allocator);
+    errdefer arr.deinit();
+    const session = daemon.engine.findSession(rec.info_hash_hex);
+    for (rec.trackers, 0..) |tr, i| {
+        var obj: std.json.ObjectMap = .empty;
+        errdefer obj.deinit(allocator);
+        try obj.put(allocator, "url", .{ .string = tr.url });
+        const endpoint_state: tracker.TrackerState = if (session) |s| blk: {
+            if (i < s.trackers.items.len) break :blk s.trackers.items[i].state;
+            break :blk .{};
+        } else .{
+            .last_error = tr.last_error,
+            .next_announce_ms = tr.next_announce_ms,
+            .started_sent = tr.started_sent,
+        };
+        try obj.put(allocator, "status", .{ .string = tracker.trackerShowStatus(endpoint_state) });
+        try obj.put(allocator, "last_error", if (endpoint_state.last_error) |s| .{ .string = s } else .null);
+        try obj.put(allocator, "next_announce", .{ .integer = endpoint_state.next_announce_ms });
+        try arr.append(.{ .object = obj });
+    }
+    return arr;
 }
 
 fn summaryValue(daemon: *Daemon, allocator: std.mem.Allocator, rec: state.TorrentRecord) !std.json.Value {
@@ -398,7 +450,7 @@ fn derivedActivity(daemon: *Daemon, rec: state.TorrentRecord) []const u8 {
     if (daemon.engine.findSession(rec.info_hash_hex)) |session| {
         if (session.active_piece != null) return "downloading";
         if (session.peers.items.len > 0) return "connecting";
-        if (session.tracker_state.last_error != null) return "announcing";
+        for (session.trackers.items) |tr| if (tr.state.last_error != null) return "announcing";
     }
     return "waiting_for_peers";
 }
@@ -463,8 +515,6 @@ fn validatePersistedSession(daemon: *Daemon, info_hash_hex: []const u8, rec: *st
     if (!std.mem.eql(u8, &parsed_hex, info_hash_hex)) return error.StateCorruption;
     torrent.validateLimits(meta, daemon.cfg.limits, meta.bytes.len) catch {
         rec.status = .failed;
-        if (rec.tracker_error) |old| daemon.allocator.free(old);
-        rec.tracker_error = try daemon.allocator.dupe(u8, "torrent metadata exceeds configured safety limits");
         return;
     };
     try recheckSession(daemon, info_hash_hex, rec);
@@ -492,8 +542,6 @@ fn loadPersistedSessions(daemon: *Daemon) !void {
             error.StateCorruption => return err,
             else => {
                 rec.status = .failed;
-                if (rec.tracker_error) |old| daemon.allocator.free(old);
-                rec.tracker_error = try std.fmt.allocPrint(daemon.allocator, "startup validation failed: {s}", .{@errorName(err)});
             },
         };
         try daemon.registry.add(rec);

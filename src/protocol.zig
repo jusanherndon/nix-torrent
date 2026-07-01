@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
 
 pub const Command = enum { add, list, show, pause, @"resume", remove, status };
 

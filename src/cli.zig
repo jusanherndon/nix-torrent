@@ -77,12 +77,30 @@ pub fn main(init: std.process.Init) !void {
         .help => unreachable,
     }, .argument = if (command_args.len == 2) command_args[1] else null };
 
+    try verifyDaemonProtocol(init.io, allocator, cfg.socket_path);
+
     const response = try sendRequest(init.io, allocator, cfg.socket_path, request);
     defer allocator.free(response);
+
     try stdout.writeAll(response);
     if (response.len == 0 or response[response.len - 1] != '\n') try stdout.writeByte('\n');
     try stdout.flush();
     try stderr.flush();
+}
+
+fn verifyDaemonProtocol(io: std.Io, allocator: std.mem.Allocator, socket_path: []const u8) !void {
+    const response = try sendRequest(io, allocator, socket_path, .{ .command = .status });
+    defer allocator.free(response);
+    try verifyControlProtocol(allocator, response);
+}
+
+fn verifyControlProtocol(allocator: std.mem.Allocator, response: []const u8) !void {
+    const parsed = try protocol.parseResponse(allocator, response);
+    defer parsed.deinit();
+    if (!parsed.value.object.get("ok").?.bool) return error.ControlProtocolMismatch;
+    const result = parsed.value.object.get("result") orelse return error.ControlProtocolMismatch;
+    const version = result.object.get("control_protocol_version") orelse return error.ControlProtocolMismatch;
+    if (version.integer != protocol.CONTROL_PROTOCOL_VERSION) return error.ControlProtocolMismatch;
 }
 
 fn sendRequest(io: std.Io, allocator: std.mem.Allocator, socket_path: []const u8, request: protocol.Request) ![]u8 {
