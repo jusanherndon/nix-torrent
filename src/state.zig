@@ -29,6 +29,8 @@ pub const TorrentRecord = struct {
     name: []const u8,
     status: Status = .active,
     trackers: []TrackerRecord,
+    dht_slot: ?usize = null,
+    private_torrent: bool = false,
     total_bytes: u64 = 0,
     piece_length: u64 = 0,
     piece_count: usize = 0,
@@ -130,6 +132,8 @@ pub fn cloneRecord(allocator: std.mem.Allocator, record: TorrentRecord) !Torrent
         .name = try allocator.dupe(u8, record.name),
         .status = record.status,
         .trackers = trackers,
+        .dht_slot = record.dht_slot,
+        .private_torrent = record.private_torrent,
         .total_bytes = record.total_bytes,
         .piece_length = record.piece_length,
         .piece_count = record.piece_count,
@@ -205,6 +209,10 @@ fn recordJson(allocator: std.mem.Allocator, record: TorrentRecord) ![]u8 {
     try jw.write(record.piece_count);
     try jw.objectField("verified_piece_count");
     try jw.write(record.verified_piece_count);
+    try jw.objectField("dht_slot");
+    if (record.dht_slot) |slot| try jw.write(slot) else try jw.write(null);
+    try jw.objectField("private_torrent");
+    try jw.write(record.private_torrent);
     try jw.endObject();
     try out.writer.writeByte('\n');
     return out.toOwnedSlice();
@@ -318,6 +326,8 @@ pub fn readTorrentState(io: std.Io, allocator: std.mem.Allocator, path: []const 
         piece_length: u64 = 0,
         piece_count: usize = 0,
         verified_piece_count: usize = 0,
+        dht_slot: ?usize = null,
+        private_torrent: bool = false,
     };
     const parsed = try std.json.parseFromSlice(Wire, allocator, bytes, .{});
     defer parsed.deinit();
@@ -349,6 +359,8 @@ pub fn readTorrentState(io: std.Io, allocator: std.mem.Allocator, path: []const 
         .name = try allocator.dupe(u8, parsed.value.name),
         .status = parseStatus(parsed.value.status) orelse .failed,
         .trackers = trackers,
+        .dht_slot = parsed.value.dht_slot,
+        .private_torrent = parsed.value.private_torrent,
         .total_bytes = parsed.value.total_bytes,
         .piece_length = parsed.value.piece_length,
         .piece_count = parsed.value.piece_count,

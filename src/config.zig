@@ -16,6 +16,19 @@ pub const Limits = struct {
 };
 
 pub const Engine = struct { block_request_bytes: u64 = 16_384 };
+pub const Dht = struct {
+    enabled: bool = true,
+    bootstrap_nodes: []const []const u8 = &default_bootstrap_nodes,
+    request_timeout_ms: u64 = 5000,
+    refresh_interval_ms: u64 = 900_000,
+};
+
+const default_bootstrap_nodes = [_][]const u8{
+    "router.bittorrent.com:6881",
+    "router.utorrent.com:6881",
+    "dht.transmissionbt.com:6881",
+};
+
 pub const Network = struct {
     dht_base_port: u64 = 6881,
     peer_connect_timeout_ms: u64 = 10_000,
@@ -23,6 +36,7 @@ pub const Network = struct {
     tracker_request_timeout_ms: u64 = 10_000,
     tracker_retry_min_ms: u64 = 30_000,
     tracker_retry_max_ms: u64 = 300_000,
+    dht: Dht = .{},
 };
 pub const Logging = struct { level: []const u8 = "info", format: []const u8 = "json" };
 
@@ -41,6 +55,12 @@ pub const Config = struct {
         allocator.free(self.socket_path);
         if (!std.mem.eql(u8, self.logging.level, "info")) allocator.free(self.logging.level);
         if (!std.mem.eql(u8, self.logging.format, "json")) allocator.free(self.logging.format);
+        for (self.network.dht.bootstrap_nodes) |node| {
+            if (!isDefaultBootstrapNode(node)) allocator.free(node);
+        }
+        if (self.network.dht.bootstrap_nodes.ptr != &default_bootstrap_nodes) {
+            allocator.free(self.network.dht.bootstrap_nodes);
+        }
     }
 };
 
@@ -171,8 +191,13 @@ pub fn usage(program_name: []const u8, writer: anytype) !void {
     , .{program_name});
 }
 
+fn isDefaultBootstrapNode(node: []const u8) bool {
+    for (default_bootstrap_nodes) |default| if (std.mem.eql(u8, default, node)) return true;
+    return false;
+}
+
 fn parseTomlInto(allocator: std.mem.Allocator, cfg: *Config, bytes: []const u8) !void {
-    var section: enum { root, paths, limits, engine, network, logging } = .root;
+    var section: enum { root, paths, limits, engine, network, network_dht, logging } = .root;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |raw_line| {
         const no_comment = if (std.mem.indexOfScalar(u8, raw_line, '#')) |n| raw_line[0..n] else raw_line;
@@ -180,7 +205,7 @@ fn parseTomlInto(allocator: std.mem.Allocator, cfg: *Config, bytes: []const u8) 
         if (line.len == 0) continue;
         if (line[0] == '[' and line[line.len - 1] == ']') {
             const name = line[1 .. line.len - 1];
-            section = if (std.mem.eql(u8, name, "paths")) .paths else if (std.mem.eql(u8, name, "limits")) .limits else if (std.mem.eql(u8, name, "engine")) .engine else if (std.mem.eql(u8, name, "network")) .network else if (std.mem.eql(u8, name, "logging")) .logging else return ConfigError.InvalidConfig;
+            section = if (std.mem.eql(u8, name, "paths")) .paths else if (std.mem.eql(u8, name, "limits")) .limits else if (std.mem.eql(u8, name, "engine")) .engine else if (std.mem.eql(u8, name, "network.dht")) .network_dht else if (std.mem.eql(u8, name, "network")) .network else if (std.mem.eql(u8, name, "logging")) .logging else return ConfigError.InvalidConfig;
             continue;
         }
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse return ConfigError.InvalidConfig;
@@ -191,6 +216,7 @@ fn parseTomlInto(allocator: std.mem.Allocator, cfg: *Config, bytes: []const u8) 
             .limits => try parseLimit(&cfg.limits, key, value),
             .engine => try parseEngine(&cfg.engine, key, value),
             .network => try parseNetwork(&cfg.network, key, value),
+            .network_dht => try parseDht(allocator, &cfg.network.dht, key, value),
             .logging => try parseLogging(allocator, &cfg.logging, key, value),
             .root => return ConfigError.InvalidConfig,
         }
@@ -228,11 +254,56 @@ fn parseNetwork(n: *Network, key: []const u8, value: []const u8) !void {
         n.dht_base_port = v;
         return;
     }
-    inline for (@typeInfo(Network).@"struct".fields) |field| {
-        if (std.mem.eql(u8, key, field.name)) { @field(n, field.name) = v; return; }
-    }
-    return ConfigError.InvalidConfig;
+    if (std.mem.eql(u8, key, "dht_base_port")) n.dht_base_port = v
+    else if (std.mem.eql(u8, key, "peer_connect_timeout_ms")) n.peer_connect_timeout_ms = v
+    else if (std.mem.eql(u8, key, "peer_request_timeout_ms")) n.peer_request_timeout_ms = v
+    else if (std.mem.eql(u8, key, "tracker_request_timeout_ms")) n.tracker_request_timeout_ms = v
+    else if (std.mem.eql(u8, key, "tracker_retry_min_ms")) n.tracker_retry_min_ms = v
+    else if (std.mem.eql(u8, key, "tracker_retry_max_ms")) n.tracker_retry_max_ms = v
+    else return ConfigError.InvalidConfig;
 }
+fn parseDht(allocator: std.mem.Allocator, dht_cfg: *Dht, key: []const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, key, "enabled")) {
+        const s = try parseString(value);
+        dht_cfg.enabled = std.mem.eql(u8, s, "true");
+        return;
+    }
+    if (std.mem.eql(u8, key, "bootstrap_nodes")) {
+        if (dht_cfg.bootstrap_nodes.ptr != &default_bootstrap_nodes) {
+            for (dht_cfg.bootstrap_nodes) |node| allocator.free(node);
+            allocator.free(dht_cfg.bootstrap_nodes);
+        }
+        dht_cfg.bootstrap_nodes = try parseStringArray(allocator, value);
+        return;
+    }
+    const n = try parseInt(value);
+    if (std.mem.eql(u8, key, "request_timeout_ms")) dht_cfg.request_timeout_ms = n
+    else if (std.mem.eql(u8, key, "refresh_interval_ms")) dht_cfg.refresh_interval_ms = n
+    else return ConfigError.InvalidConfig;
+}
+
+fn parseStringArray(allocator: std.mem.Allocator, value: []const u8) ![]const []const u8 {
+    if (value.len < 2 or value[0] != '[') return ConfigError.InvalidConfig;
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |item| allocator.free(item);
+        out.deinit(allocator);
+    }
+    var i: usize = 1;
+    while (i < value.len) {
+        while (i < value.len and (value[i] == ' ' or value[i] == ',' or value[i] == '\t')) i += 1;
+        if (i >= value.len or value[i] == ']') break;
+        if (value[i] != '"') return ConfigError.InvalidConfig;
+        i += 1;
+        const start = i;
+        while (i < value.len and value[i] != '"') i += 1;
+        if (i >= value.len) return ConfigError.InvalidConfig;
+        try out.append(allocator, try allocator.dupe(u8, value[start..i]));
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn parseLogging(allocator: std.mem.Allocator, logging: *Logging, key: []const u8, value: []const u8) !void {
     const s = try parseString(value);
     if (std.mem.eql(u8, key, "level")) {

@@ -6,6 +6,15 @@ const state = @import("state.zig");
 const storage = @import("storage.zig");
 const torrent = @import("torrent.zig");
 const tracker = @import("tracker.zig");
+const dht = @import("dht.zig");
+
+pub const DhtContext = struct {
+    routing: *dht.RoutingTable,
+    cfg: dht.Config,
+    bootstrapped: *bool,
+    last_refresh_ms: *i64,
+    slots: *dht.SlotAllocator,
+};
 
 const BlockMap = std.AutoHashMap(u32, void);
 
@@ -57,6 +66,7 @@ pub const TorrentSession = struct {
     content_dir: []const u8,
     trackers: std.ArrayList(TrackerEndpoint),
     announce_port: u16,
+    dht_socket: ?dht.TorrentDhtSocket = null,
     peers: std.ArrayList(peer.Connection),
     active_piece: ?PieceDownload,
     failure_reason: ?[]const u8 = null,
@@ -70,6 +80,7 @@ pub const TorrentSession = struct {
         allocator.free(self.content_dir);
         for (self.trackers.items) |*tr| tr.deinit(allocator);
         self.trackers.deinit(allocator);
+        if (self.dht_socket) |*sock| sock.close(io, allocator);
         if (self.failure_reason) |s| allocator.free(s);
     }
 };
@@ -87,16 +98,16 @@ pub const Engine = struct {
         self.sessions.deinit(self.allocator);
     }
 
-    pub fn loadFromRegistry(self: *Engine, io: std.Io, cfg: config.Config, registry: *state.Registry) !void {
+    pub fn loadFromRegistry(self: *Engine, io: std.Io, cfg: config.Config, registry: *state.Registry, dht_ctx: ?DhtContext) !void {
         for (self.sessions.items) |*session| session.deinit(io, self.allocator);
         self.sessions.clearRetainingCapacity();
         for (registry.records.items) |*rec| {
             if (rec.status == .complete) continue;
-            try self.addSession(io, cfg, registry, rec);
+            try self.addSession(io, cfg, registry, rec, dht_ctx);
         }
     }
 
-    pub fn addSession(self: *Engine, io: std.Io, cfg: config.Config, registry: *state.Registry, rec: *state.TorrentRecord) !void {
+    pub fn addSession(self: *Engine, io: std.Io, cfg: config.Config, registry: *state.Registry, rec: *state.TorrentRecord, dht_ctx: ?DhtContext) !void {
         _ = registry;
         if (self.findSession(rec.info_hash_hex) != null) return;
         const metadata_path = try std.fs.path.join(self.allocator, &.{ cfg.staging_area, rec.info_hash_hex, "metadata.torrent" });
@@ -137,13 +148,32 @@ pub const Engine = struct {
             });
         }
 
+        const announce_port: u16 = if (rec.dht_slot) |slot| @intCast(cfg.network.dht_base_port + slot) else @intCast(cfg.network.dht_base_port);
+
+        var dht_socket: ?dht.TorrentDhtSocket = null;
+        if (dht_ctx) |ctx| {
+            if (ctx.cfg.enabled and !rec.private_torrent) {
+                if (rec.dht_slot) |slot| {
+                    dht_socket = .{ .slot = slot, .bind_port = announce_port };
+                    try dht_socket.?.open(io, announce_port);
+                    if (!ctx.bootstrapped.*) {
+                        if (dht_socket.?.socket) |sock| {
+                            dht.bootstrap(io, self.allocator, ctx.routing, sock, ctx.cfg.bootstrap_nodes, ctx.cfg.request_timeout_ms) catch {};
+                            ctx.bootstrapped.* = true;
+                        }
+                    }
+                }
+            }
+        }
+
         const session = TorrentSession{
             .info_hash_hex = rec.info_hash_hex,
             .meta = meta,
             .layout = layout,
             .content_dir = content_dir,
             .trackers = trackers,
-            .announce_port = @intCast(cfg.network.dht_base_port),
+            .announce_port = announce_port,
+            .dht_socket = dht_socket,
             .peers = .empty,
             .active_piece = null,
         };
@@ -203,13 +233,30 @@ pub const Engine = struct {
         }
     }
 
-    pub fn tick(self: *Engine, io: std.Io, cfg: config.Config, registry: *state.Registry, peer_id: [20]u8, now_ms: i64) !void {
+    pub fn closeDht(self: *Engine, io: std.Io, info_hash_hex: []const u8) void {
+        if (self.findSession(info_hash_hex)) |session| {
+            if (session.dht_socket) |*sock| sock.close(io, self.allocator);
+            session.dht_socket = null;
+        }
+    }
+
+    pub fn tick(self: *Engine, io: std.Io, cfg: config.Config, registry: *state.Registry, peer_id: [20]u8, now_ms: i64, dht_ctx: ?DhtContext) !void {
+        if (dht_ctx) |ctx| try maybeRefreshDht(io, self.allocator, ctx, cfg, now_ms);
         for (self.sessions.items) |*session| {
             const rec = registry.find(session.info_hash_hex) orelse continue;
-            try tickSession(self, io, cfg, registry, session, rec, peer_id, now_ms);
+            try tickSession(self, io, cfg, registry, session, rec, peer_id, now_ms, dht_ctx);
         }
     }
 };
+
+fn maybeRefreshDht(io: std.Io, allocator: std.mem.Allocator, ctx: DhtContext, cfg: config.Config, now_ms: i64) !void {
+    if (!ctx.cfg.enabled) return;
+    if (now_ms - ctx.last_refresh_ms.* < @as(i64, @intCast(ctx.cfg.refresh_interval_ms))) return;
+    ctx.last_refresh_ms.* = now_ms;
+    _ = allocator;
+    _ = cfg;
+    _ = io;
+}
 
 fn syncTrackerRecord(allocator: std.mem.Allocator, rec: *state.TorrentRecord, index: usize, endpoint: *TrackerEndpoint) void {
     if (index >= rec.trackers.len) return;
@@ -229,6 +276,7 @@ fn tickSession(
     rec: *state.TorrentRecord,
     peer_id: [20]u8,
     now_ms: i64,
+    dht_ctx: ?DhtContext,
 ) !void {
     if (rec.status == .paused or rec.status == .failed or rec.status == .complete) {
         if (rec.status == .paused or rec.status == .failed) closePeers(session, io);
@@ -243,6 +291,27 @@ fn tickSession(
     for (session.trackers.items, 0..) |*endpoint, i| {
         if (endpoint.state.due(now_ms)) {
             try announceTrackerEndpoint(engine, io, cfg, session, rec, endpoint, i, peer_id, now_ms);
+        }
+    }
+
+    if (dht_ctx) |ctx| {
+        if (session.dht_socket) |*sock| {
+            const dht_peers = try sock.tick(io, engine.allocator, ctx.routing, ctx.cfg, session.meta.info_hash, now_ms);
+            defer engine.allocator.free(dht_peers);
+            for (dht_peers) |tp| {
+                if (session.peers.items.len >= cfg.limits.max_peers_per_torrent) break;
+                if (hasPeer(session, tp.ip, tp.port)) continue;
+                var conn = peer.Connection.connect(io, engine.allocator, tp.ip, tp.port, cfg.network.peer_connect_timeout_ms) catch continue;
+                conn.performHandshake(io, session.meta.info_hash, peer_id) catch {
+                    conn.deinit(io);
+                    continue;
+                };
+                conn.sendInterested(io) catch {
+                    conn.deinit(io);
+                    continue;
+                };
+                try session.peers.append(engine.allocator, conn);
+            }
         }
     }
 

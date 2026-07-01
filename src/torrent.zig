@@ -19,6 +19,7 @@ pub const Metadata = struct {
     bytes: []const u8,
     root: bencode.Value,
     announce: ?[]const u8,
+    private_torrent: bool = false,
     name: []const u8,
     piece_length: u64,
     pieces: []const u8,
@@ -149,11 +150,17 @@ fn parseOwnedBytes(allocator: std.mem.Allocator, bytes: []const u8) !Metadata {
         else => null,
     } else null;
 
+    const private_torrent = if (info.dictGet("private")) |v| switch (v) {
+        .int => |i| i != 0,
+        else => false,
+    } else false;
+
     return .{
         .allocator = allocator,
         .bytes = bytes,
         .root = root,
         .announce = announce,
+        .private_torrent = private_torrent,
         .name = name,
         .piece_length = piece_length,
         .pieces = pieces,

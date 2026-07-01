@@ -8,8 +8,7 @@ const state = @import("state.zig");
 const torrent = @import("torrent.zig");
 const tracker = @import("tracker.zig");
 const storage = @import("storage.zig");
-
-const net = std.Io.net;
+const dht = @import("dht.zig");
 
 const Daemon = struct {
     allocator: std.mem.Allocator,
@@ -19,23 +18,50 @@ const Daemon = struct {
     engine: engine_mod.Engine,
     peer_id: [20]u8,
     started_ms: i64 = 0,
+    dht_routing: dht.RoutingTable,
+    dht_slots: dht.SlotAllocator,
+    dht_bootstrapped: bool = false,
+    dht_last_refresh_ms: i64 = 0,
 
     fn init(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config) !Daemon {
+        const peer_id = try loadOrCreatePeerId(io, allocator, cfg.staging_area);
         return .{
             .allocator = allocator,
             .io = io,
             .cfg = cfg,
             .registry = state.Registry.init(allocator, @intCast(cfg.limits.max_active_torrents), @intCast(cfg.limits.max_peers_per_torrent)),
             .engine = engine_mod.Engine.init(allocator),
-            .peer_id = try loadOrCreatePeerId(io, allocator, cfg.staging_area),
+            .peer_id = peer_id,
+            .dht_routing = dht.RoutingTable.init(allocator, dht.deriveNodeId(peer_id)),
+            .dht_slots = try dht.SlotAllocator.init(allocator, @intCast(cfg.limits.max_active_torrents)),
         };
     }
 
     fn deinit(self: *Daemon) void {
+        self.dht_slots.deinit();
+        self.dht_routing.deinit();
         self.engine.deinit(self.io);
         self.registry.deinit();
     }
+
+    fn dhtContext(self: *Daemon) ?engine_mod.DhtContext {
+        if (!self.cfg.network.dht.enabled) return null;
+        return .{
+            .routing = &self.dht_routing,
+            .cfg = .{
+                .enabled = self.cfg.network.dht.enabled,
+                .bootstrap_nodes = self.cfg.network.dht.bootstrap_nodes,
+                .request_timeout_ms = self.cfg.network.dht.request_timeout_ms,
+                .refresh_interval_ms = self.cfg.network.dht.refresh_interval_ms,
+            },
+            .bootstrapped = &self.dht_bootstrapped,
+            .last_refresh_ms = &self.dht_last_refresh_ms,
+            .slots = &self.dht_slots,
+        };
+    }
 };
+
+const net = std.Io.net;
 
 var shutting_down: bool = false;
 var listen_handle: ?net.Socket.Handle = null;
@@ -89,7 +115,7 @@ pub fn main(init: std.process.Init) !void {
     var daemon = try Daemon.init(allocator, init.io, cfg);
     defer daemon.deinit();
     try loadPersistedSessions(&daemon);
-    try daemon.engine.loadFromRegistry(daemon.io, daemon.cfg, &daemon.registry);
+    try daemon.engine.loadFromRegistry(daemon.io, daemon.cfg, &daemon.registry, daemon.dhtContext());
 
     try prepareSocketPath(init.io, cfg.socket_path);
 
@@ -115,7 +141,7 @@ pub fn main(init: std.process.Init) !void {
 
     while (!shutting_down) {
         const now_ms = nowMs(init.io);
-        daemon.engine.tick(daemon.io, daemon.cfg, &daemon.registry, daemon.peer_id, now_ms) catch |err| {
+        daemon.engine.tick(daemon.io, daemon.cfg, &daemon.registry, daemon.peer_id, now_ms, daemon.dhtContext()) catch |err| {
             try stderr.print("{{\"level\":\"error\",\"component\":\"engine\",\"message\":\"tick failed: {s}\"}}\n", .{@errorName(err)});
             try stderr.flush();
         };
@@ -198,6 +224,12 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
             try limits.put(allocator, "max_peers_per_torrent", .{ .integer = @intCast(daemon.cfg.limits.max_peers_per_torrent) });
             try limits.put(allocator, "max_torrent_file_bytes", .{ .integer = @intCast(daemon.cfg.limits.max_torrent_file_bytes) });
             try root.put(allocator, "limits", .{ .object = limits });
+            var dht_obj: std.json.ObjectMap = .empty;
+            errdefer dht_obj.deinit(allocator);
+            try dht_obj.put(allocator, "enabled", .{ .bool = daemon.cfg.network.dht.enabled });
+            try dht_obj.put(allocator, "bootstrapped", .{ .bool = daemon.dht_bootstrapped });
+            try dht_obj.put(allocator, "bootstrap_node_count", .{ .integer = @intCast(daemon.cfg.network.dht.bootstrap_nodes.len) });
+            try root.put(allocator, "dht", .{ .object = dht_obj });
             return .{ .success = .{ .object = root } };
         },
         .list => return listResponse(daemon),
@@ -215,6 +247,7 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
             };
             if (daemon.engine.findSession(info_hash)) |session| {
                 daemon.engine.sendTrackerEvent(daemon.io, daemon.cfg, session, rec, daemon.peer_id, .stopped, nowMs(daemon.io));
+                daemon.engine.closeDht(daemon.io, info_hash);
             }
             rec.status = .paused;
             try state.writeTorrentState(daemon.io, allocator, daemon.cfg.staging_area, rec.*);
@@ -235,7 +268,7 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
             }
             rec.status = .active;
             try state.writeTorrentState(daemon.io, allocator, daemon.cfg.staging_area, rec.*);
-            try daemon.engine.addSession(daemon.io, daemon.cfg, &daemon.registry, rec);
+            try daemon.engine.addSession(daemon.io, daemon.cfg, &daemon.registry, rec, daemon.dhtContext());
             if (daemon.engine.findSession(info_hash)) |session| {
                 daemon.engine.sendTrackerEvent(daemon.io, daemon.cfg, session, rec, daemon.peer_id, .started, nowMs(daemon.io));
             }
@@ -247,7 +280,9 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
             if (rec) |r| {
                 if (daemon.engine.findSession(info_hash)) |session| {
                     daemon.engine.sendTrackerEvent(daemon.io, daemon.cfg, session, r, daemon.peer_id, .stopped, nowMs(daemon.io));
+                    daemon.engine.closeDht(daemon.io, info_hash);
                 }
+                if (r.dht_slot) |slot| daemon.dht_slots.release(slot);
             }
             if (!daemon.registry.remove(info_hash)) {
                 if (daemon.registry.findCompletion(info_hash) != null) return .{ .failure = .{ .code = .already_completed, .message = "completed torrents cannot be paused, resumed, or removed in v2" } };
@@ -318,10 +353,12 @@ fn addTorrent(daemon: *Daemon, path: []const u8) !protocol.Response {
         .name = meta.name,
         .status = .active,
         .trackers = tracker_records,
+        .private_torrent = meta.private_torrent,
         .total_bytes = state.totalBytes(meta),
         .piece_length = meta.piece_length,
         .piece_count = meta.pieces.len / 20,
     };
+    try allocateDhtSlot(daemon, &rec, meta.private_torrent);
     recheckSession(daemon, hex, &rec) catch |err| switch (err) {
         error.StateCorruption => return .{ .failure = .{ .code = .storage_error, .message = "staged metadata info hash does not match staging directory" } },
         else => return .{ .failure = .{ .code = .storage_error, .message = "failed to recheck staged content" } },
@@ -330,8 +367,21 @@ fn addTorrent(daemon: *Daemon, path: []const u8) !protocol.Response {
     try daemon.registry.add(rec);
     const stored = daemon.registry.find(hex).?;
     try state.writeTorrentState(daemon.io, allocator, daemon.cfg.staging_area, stored.*);
-    try daemon.engine.addSession(daemon.io, daemon.cfg, &daemon.registry, stored);
+    try daemon.engine.addSession(daemon.io, daemon.cfg, &daemon.registry, stored, daemon.dhtContext());
     return showResponse(daemon, stored.*);
+}
+
+fn allocateDhtSlot(daemon: *Daemon, rec: *state.TorrentRecord, private_torrent: bool) !void {
+    if (!daemon.cfg.network.dht.enabled or private_torrent) return;
+    if (rec.dht_slot) |slot| {
+        _ = daemon.dht_slots.reserve(slot);
+        return;
+    }
+    rec.dht_slot = daemon.dht_slots.allocate();
+}
+
+fn releaseDhtSlot(daemon: *Daemon, rec: state.TorrentRecord) void {
+    if (rec.dht_slot) |slot| daemon.dht_slots.release(slot);
 }
 
 fn validateTracker(meta: torrent.Metadata) ![]const u8 {
@@ -373,6 +423,16 @@ fn showResponse(daemon: *Daemon, rec: state.TorrentRecord) !protocol.Response {
     try root.put(allocator, "derived_activity", .{ .string = derivedActivity(daemon, rec) });
     try root.put(allocator, "connected_peer_count", .{ .integer = connectedPeerCount(daemon, rec.info_hash_hex) });
     try root.put(allocator, "trackers", .{ .array = try trackersShowArray(daemon, allocator, rec) });
+    try root.put(allocator, "dht_eligible", .{ .bool = !rec.private_torrent and daemon.cfg.network.dht.enabled });
+    if (rec.dht_slot) |slot| {
+        try root.put(allocator, "dht_slot", .{ .integer = @intCast(slot) });
+        try root.put(allocator, "dht_port", .{ .integer = @intCast(daemon.cfg.network.dht_base_port + slot) });
+    }
+    if (daemon.engine.findSession(rec.info_hash_hex)) |session| {
+        if (session.dht_socket) |sock| {
+            try root.put(allocator, "dht_last_error", if (sock.last_error) |e| .{ .string = e } else .null);
+        }
+    }
     return .{ .success = .{ .object = root } };
 }
 
@@ -546,6 +606,7 @@ fn loadPersistedSessions(daemon: *Daemon) !void {
         };
         try daemon.registry.add(rec);
         const stored = daemon.registry.find(entry.name).?;
+        try allocateDhtSlot(daemon, stored, stored.private_torrent);
         try state.writeTorrentState(daemon.io, daemon.allocator, daemon.cfg.staging_area, stored.*);
     }
 }

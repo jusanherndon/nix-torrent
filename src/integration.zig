@@ -57,7 +57,7 @@ test "integration: engine startup recheck reports zero verified bytes for empty 
 
     var eng = engine_mod.Engine.init(allocator);
     defer eng.deinit(io);
-    try eng.addSession(io, cfg, &registry, rec);
+    try eng.addSession(io, cfg, &registry, rec, null);
     try std.testing.expectEqual(@as(usize, 0), rec.verified_piece_count);
 }
 
