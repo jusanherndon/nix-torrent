@@ -213,6 +213,29 @@ fn parseFiles(allocator: std.mem.Allocator, value: bencode.Value) ![]File {
     return files;
 }
 
+pub fn infoHashFromInfoBytes(info_bytes: []const u8) InfoHash {
+    var hash: InfoHash = undefined;
+    std.crypto.hash.Sha1.hash(info_bytes, &hash, .{});
+    return hash;
+}
+
+pub fn wrapInfoBytes(allocator: std.mem.Allocator, info_bytes: []const u8, announce: ?[]const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, 'd');
+    if (announce) |url| {
+        try out.appendSlice(allocator, "8:announce");
+        const len_prefix = try std.fmt.allocPrint(allocator, "{d}:", .{url.len});
+        defer allocator.free(len_prefix);
+        try out.appendSlice(allocator, len_prefix);
+        try out.appendSlice(allocator, url);
+    }
+    try out.appendSlice(allocator, "4:info");
+    try out.appendSlice(allocator, info_bytes);
+    try out.append(allocator, 'e');
+    return out.toOwnedSlice(allocator);
+}
+
 fn expectHashHex(actual: InfoHash, expected_hex: []const u8) !void {
     const encoded = std.fmt.bytesToHex(actual, .lower);
     try std.testing.expectEqualStrings(expected_hex, &encoded);

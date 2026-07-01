@@ -1,6 +1,7 @@
 const std = @import("std");
 const torrent = @import("torrent.zig");
 const encryption = @import("encryption.zig");
+const bencode = @import("bencode.zig");
 
 const net = std.Io.net;
 
@@ -17,6 +18,7 @@ pub const Message = union(enum) {
     request: BlockRef,
     piece: PieceBlock,
     cancel: BlockRef,
+    extended: []const u8,
 };
 
 pub const BlockRef = struct { index: u32, begin: u32, length: u32 };
@@ -74,6 +76,8 @@ pub const Connection = struct {
     closed: bool = false,
     encryption_mode: encryption.Mode = .plaintext,
     crypto: ?encryption.Session = null,
+    ut_metadata_id: ?u8 = null,
+    metadata_size: ?usize = null,
 
     pub fn connect(io: std.Io, allocator: std.mem.Allocator, ip: [4]u8, port: u16, timeout_ms: u64) !Connection {
         const addr = net.IpAddress{ .ip4 = .{ .bytes = ip, .port = port } };
@@ -102,28 +106,28 @@ pub const Connection = struct {
         }
     }
 
-    pub fn performHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8, policy: encryption.Policy) !void {
+    pub fn performHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8, policy: encryption.Policy, extensions: bool) !void {
         switch (policy) {
-            .disable => try self.plaintextHandshake(io, info_hash, peer_id),
+            .disable => try self.plaintextHandshake(io, info_hash, peer_id, extensions),
             .prefer => {
-                if (try self.tryEncryptedHandshake(io, info_hash, peer_id)) {
+                if (try self.tryEncryptedHandshake(io, info_hash, peer_id, extensions)) {
                     self.handshake_done = true;
                     return;
                 }
                 self.crypto = null;
                 self.encryption_mode = .plaintext;
-                try self.plaintextHandshake(io, info_hash, peer_id);
+                try self.plaintextHandshake(io, info_hash, peer_id, extensions);
             },
             .require => {
-                if (!try self.tryEncryptedHandshake(io, info_hash, peer_id)) return error.EncryptionRequired;
+                if (!try self.tryEncryptedHandshake(io, info_hash, peer_id, extensions)) return error.EncryptionRequired;
                 self.handshake_done = true;
             },
         }
     }
 
-    fn plaintextHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8) !void {
+    fn plaintextHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8, extensions: bool) !void {
         var out: [68]u8 = undefined;
-        encodeHandshake(&out, info_hash, peer_id);
+        encodeHandshake(&out, info_hash, peer_id, extensions);
         try self.sendRawPlain(io, &out);
         var in: [68]u8 = undefined;
         try readExact(io, self.stream, &in);
@@ -132,7 +136,7 @@ pub const Connection = struct {
         self.handshake_done = true;
     }
 
-    fn tryEncryptedHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8) !bool {
+    fn tryEncryptedHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8, extensions: bool) !bool {
         const keys = try encryption.generateKeyPair(self.allocator);
         defer self.allocator.free(keys.private);
         const init_payload = try encryption.buildInitiatorPayload(self.allocator, keys.public);
@@ -155,7 +159,7 @@ pub const Connection = struct {
         self.encryption_mode = .encrypted;
 
         var hs: [68]u8 = undefined;
-        encodeHandshake(&hs, info_hash, peer_id);
+        encodeHandshake(&hs, info_hash, peer_id, extensions);
         self.crypto.?.encrypt.crypt(&hs);
         try self.sendRawPlain(io, &hs);
 
@@ -165,6 +169,36 @@ pub const Connection = struct {
         const decoded = try decodeHandshake(&in);
         if (!std.mem.eql(u8, &decoded.info_hash, &info_hash)) return error.InfoHashMismatch;
         return true;
+    }
+
+    pub fn performMetadataHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8, policy: encryption.Policy) !void {
+        try self.performHandshake(io, info_hash, peer_id, policy, true);
+        const ext = try encodeExtendedHandshake(self.allocator, 1);
+        defer self.allocator.free(ext);
+        try self.sendRaw(io, ext);
+        const msg = self.readMessage(io, 1_048_576) catch return error.MetadataHandshakeFailed;
+        const payload = msg orelse return error.MetadataHandshakeFailed;
+        if (payload != .extended) return error.MetadataHandshakeFailed;
+        const parsed = try parsePeerExtendedHandshake(self.allocator, payload.extended);
+        const handshake = parsed orelse return error.MetadataHandshakeFailed;
+        self.ut_metadata_id = handshake.ut_metadata_id;
+        self.metadata_size = handshake.metadata_size;
+    }
+
+    pub fn requestMetadataPiece(self: *Connection, io: std.Io, piece: u32) !void {
+        const id = self.ut_metadata_id orelse return error.MetadataUnsupported;
+        const body = try std.fmt.allocPrint(self.allocator, "d11:msg_typei0e5:piecei{d}e", .{piece});
+        defer self.allocator.free(body);
+        const msg = try encodeExtendedMessage(self.allocator, id, body);
+        defer self.allocator.free(msg);
+        try self.sendRaw(io, msg);
+    }
+
+    pub fn readMetadataPiece(self: *Connection, io: std.Io) !?UtMetadataData {
+        const msg = try self.readMessage(io, 1_048_576);
+        const payload = msg orelse return null;
+        if (payload != .extended) return null;
+        return parseUtMetadataData(self.allocator, payload.extended) catch null;
     }
 
     pub fn sendInterested(self: *Connection, io: std.Io) !void {
@@ -231,10 +265,11 @@ pub const Connection = struct {
     }
 };
 
-pub fn encodeHandshake(out: *[68]u8, info_hash: torrent.InfoHash, peer_id: [20]u8) void {
+pub fn encodeHandshake(out: *[68]u8, info_hash: torrent.InfoHash, peer_id: [20]u8, extensions: bool) void {
     out[0] = 19;
     @memcpy(out[1..20], "BitTorrent protocol");
     @memset(out[20..28], 0);
+    if (extensions) out[20] = 0x10;
     @memcpy(out[28..48], &info_hash);
     @memcpy(out[48..68], &peer_id);
 }
@@ -272,6 +307,11 @@ pub fn encodeMessage(allocator: std.mem.Allocator, msg: Message) ![]u8 {
             try writeU32(&out, allocator, p.begin);
             try out.appendSlice(allocator, p.block);
         },
+        .extended => |payload| {
+            try writeLen(&out, allocator, @intCast(2 + payload.len));
+            try out.append(allocator, 20);
+            try out.appendSlice(allocator, payload);
+        },
     }
     return out.toOwnedSlice(allocator);
 }
@@ -281,8 +321,10 @@ pub fn decodeMessage(bytes: []const u8) !Message {
     const len = std.mem.readInt(u32, bytes[0..4], .big);
     if (len == 0) return .keepalive;
     if (bytes.len != 4 + len) return error.ShortMessage;
-    const id: MessageId = @enumFromInt(bytes[4]);
+    const id_byte = bytes[4];
     const payload = bytes[5..];
+    if (id_byte == 20) return .{ .extended = payload };
+    const id: MessageId = @enumFromInt(id_byte);
     return switch (id) {
         .choke => .choke,
         .unchoke => .unchoke,
@@ -293,6 +335,61 @@ pub fn decodeMessage(bytes: []const u8) !Message {
         .request => .{ .request = parseBlockRef(payload) },
         .cancel => .{ .cancel = parseBlockRef(payload) },
         .piece => .{ .piece = .{ .index = std.mem.readInt(u32, payload[0..4], .big), .begin = std.mem.readInt(u32, payload[4..8], .big), .block = payload[8..] } },
+    };
+}
+
+fn encodeExtendedHandshake(allocator: std.mem.Allocator, ut_metadata_id: u8) ![]u8 {
+    var body: std.ArrayList(u8) = .empty;
+    errdefer body.deinit(allocator);
+    try body.appendSlice(allocator, "d2:md11:ut_metadatai");
+    try body.append(allocator, '0' + ut_metadata_id);
+    try body.append(allocator, 'e');
+    return encodeExtendedMessage(allocator, 0, body.items);
+}
+
+fn encodeExtendedMessage(allocator: std.mem.Allocator, ext_id: u8, payload: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try writeLen(&out, allocator, @intCast(2 + payload.len));
+    try out.append(allocator, 20);
+    try out.append(allocator, ext_id);
+    try out.appendSlice(allocator, payload);
+    return out.toOwnedSlice(allocator);
+}
+
+pub const UtMetadataData = struct {
+    piece: u32,
+    bytes: []const u8,
+};
+
+pub fn parsePeerExtendedHandshake(allocator: std.mem.Allocator, payload: []const u8) !?struct { ut_metadata_id: u8, metadata_size: usize } {
+    if (payload.len < 2 or payload[0] != 0) return null;
+    const root = bencode.parse(allocator, payload[1..]) catch return null;
+    defer root.deinit(allocator);
+    if (root != .dict) return null;
+    const md = root.dictGet("m") orelse return null;
+    if (md != .dict) return null;
+    const ut = md.dictGet("ut_metadata") orelse return null;
+    if (ut != .int or ut.int <= 0 or ut.int > 255) return null;
+    const size_val = root.dictGet("metadata_size") orelse return null;
+    if (size_val != .int or size_val.int <= 0) return null;
+    return .{ .ut_metadata_id = @intCast(ut.int), .metadata_size = @intCast(size_val.int) };
+}
+
+fn parseUtMetadataData(allocator: std.mem.Allocator, payload: []const u8) !?UtMetadataData {
+    if (payload.len < 2) return null;
+    const root = bencode.parse(allocator, payload[1..]) catch return null;
+    defer root.deinit(allocator);
+    if (root != .dict) return null;
+    const msg_type = root.dictGet("msg_type") orelse return null;
+    if (msg_type != .int or msg_type.int != 1) return null;
+    const piece_val = root.dictGet("piece") orelse return null;
+    if (piece_val != .int or piece_val.int < 0) return null;
+    const data_start = 1 + root.dict.raw.len;
+    if (data_start > payload.len) return null;
+    return .{
+        .piece = @intCast(piece_val.int),
+        .bytes = try allocator.dupe(u8, payload[data_start..]),
     };
 }
 
@@ -331,7 +428,7 @@ test "encodes and decodes handshake" {
     var ih: torrent.InfoHash = [_]u8{1} ** 20;
     var pid: [20]u8 = [_]u8{2} ** 20;
     var buf: [68]u8 = undefined;
-    encodeHandshake(&buf, ih, pid);
+    encodeHandshake(&buf, ih, pid, false);
     const decoded = try decodeHandshake(&buf);
     try std.testing.expectEqualSlices(u8, &ih, &decoded.info_hash);
     try std.testing.expectEqualSlices(u8, &pid, &decoded.peer_id);

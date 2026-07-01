@@ -31,6 +31,10 @@ pub const TorrentRecord = struct {
     trackers: []TrackerRecord,
     dht_slot: ?usize = null,
     private_torrent: bool = false,
+    metadata_complete: bool = true,
+    metadata_error: ?[]const u8 = null,
+    source: []const u8 = "torrent_file",
+    unsupported_tracker_warnings: []const []const u8 = &.{},
     total_bytes: u64 = 0,
     piece_length: u64 = 0,
     piece_count: usize = 0,
@@ -134,6 +138,10 @@ pub fn cloneRecord(allocator: std.mem.Allocator, record: TorrentRecord) !Torrent
         .trackers = trackers,
         .dht_slot = record.dht_slot,
         .private_torrent = record.private_torrent,
+        .metadata_complete = record.metadata_complete,
+        .metadata_error = if (record.metadata_error) |s| try allocator.dupe(u8, s) else null,
+        .source = try allocator.dupe(u8, record.source),
+        .unsupported_tracker_warnings = try cloneStringSlice(allocator, record.unsupported_tracker_warnings),
         .total_bytes = record.total_bytes,
         .piece_length = record.piece_length,
         .piece_count = record.piece_count,
@@ -146,6 +154,17 @@ pub fn deinitRecord(allocator: std.mem.Allocator, record: TorrentRecord) void {
     allocator.free(record.name);
     for (record.trackers) |*tr| tr.deinit(allocator);
     allocator.free(record.trackers);
+    allocator.free(record.source);
+    if (record.metadata_error) |s| allocator.free(s);
+    for (record.unsupported_tracker_warnings) |w| allocator.free(w);
+    allocator.free(record.unsupported_tracker_warnings);
+}
+
+fn cloneStringSlice(allocator: std.mem.Allocator, items: []const []const u8) ![]const []const u8 {
+    const out = try allocator.alloc([]const u8, items.len);
+    errdefer allocator.free(out);
+    for (items, 0..) |item, i| out[i] = try allocator.dupe(u8, item);
+    return out;
 }
 
 pub fn findTracker(record: *TorrentRecord, url: []const u8) ?*TrackerRecord {
@@ -213,6 +232,16 @@ fn recordJson(allocator: std.mem.Allocator, record: TorrentRecord) ![]u8 {
     if (record.dht_slot) |slot| try jw.write(slot) else try jw.write(null);
     try jw.objectField("private_torrent");
     try jw.write(record.private_torrent);
+    try jw.objectField("metadata_complete");
+    try jw.write(record.metadata_complete);
+    try jw.objectField("metadata_error");
+    if (record.metadata_error) |s| try jw.write(s) else try jw.write(null);
+    try jw.objectField("source");
+    try jw.write(record.source);
+    try jw.objectField("unsupported_tracker_warnings");
+    try jw.beginArray();
+    for (record.unsupported_tracker_warnings) |w| try jw.write(w);
+    try jw.endArray();
     try jw.endObject();
     try out.writer.writeByte('\n');
     return out.toOwnedSlice();
@@ -328,6 +357,10 @@ pub fn readTorrentState(io: std.Io, allocator: std.mem.Allocator, path: []const 
         verified_piece_count: usize = 0,
         dht_slot: ?usize = null,
         private_torrent: bool = false,
+        metadata_complete: bool = true,
+        metadata_error: ?[]const u8 = null,
+        source: []const u8 = "torrent_file",
+        unsupported_tracker_warnings: ?[][]const u8 = null,
     };
     const parsed = try std.json.parseFromSlice(Wire, allocator, bytes, .{});
     defer parsed.deinit();
@@ -361,6 +394,10 @@ pub fn readTorrentState(io: std.Io, allocator: std.mem.Allocator, path: []const 
         .trackers = trackers,
         .dht_slot = parsed.value.dht_slot,
         .private_torrent = parsed.value.private_torrent,
+        .metadata_complete = parsed.value.metadata_complete,
+        .metadata_error = if (parsed.value.metadata_error) |s| try allocator.dupe(u8, s) else null,
+        .source = try allocator.dupe(u8, parsed.value.source),
+        .unsupported_tracker_warnings = if (parsed.value.unsupported_tracker_warnings) |w| try cloneStringSlice(allocator, w) else try allocator.alloc([]const u8, 0),
         .total_bytes = parsed.value.total_bytes,
         .piece_length = parsed.value.piece_length,
         .piece_count = parsed.value.piece_count,

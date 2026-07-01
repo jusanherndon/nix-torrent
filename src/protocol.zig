@@ -7,6 +7,7 @@ pub const Command = enum { add, list, show, pause, @"resume", remove, status };
 pub const ErrorCode = enum {
     invalid_request,
     unknown_command,
+    no_discovery_source,
     invalid_arguments,
     torrent_parse_error,
     unsupported_tracker_scheme,

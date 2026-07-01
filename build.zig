@@ -150,5 +150,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(state_tests).step);
     test_step.dependOn(&b.addRunArtifact(dht_tests).step);
     test_step.dependOn(&b.addRunArtifact(encryption_tests).step);
+    const magnet_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/magnet.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    test_step.dependOn(&b.addRunArtifact(magnet_tests).step);
     test_step.dependOn(&b.addRunArtifact(integration_tests).step);
 }

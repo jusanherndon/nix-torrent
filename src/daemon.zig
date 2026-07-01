@@ -9,6 +9,7 @@ const torrent = @import("torrent.zig");
 const tracker = @import("tracker.zig");
 const storage = @import("storage.zig");
 const dht = @import("dht.zig");
+const magnet = @import("magnet.zig");
 
 const Daemon = struct {
     allocator: std.mem.Allocator,
@@ -295,11 +296,74 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
             try root.put(allocator, "removed", .{ .bool = true });
             return .{ .success = .{ .object = root } };
         },
-        .add => return addTorrent(daemon, req.argument orelse return .{ .failure = .{ .code = .invalid_arguments, .message = "torrent file argument is required" } }),
+        .add => return addTorrent(daemon, req.argument orelse return .{ .failure = .{ .code = .invalid_arguments, .message = "torrent file or magnet URI argument is required" } }),
     }
 }
 
 fn addTorrent(daemon: *Daemon, path: []const u8) !protocol.Response {
+    if (std.mem.startsWith(u8, path, "magnet:")) return addMagnet(daemon, path);
+    return addTorrentFile(daemon, path);
+}
+
+fn addMagnet(daemon: *Daemon, uri: []const u8) !protocol.Response {
+    const allocator = daemon.allocator;
+    const parsed = magnet.parse(allocator, uri) catch |err| switch (err) {
+        error.InvalidMagnet, error.InvalidInfoHash => return .{ .failure = .{ .code = .torrent_parse_error, .message = "failed to parse magnet URI" } },
+        error.OutOfMemory => return .{ .failure = .{ .code = .internal_error, .message = "out of memory" } },
+        else => return .{ .failure = .{ .code = .torrent_parse_error, .message = "failed to parse magnet URI" } },
+    };
+    defer magnet.deinit(parsed, allocator);
+
+    const has_trackers = parsed.tracker_urls.len > 0;
+    const dht_ok = daemon.cfg.network.dht.enabled;
+    if (!has_trackers and !dht_ok) {
+        return .{ .failure = .{ .code = .no_discovery_source, .message = "magnet has no supported trackers and DHT is disabled" } };
+    }
+
+    const hex = &parsed.info_hash_hex;
+    if (daemon.registry.findCompletion(hex) != null) return .{ .failure = .{ .code = .already_completed, .message = "torrent already completed and cannot be re-added in v2" } };
+    if (daemon.registry.find(hex) != null) return .{ .failure = .{ .code = .duplicate_torrent, .message = "torrent is already active" } };
+
+    const dir = try std.fs.path.join(allocator, &.{ daemon.cfg.staging_area, hex });
+    defer allocator.free(dir);
+    try std.Io.Dir.cwd().createDirPath(daemon.io, dir);
+
+    const name = if (parsed.display_name) |dn| try allocator.dupe(u8, dn) else try allocator.dupe(u8, hex);
+    errdefer allocator.free(name);
+
+    const tracker_records = try buildTrackerRecords(daemon.allocator, parsed.tracker_urls);
+    errdefer freeTrackerRecords(daemon.allocator, tracker_records);
+
+    var unsupported: []const []const u8 = &.{};
+    if (parsed.unsupported_urls.len > 0) {
+        var warn_list = try allocator.alloc([]const u8, parsed.unsupported_urls.len);
+        errdefer {
+            for (warn_list) |u| allocator.free(u);
+            allocator.free(warn_list);
+        }
+        for (parsed.unsupported_urls, 0..) |url, i| warn_list[i] = try allocator.dupe(u8, url);
+        unsupported = warn_list;
+    }
+
+    var rec = state.TorrentRecord{
+        .info_hash_hex = hex,
+        .name = name,
+        .status = .active,
+        .trackers = tracker_records,
+        .metadata_complete = false,
+        .source = "magnet",
+        .unsupported_tracker_warnings = unsupported,
+    };
+    try allocateDhtSlot(daemon, &rec, false);
+
+    try daemon.registry.add(rec);
+    const stored = daemon.registry.find(hex).?;
+    try state.writeTorrentState(daemon.io, allocator, daemon.cfg.staging_area, stored.*);
+    try daemon.engine.addSession(daemon.io, daemon.cfg, &daemon.registry, stored, daemon.dhtContext());
+    return showResponse(daemon, stored.*);
+}
+
+fn addTorrentFile(daemon: *Daemon, path: []const u8) !protocol.Response {
     const allocator = daemon.allocator;
     const meta = torrent.Metadata.parseFile(allocator, daemon.io, path) catch return .{ .failure = .{ .code = .torrent_parse_error, .message = "failed to parse torrent file" } };
     defer meta.deinit();
@@ -428,6 +492,9 @@ fn showResponse(daemon: *Daemon, rec: state.TorrentRecord) !protocol.Response {
         try root.put(allocator, "dht_slot", .{ .integer = @intCast(slot) });
         try root.put(allocator, "dht_port", .{ .integer = @intCast(daemon.cfg.network.dht_base_port + slot) });
     }
+    try root.put(allocator, "metadata_complete", .{ .bool = rec.metadata_complete });
+    try root.put(allocator, "source", .{ .string = rec.source });
+    if (rec.metadata_error) |err| try root.put(allocator, "metadata_error", .{ .string = err }) else try root.put(allocator, "metadata_error", .null);
     if (daemon.engine.findSession(rec.info_hash_hex)) |session| {
         if (session.dht_socket) |sock| {
             try root.put(allocator, "dht_last_error", if (sock.last_error) |e| .{ .string = e } else .null);
@@ -507,6 +574,7 @@ fn connectedPeerCount(daemon: *Daemon, info_hash_hex: []const u8) i64 {
 
 fn derivedActivity(daemon: *Daemon, rec: state.TorrentRecord) []const u8 {
     if (rec.status != .active) return @tagName(rec.status);
+    if (!rec.metadata_complete) return "fetching_metadata";
     if (daemon.engine.findSession(rec.info_hash_hex)) |session| {
         if (session.active_piece != null) return "downloading";
         if (session.peers.items.len > 0) return "connecting";
@@ -598,6 +666,13 @@ fn loadPersistedSessions(daemon: *Daemon) !void {
         var rec = state.readTorrentState(daemon.io, daemon.allocator, state_path) catch continue;
         defer state.deinitRecord(daemon.allocator, rec);
         if (daemon.registry.findCompletion(rec.info_hash_hex) != null) return error.StateCorruption;
+        if (!rec.metadata_complete) {
+            try daemon.registry.add(rec);
+            const stored = daemon.registry.find(entry.name).?;
+            try allocateDhtSlot(daemon, stored, stored.private_torrent);
+            try state.writeTorrentState(daemon.io, daemon.allocator, daemon.cfg.staging_area, stored.*);
+            continue;
+        }
         validatePersistedSession(daemon, entry.name, &rec) catch |err| switch (err) {
             error.StateCorruption => return err,
             else => {

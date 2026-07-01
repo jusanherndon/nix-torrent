@@ -60,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
     try log.configEvent(stderr, "cli", cfg.staging_area, cfg.final_destination, cfg.socket_path);
 
     switch (command) {
-        .add => try requireArity(stderr, command_args, 2, "add <torrent-file>"),
+        .add => try requireArity(stderr, command_args, 2, "add <torrent-file|magnet-uri>"),
         .show, .pause, .@"resume", .remove => try requireArity(stderr, command_args, 2, "<command> <info-hash>"),
         .list, .status => try requireArity(stderr, command_args, 1, @tagName(command)),
         .help => unreachable,
@@ -162,7 +162,7 @@ fn usage(writer: anytype) !void {
         \\  --config PATH
         \\
         \\Commands:
-        \\  add <torrent-file>
+        \\  add <torrent-file|magnet-uri>
         \\  list
         \\  show <info-hash>
         \\  pause <info-hash>
