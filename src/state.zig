@@ -1,9 +1,11 @@
 const std = @import("std");
 const torrent = @import("torrent.zig");
+const tracker = @import("tracker.zig");
 
 pub const Status = enum { active, paused, complete, failed };
 
 pub const TrackerRecord = struct {
+    /// Persistence DTO: URL is stable; other fields are a projection of live TrackerState when a session is attached.
     url: []const u8,
     last_error: ?[]const u8 = null,
     next_announce_ms: i64 = 0,
@@ -165,6 +167,13 @@ fn cloneStringSlice(allocator: std.mem.Allocator, items: []const []const u8) ![]
     errdefer allocator.free(out);
     for (items, 0..) |item, i| out[i] = try allocator.dupe(u8, item);
     return out;
+}
+
+pub fn applyTrackerState(allocator: std.mem.Allocator, tr: *TrackerRecord, ts: tracker.TrackerState) void {
+    tr.next_announce_ms = ts.next_announce_ms;
+    tr.started_sent = ts.started_sent;
+    if (tr.last_error) |old| allocator.free(old);
+    tr.last_error = if (ts.last_error) |s| allocator.dupe(u8, s) catch null else null;
 }
 
 pub fn findTracker(record: *TorrentRecord, url: []const u8) ?*TrackerRecord {
@@ -408,6 +417,22 @@ pub fn readTorrentState(io: std.Io, allocator: std.mem.Allocator, path: []const 
 fn parseStatus(s: []const u8) ?Status {
     inline for (@typeInfo(Status).@"enum".fields) |f| if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
     return null;
+}
+
+test "applyTrackerState copies runtime tracker fields onto record" {
+    const allocator = std.testing.allocator;
+    var tr = TrackerRecord{ .url = try allocator.dupe(u8, "http://127.0.0.1/announce") };
+    defer tr.deinit(allocator);
+    var ts: tracker.TrackerState = .{
+        .next_announce_ms = 42,
+        .started_sent = true,
+        .last_error = try allocator.dupe(u8, "timeout"),
+    };
+    defer ts.deinit(allocator);
+    applyTrackerState(allocator, &tr, ts);
+    try std.testing.expectEqual(@as(i64, 42), tr.next_announce_ms);
+    try std.testing.expect(tr.started_sent);
+    try std.testing.expectEqualStrings("timeout", tr.last_error.?);
 }
 
 test "rejects duplicate torrent by info hash" {

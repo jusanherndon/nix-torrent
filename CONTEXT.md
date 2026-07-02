@@ -36,6 +36,14 @@ _Avoid_: Tracker, magnet link, per-torrent routing table
 The client-owned location where incomplete torrent content is kept before it is ready for handoff.
 _Avoid_: Final destination, downloads folder
 
+**Staging Provisioning**:
+Filesystem preparation of a torrent's staging area — directories, metadata on disk, staged content files, and piece recheck — before the engine attaches a Torrent Session.
+_Avoid_: Session attach, registry update, DHT slot allocation
+
+**Torrent Session**:
+Engine-owned runtime state for a torrent under active download, including peers, piece progress, tracker protocol state, and DHT socket handles.
+_Avoid_: Torrent record, registry entry, completion history
+
 **Final Destination**:
 The user-facing location where completed torrent content is placed after handoff.
 _Avoid_: Staging area, incomplete folder
