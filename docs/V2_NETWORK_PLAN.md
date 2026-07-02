@@ -193,7 +193,7 @@ TorrentDhtSocket {
 
 ## Milestone 11: Protocol Encryption
 
-Add outbound Message Stream Encryption (MSE) per BEP 10 so peer connections can use encrypted handshakes when supported. v2 remains download-only and does not accept inbound peer connections. Encryption policy applies to both metadata and content peer connections.
+Add outbound Message Stream Encryption (MSE) per the [de facto MSE spec](https://wiki.theory.org/BitTorrentSpecification) so peer connections can negotiate stream protection before the BitTorrent handshake. v2 remains download-only and does not accept inbound peer connections. Encryption policy applies to both metadata and content peer connections.
 
 ### Configuration
 
@@ -206,30 +206,37 @@ policy = "prefer"
 
 Supported `policy` values:
 
-- `prefer` — try encrypted handshake first, fall back to plaintext when the peer does not support encryption
-- `require` — only complete handshakes with encryption; disconnect peers that do not support encryption
-- `disable` — use plaintext BitTorrent handshakes only
+- `prefer` — attempt MSE on every outbound connect; select RC4 (`0x02`) when offered, otherwise plaintext-within-MSE (`0x01`); skip peers that do not speak MSE (no non-MSE plaintext fallback)
+- `require` — attempt MSE and accept only peers that negotiate RC4 (`0x02`); skip all others
+- `disable` — use standard plaintext BitTorrent handshakes only (no MSE)
 
 Default policy for v2: `prefer`.
 
 ### Tasks
 
-- Perform the MSE DH key exchange and crypto provide/select negotiation before the BitTorrent handshake when policy is not `disable`.
-- Support both plaintext and encrypted handshake paths behind one peer-connection API.
-- Encrypt and decrypt the BitTorrent handshake and subsequent peer messages when encryption is active.
-- Preserve the existing plaintext handshake path for peers that do not support encryption when policy is `prefer`.
-- Reject or disconnect peers that do not complete encryption when policy is `require`.
+- Perform full-spec MSE initiator and responder frames: DH key exchange, VC verification, RC4-decrypted negotiation payloads, variable pads, and `crypto_provide` / `crypto_select` negotiation before the BitTorrent handshake when policy is not `disable`.
+- Negotiate de facto schemes only: plaintext-within-MSE (`0x01`) and RC4 (`0x02`). When both are offered, select RC4.
+- Support three peer connection modes behind one peer-connection API: `encrypted` (RC4), `obfuscated` (MSE `0x01`), and `plaintext` (no MSE).
+- Encrypt and decrypt the BitTorrent handshake and subsequent peer messages when RC4 is selected.
+- After plaintext-within-MSE selection, send the BitTorrent handshake and subsequent messages on a cleartext stream (no RC4 `Session`).
+- Remove non-MSE plaintext fallback from the `prefer` policy path; skip peers that respond with a raw BitTorrent handshake.
+- Reject or skip peers that do not offer an acceptable scheme for the configured policy.
+- Send HTTP tracker MSE signaling on announces: `supportcrypto=1` for `prefer` and `require`; add `requirecrypto=1` for `require` only.
+- Parse HTTP tracker `crypto_flags` when present: under `require`, skip peers with flag `0`; under `prefer`, order flag-`1` peers before flag-`0` in each connect batch.
 - For **content-download** connections, keep reserved extension bytes at zero (no extension protocol in v2).
 - For **metadata-fetch** connections (milestone 12), set the extension protocol bit after encryption negotiation; see milestone 12.
 - Enforce the configured maximum peer message size on decrypted plaintext before decode.
-- Surface encryption mode per peer in detailed torrent status when useful, such as `plaintext`, `encrypted`, or `encryption_required`.
+- Surface per-peer connection mode in detailed torrent status: `encrypted`, `obfuscated`, or `plaintext`.
 
 ### Acceptance Criteria
 
-- The daemon can download from a fake peer that requires encrypted handshakes.
-- With `policy = "prefer"`, encrypted peers complete successfully and plaintext-only fake peers still work.
-- With `policy = "require"`, plaintext-only fake peers are rejected without crashing the daemon.
-- With `policy = "disable"`, behavior matches the foundation plaintext peer milestone.
+- The daemon can download from a fake peer that requires RC4 (`policy = "require"`).
+- With `policy = "prefer"`, a fake peer advertising RC4 completes as `encrypted`.
+- With `policy = "prefer"`, a fake peer advertising only plaintext-within-MSE (`0x01`) completes as `obfuscated`.
+- With `policy = "prefer"`, a fake non-MSE peer is skipped without crashing the daemon (no plaintext fallback).
+- With `policy = "require"`, fake peers that do not offer RC4 are skipped without crashing the daemon.
+- With `policy = "disable"`, behavior matches the foundation plaintext peer milestone (`plaintext` mode).
+- HTTP tracker announces include `supportcrypto=1` when policy is `prefer` or `require`, and `requirecrypto=1` when policy is `require`.
 - Malformed or oversized encrypted peer messages close only the affected peer connection.
 
 ## Milestone 12: Magnet Links
@@ -293,7 +300,7 @@ Extend the local integration harness so automated v2 tests cover the new network
 - Fake UDP tracker
 - Fake DHT node
 - Fake plaintext peer
-- Fake encrypted peer
+- Fake encrypted peer (full-spec MSE; variants: `rc4_only`, `plaintext_only`, `both`)
 - Fake metadata peer
 - Temporary staging and final directories
 - Real daemon socket
@@ -304,14 +311,15 @@ Extend the local integration harness so automated v2 tests cover the new network
 1. Add a torrent with a `udp://` top-level announce URL and download from a fake UDP tracker peer.
 2. Add a non-private torrent and discover a fake DHT peer without a working tracker.
 3. Two active DHT-eligible torrents bind distinct `dht_base_port + slot` UDP ports.
-4. Download from a fake peer that requires protocol encryption with `policy = "require"`.
-5. Add a magnet URI, fetch metadata from a fake metadata peer, and complete the torrent.
-6. Magnet add with no `tr=` and DHT enabled succeeds; same magnet with DHT disabled is rejected with `no_discovery_source`.
-7. Private torrent does not bind a DHT socket or perform DHT lookup.
-8. DHT-disabled config does not bind DHT sockets.
-9. Restart daemon and resume an incomplete magnet torrent before metadata is complete.
-10. Restart daemon and resume an incomplete magnet torrent after metadata is known.
-11. CLI checks control protocol version 2 and rejects mismatched daemon responses in tests where practical.
+4. Download from a fake peer that requires RC4 with `policy = "require"`.
+5. With `policy = "prefer"`, connect to fake peers advertising RC4-only, plaintext-within-MSE-only, and both schemes; verify `encrypted` and `obfuscated` modes and that non-MSE fakes are skipped.
+6. Add a magnet URI, fetch metadata from a fake metadata peer, and complete the torrent.
+7. Magnet add with no `tr=` and DHT enabled succeeds; same magnet with DHT disabled is rejected with `no_discovery_source`.
+8. Private torrent does not bind a DHT socket or perform DHT lookup.
+9. DHT-disabled config does not bind DHT sockets.
+10. Restart daemon and resume an incomplete magnet torrent before metadata is complete.
+11. Restart daemon and resume an incomplete magnet torrent after metadata is known.
+12. CLI checks control protocol version 2 and rejects mismatched daemon responses in tests where practical.
 
 ## Suggested Implementation Order
 

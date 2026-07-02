@@ -83,3 +83,39 @@ _Avoid_: Piece, file chunk, disk block
 **Configuration File**:
 A user-editable source of torrent client settings that should expose operational limits and daemon behavior without requiring code changes.
 _Avoid_: Hidden constants, command script
+
+**Message Stream Encryption (MSE)**:
+The BitTorrent peer-connection obfuscation handshake that negotiates how the stream is protected before the standard BitTorrent handshake. Peers exchange key material and select one of the defined encryption schemes.
+_Avoid_: TLS, HTTPS, transport-layer encryption
+
+**MSE Handshake**:
+The key-exchange and scheme-negotiation exchange between two peers before the BitTorrent handshake. It completes when both peers agree on one encryption scheme via `crypto_select`.
+_Avoid_: BitTorrent handshake, encryption policy
+
+**Encryption Scheme**:
+A mutually agreed MSE stream-protection option identified by a `crypto_provide` / `crypto_select` bit. The de facto schemes are plaintext-within-MSE (`0x01`, handshake only — stream not RC4-encrypted) and RC4 (`0x02`, stream encrypted after negotiation).
+_Avoid_: Encryption policy, cipher suite, AES
+
+**Encrypted Peer Connection**:
+A peer connection with RC4 stream encryption active after MSE negotiation.
+_Avoid_: Obfuscated peer connection, encryption policy
+
+**Obfuscated Peer Connection**:
+A peer connection that completed MSE negotiation with plaintext-within-MSE. The BitTorrent stream after negotiation is not RC4-encrypted, but the MSE handshake obfuscated the initial exchange.
+_Avoid_: Encrypted peer connection, plaintext peer connection, encryption policy
+
+**Plaintext Peer Connection**:
+A peer connection that uses the standard BitTorrent handshake without MSE.
+_Avoid_: Obfuscated peer connection, encrypted peer connection, encryption policy
+
+**Encryption Policy**:
+A torrent-client setting that controls whether outbound peer connections attempt MSE and what happens when negotiation fails. `disable` skips MSE. `prefer` completes MSE and selects RC4 when offered, otherwise plaintext-within-MSE (`0x01`), and never falls back to a non-MSE BitTorrent handshake; peers that do not speak MSE are skipped. `require` accepts only peers that negotiate RC4 (`0x02`).
+_Avoid_: Encryption scheme, crypto flag, tracker announce parameter
+
+**Tracker MSE Signaling**:
+Optional HTTP tracker announce parameters that tell a tracker whether this torrent client supports MSE peer connections. `supportcrypto` advertises MSE capability; `requirecrypto` advertises that only MSE peers should be returned.
+_Avoid_: Encryption policy, encryption scheme, UDP tracker announce
+
+**Tracker Peer Crypto Flag**:
+A per-peer hint in some HTTP tracker responses indicating whether that peer requires MSE. Used to filter or order peers before outbound connect attempts.
+_Avoid_: Encryption policy, encryption scheme, tracker announce parameter
