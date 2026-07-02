@@ -1,5 +1,7 @@
 const std = @import("std");
 const bencode = @import("bencode.zig");
+const dns = @import("dns.zig");
+const tcp = @import("tcp.zig");
 const torrent = @import("torrent.zig");
 
 const net = std.Io.net;
@@ -143,7 +145,7 @@ pub fn announceGet(
         .bytes = try resolveHost(io, parsed.host),
         .port = parsed.port,
     } };
-    var stream = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
+    var stream = try tcp.connectStream(io, addr.ip4.bytes, addr.ip4.port, timeout_ms);
     defer stream.close(io);
 
     var req_buf: [4096]u8 = undefined;
@@ -154,33 +156,9 @@ pub fn announceGet(
     try writer.interface.writeAll(req);
     try writer.interface.flush();
 
-    var read_buffer: [65536]u8 = undefined;
-    var reader = stream.reader(io, &read_buffer);
-    var body = std.ArrayList(u8).empty;
-    errdefer body.deinit(allocator);
-    var in_body = false;
-    var content_length: ?usize = null;
-    while (true) {
-        const line = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (!in_body) {
-            if (line.len <= 2) {
-                in_body = true;
-                continue;
-            }
-            if (std.mem.startsWith(u8, line, "Content-Length:")) {
-                const val = std.mem.trim(u8, line["Content-Length:".len..], " \t\r\n");
-                content_length = try std.fmt.parseInt(usize, val, 10);
-            }
-            continue;
-        }
-        try body.appendSlice(allocator, line);
-        if (content_length) |len| if (body.items.len >= len) break;
-    }
-    _ = timeout_ms;
-    return parseAnnounceResponse(allocator, body.items);
+    const body = try tcp.readHttpResponse(io, stream.socket.handle, allocator, timeout_ms);
+    defer allocator.free(body);
+    return parseAnnounceResponse(allocator, body);
 }
 
 const udp_connect_magic: i64 = 0x0000041727101980;
@@ -348,9 +326,8 @@ pub fn trackerShowStatus(tr: TrackerState) []const u8 {
     return "pending";
 }
 
-fn resolveHost(_: std.Io, host: []const u8) ![4]u8 {
-    const ip4 = try net.Ip4Address.parse(host, 0);
-    return ip4.bytes;
+fn resolveHost(io: std.Io, host: []const u8) ![4]u8 {
+    return dns.resolveIpv4(io, host);
 }
 
 pub fn parseAnnounceResponse(allocator: std.mem.Allocator, bytes: []const u8) !Announce {

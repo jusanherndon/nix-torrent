@@ -1,4 +1,5 @@
 const std = @import("std");
+const tcp = @import("tcp.zig");
 const torrent = @import("torrent.zig");
 const encryption = @import("encryption.zig");
 const bencode = @import("bencode.zig");
@@ -87,9 +88,7 @@ pub const Connection = struct {
     }
 
     pub fn connect(io: std.Io, allocator: std.mem.Allocator, ip: [4]u8, port: u16, timeout_ms: u64) !Connection {
-        const addr = net.IpAddress{ .ip4 = .{ .bytes = ip, .port = port } };
-        const stream = try net.IpAddress.connect(&addr, io, .{ .mode = .stream });
-        _ = timeout_ms;
+        const stream = try tcp.connectStream(io, ip, port, timeout_ms);
         return .{
             .allocator = allocator,
             .stream = stream,

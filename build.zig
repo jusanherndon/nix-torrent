@@ -10,6 +10,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/daemon.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
     });
     b.installArtifact(daemon);
@@ -69,6 +70,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/tracker.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
     });
 
@@ -77,6 +79,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/peer.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
     });
 
@@ -85,6 +88,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/engine.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
     });
 

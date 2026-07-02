@@ -53,6 +53,12 @@ pub fn connectContent(
     log.debug("peer_pool", "connected content peer {d}.{d}.{d}.{d}:{d} for {s} ({d} total)", .{ ip[0], ip[1], ip[2], ip[3], port, session.info_hash_hex, session.peers.items.len });
 }
 
+fn logConnectFailure(mode: []const u8, session: *TorrentSession, ip: [4]u8, port: u16, err: anyerror) void {
+    log.debug("peer_pool", "{s} peer connect failed {d}.{d}.{d}.{d}:{d} for {s}: {s}", .{
+        mode, ip[0], ip[1], ip[2], ip[3], port, session.info_hash_hex, @errorName(err),
+    });
+}
+
 pub fn connectContentBatch(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -63,7 +69,9 @@ pub fn connectContentBatch(
 ) void {
     for (peers) |tp| {
         if (session.peers.items.len >= cfg.limits.max_peers_per_torrent) break;
-        connectContent(allocator, io, cfg, session, tp.ip, tp.port, peer_id) catch {};
+        connectContent(allocator, io, cfg, session, tp.ip, tp.port, peer_id) catch |err| {
+            logConnectFailure("content", session, tp.ip, tp.port, err);
+        };
     }
 }
 
@@ -99,7 +107,9 @@ pub fn connectMetadataBatch(
 ) void {
     for (peers) |tp| {
         if (session.metadata_peers.items.len >= cfg.limits.max_peers_per_torrent) break;
-        connectMetadata(allocator, io, cfg, session, tp.ip, tp.port, peer_id) catch {};
+        connectMetadata(allocator, io, cfg, session, tp.ip, tp.port, peer_id) catch |err| {
+            logConnectFailure("metadata", session, tp.ip, tp.port, err);
+        };
     }
 }
 

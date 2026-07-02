@@ -333,6 +333,13 @@ fn tickTrackerAnnounces(
     now_ms: i64,
 ) !void {
     for (session.trackers.items) |*endpoint| {
+        if (endpoint.parsed.scheme != .udp) continue;
+        if (endpoint.state.due(now_ms)) {
+            try announceTrackerEndpoint(engine, io, cfg, session, rec, endpoint, peer_id, now_ms);
+        }
+    }
+    for (session.trackers.items) |*endpoint| {
+        if (endpoint.parsed.scheme != .http) continue;
         if (endpoint.state.due(now_ms)) {
             try announceTrackerEndpoint(engine, io, cfg, session, rec, endpoint, peer_id, now_ms);
         }
@@ -352,6 +359,7 @@ fn announceTrackerEndpoint(
     const left = sessionLeftBytes(session, rec);
     const event: tracker.Event = if (!endpoint.state.started_sent) .started else .none;
     const downloaded = if (session.fetching_metadata) @as(u64, 0) else rec.total_bytes - left;
+    log.debug("engine", "announcing to {s} ({s})", .{ endpoint.raw_url, endpoint.parsed.host });
     const response = tracker.announce(
         io,
         engine.allocator,
@@ -369,7 +377,7 @@ fn announceTrackerEndpoint(
     ) catch |announce_err| {
         const msg = try std.fmt.allocPrint(engine.allocator, "tracker announce failed: {s}", .{@errorName(announce_err)});
         defer engine.allocator.free(msg);
-        log.debug("engine", "tracker announce failed for {s}: {s}", .{ endpoint.raw_url, @errorName(announce_err) });
+        log.debug("engine", "tracker announce failed for {s} ({s}): {s}", .{ endpoint.raw_url, endpoint.parsed.host, @errorName(announce_err) });
         try endpoint.state.scheduleFailure(now_ms, msg, engine.allocator);
         return;
     };

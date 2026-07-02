@@ -1,5 +1,6 @@
 const std = @import("std");
 const bencode = @import("bencode.zig");
+const dns = @import("dns.zig");
 const torrent = @import("torrent.zig");
 const tracker = @import("tracker.zig");
 
@@ -128,7 +129,7 @@ pub const TorrentDhtSocket = struct {
             var converted = try allocator.alloc(BootstrapTarget, slice.len);
             for (slice, 0..) |node, i| converted[i] = .{ .ip = node.ip, .port = node.port, .id = node.id };
             break :blk converted;
-        } else try parseBootstrapNodes(allocator, cfg.bootstrap_nodes);
+        } else try parseBootstrapNodes(io, allocator, cfg.bootstrap_nodes);
 
         defer if (routing.nodes.items.len == 0) allocator.free(targets);
 
@@ -162,17 +163,17 @@ pub const TorrentDhtSocket = struct {
 
 const BootstrapTarget = struct { ip: [4]u8, port: u16, id: NodeId };
 
-fn parseBootstrapNodes(allocator: std.mem.Allocator, nodes: []const []const u8) ![]BootstrapTarget {
+fn parseBootstrapNodes(io: std.Io, allocator: std.mem.Allocator, nodes: []const []const u8) ![]BootstrapTarget {
     var out = std.ArrayList(BootstrapTarget).empty;
     errdefer out.deinit(allocator);
     for (nodes) |spec| {
         const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse continue;
         const host = spec[0..colon];
         const port = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch continue;
-        const ip4 = net.Ip4Address.parse(host, 0) catch continue;
+        const ip = dns.resolveIpv4(io, host) catch continue;
         var id: NodeId = undefined;
         @memset(&id, 0);
-        try out.append(allocator, .{ .ip = ip4.bytes, .port = port, .id = id });
+        try out.append(allocator, .{ .ip = ip, .port = port, .id = id });
     }
     return out.toOwnedSlice(allocator);
 }
@@ -260,11 +261,11 @@ pub fn bootstrap(
         const colon = std.mem.lastIndexOfScalar(u8, spec, ':') orelse continue;
         const host = spec[0..colon];
         const port = std.fmt.parseInt(u16, spec[colon + 1 ..], 10) catch continue;
-        const ip4 = net.Ip4Address.parse(host, 0) catch continue;
+        const ip = dns.resolveIpv4(io, host) catch continue;
         const tx = "bs";
         const query = try encodePingQuery(allocator, tx, routing.node_id);
         defer allocator.free(query);
-        const dest = net.IpAddress{ .ip4 = .{ .bytes = ip4.bytes, .port = port } };
+        const dest = net.IpAddress{ .ip4 = .{ .bytes = ip, .port = port } };
         socket.send(io, &dest, query) catch continue;
         var buf: [4096]u8 = undefined;
         const timeout: std.Io.Timeout = .{ .duration = .{
@@ -281,7 +282,7 @@ pub fn bootstrap(
         if (id_v != .string or id_v.string.len != 20) continue;
         var id: NodeId = undefined;
         @memcpy(&id, id_v.string[0..20]);
-        try routing.addNode(.{ .id = id, .ip = ip4.bytes, .port = port });
+        try routing.addNode(.{ .id = id, .ip = ip, .port = port });
     }
 }
 

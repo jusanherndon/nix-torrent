@@ -48,7 +48,7 @@ pub const Logger = struct {
 
     pub fn logFmt(self: Logger, level: Level, component: []const u8, comptime fmt: []const u8, args: anytype) void {
         if (!self.enabled(level)) return;
-        var buf: [512]u8 = undefined;
+        var buf: [4096]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, fmt, args) catch "log message truncated";
         event(self.writer, level, component, msg) catch {};
     }
