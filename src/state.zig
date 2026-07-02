@@ -41,6 +41,12 @@ pub const TorrentRecord = struct {
     piece_length: u64 = 0,
     piece_count: usize = 0,
     verified_piece_count: usize = 0,
+    /// Projection from an attached Torrent Session; not persisted in state.json.
+    connected_peer_count: usize = 0,
+    /// Projection from an attached Torrent Session; not persisted in state.json.
+    downloading: bool = false,
+    /// Ephemeral projection from the session DHT socket; not persisted in state.json.
+    dht_last_error: ?[]const u8 = null,
 };
 
 pub const CompletionRecord = struct {
@@ -148,6 +154,9 @@ pub fn cloneRecord(allocator: std.mem.Allocator, record: TorrentRecord) !Torrent
         .piece_length = record.piece_length,
         .piece_count = record.piece_count,
         .verified_piece_count = record.verified_piece_count,
+        .connected_peer_count = record.connected_peer_count,
+        .downloading = record.downloading,
+        .dht_last_error = if (record.dht_last_error) |s| try allocator.dupe(u8, s) else null,
     };
 }
 
@@ -158,6 +167,7 @@ pub fn deinitRecord(allocator: std.mem.Allocator, record: TorrentRecord) void {
     allocator.free(record.trackers);
     allocator.free(record.source);
     if (record.metadata_error) |s| allocator.free(s);
+    if (record.dht_last_error) |s| allocator.free(s);
     for (record.unsupported_tracker_warnings) |w| allocator.free(w);
     allocator.free(record.unsupported_tracker_warnings);
 }
@@ -174,6 +184,21 @@ pub fn applyTrackerState(allocator: std.mem.Allocator, tr: *TrackerRecord, ts: t
     tr.started_sent = ts.started_sent;
     if (tr.last_error) |old| allocator.free(old);
     tr.last_error = if (ts.last_error) |s| allocator.dupe(u8, s) catch null else null;
+}
+
+pub fn trackerShowStatus(tr: TrackerRecord) []const u8 {
+    if (tr.last_error != null) return "error";
+    if (tr.started_sent) return "ok";
+    return "pending";
+}
+
+pub fn derivedActivity(rec: TorrentRecord) []const u8 {
+    if (rec.status != .active) return @tagName(rec.status);
+    if (!rec.metadata_complete) return "fetching_metadata";
+    if (rec.downloading) return "downloading";
+    if (rec.connected_peer_count > 0) return "connecting";
+    for (rec.trackers) |tr| if (tr.last_error != null) return "announcing";
+    return "waiting_for_peers";
 }
 
 pub fn findTracker(record: *TorrentRecord, url: []const u8) ?*TrackerRecord {
@@ -417,6 +442,39 @@ pub fn readTorrentState(io: std.Io, allocator: std.mem.Allocator, path: []const 
 fn parseStatus(s: []const u8) ?Status {
     inline for (@typeInfo(Status).@"enum".fields) |f| if (std.mem.eql(u8, s, f.name)) return @enumFromInt(f.value);
     return null;
+}
+
+test "derivedActivity is a pure function of torrent record fields" {
+    const tr = TrackerRecord{ .url = "http://127.0.0.1/announce" };
+    var trackers = [_]TrackerRecord{tr};
+    const paused: TorrentRecord = .{
+        .info_hash_hex = "abcd",
+        .name = "one",
+        .status = .paused,
+        .trackers = trackers[0..],
+    };
+    try std.testing.expectEqualStrings("paused", derivedActivity(paused));
+
+    const downloading: TorrentRecord = .{
+        .info_hash_hex = "abcd",
+        .name = "one",
+        .status = .active,
+        .trackers = trackers[0..],
+        .metadata_complete = true,
+        .downloading = true,
+        .connected_peer_count = 3,
+    };
+    try std.testing.expectEqualStrings("downloading", derivedActivity(downloading));
+
+    const connecting: TorrentRecord = .{
+        .info_hash_hex = "abcd",
+        .name = "one",
+        .status = .active,
+        .trackers = trackers[0..],
+        .metadata_complete = true,
+        .connected_peer_count = 2,
+    };
+    try std.testing.expectEqualStrings("connecting", derivedActivity(connecting));
 }
 
 test "applyTrackerState copies runtime tracker fields onto record" {

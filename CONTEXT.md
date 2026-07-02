@@ -44,6 +44,10 @@ _Avoid_: Session attach, registry update, DHT slot allocation
 Engine-owned runtime state for a torrent under active download, including peers, piece progress, tracker protocol state, and DHT socket handles.
 _Avoid_: Torrent record, registry entry, completion history
 
+**Registry Projection**:
+The engine materialization of live Torrent Session fields onto the registry `TorrentRecord` at tick boundaries. Control Surface reads use the projected record only — not a parallel session lookup. Ephemeral fields (connected peer count, downloading, DHT last error) are projected each tick but not persisted in `state.json`.
+_Avoid_: Dual lookup, live session DTO, sync glue
+
 **Final Destination**:
 The user-facing location where completed torrent content is placed after handoff.
 _Avoid_: Staging area, incomplete folder

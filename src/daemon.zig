@@ -249,10 +249,16 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
             };
             if (daemon.engine.findSession(info_hash)) |session| {
                 daemon.engine.sendTrackerEvent(daemon.io, daemon.cfg, session, rec, daemon.peer_id, .stopped, nowMs(daemon.io));
-                daemon.engine.projectTrackerStates(rec, session);
+                try daemon.engine.persistTorrentState(daemon.io, daemon.cfg.staging_area, rec, session);
                 daemon.engine.closeDht(daemon.io, info_hash);
             }
             rec.status = .paused;
+            rec.connected_peer_count = 0;
+            rec.downloading = false;
+            if (rec.dht_last_error) |old| {
+                daemon.allocator.free(old);
+                rec.dht_last_error = null;
+            }
             try state.writeTorrentState(daemon.io, allocator, daemon.cfg.staging_area, rec.*);
             daemon.engine.removeSession(daemon.io, info_hash);
             return showResponse(daemon, rec.*);
@@ -453,9 +459,9 @@ fn showResponse(daemon: *Daemon, rec: state.TorrentRecord) !protocol.Response {
     errdefer root.deinit(allocator);
     try root.put(allocator, "piece_count", .{ .integer = @intCast(rec.piece_count) });
     try root.put(allocator, "verified_piece_count", .{ .integer = @intCast(rec.verified_piece_count) });
-    try root.put(allocator, "derived_activity", .{ .string = derivedActivity(daemon, rec) });
-    try root.put(allocator, "connected_peer_count", .{ .integer = connectedPeerCount(daemon, rec.info_hash_hex) });
-    try root.put(allocator, "trackers", .{ .array = try trackersShowArray(daemon, allocator, rec) });
+    try root.put(allocator, "derived_activity", .{ .string = state.derivedActivity(rec) });
+    try root.put(allocator, "connected_peer_count", .{ .integer = @intCast(rec.connected_peer_count) });
+    try root.put(allocator, "trackers", .{ .array = try trackersShowArray(allocator, rec) });
     try root.put(allocator, "dht_eligible", .{ .bool = !rec.private_torrent and daemon.cfg.network.dht.enabled });
     if (rec.dht_slot) |slot| {
         try root.put(allocator, "dht_slot", .{ .integer = @intCast(slot) });
@@ -464,35 +470,20 @@ fn showResponse(daemon: *Daemon, rec: state.TorrentRecord) !protocol.Response {
     try root.put(allocator, "metadata_complete", .{ .bool = rec.metadata_complete });
     try root.put(allocator, "source", .{ .string = rec.source });
     if (rec.metadata_error) |err| try root.put(allocator, "metadata_error", .{ .string = err }) else try root.put(allocator, "metadata_error", .null);
-    if (daemon.engine.findSession(rec.info_hash_hex)) |session| {
-        if (session.dht_socket) |sock| {
-            try root.put(allocator, "dht_last_error", if (sock.last_error) |e| .{ .string = e } else .null);
-        }
-    }
+    if (rec.dht_last_error) |err| try root.put(allocator, "dht_last_error", .{ .string = err }) else try root.put(allocator, "dht_last_error", .null);
     return .{ .success = .{ .object = root } };
 }
 
-fn trackersShowArray(daemon: *Daemon, allocator: std.mem.Allocator, rec: state.TorrentRecord) !std.json.Array {
+fn trackersShowArray(allocator: std.mem.Allocator, rec: state.TorrentRecord) !std.json.Array {
     var arr = std.json.Array.init(allocator);
     errdefer arr.deinit();
-    const session = daemon.engine.findSession(rec.info_hash_hex);
-    for (rec.trackers, 0..) |tr, i| {
+    for (rec.trackers) |tr| {
         var obj: std.json.ObjectMap = .empty;
         errdefer obj.deinit(allocator);
         try obj.put(allocator, "url", .{ .string = tr.url });
-        const endpoint_state: tracker.TrackerState = if (session) |s| blk: {
-            if (i < s.trackers.items.len) break :blk s.trackers.items[i].state;
-            break :blk .{};
-        } else blk: {
-            break :blk .{
-                .last_error = tr.last_error,
-                .next_announce_ms = tr.next_announce_ms,
-                .started_sent = tr.started_sent,
-            };
-        };
-        try obj.put(allocator, "status", .{ .string = tracker.trackerShowStatus(endpoint_state) });
-        try obj.put(allocator, "last_error", if (endpoint_state.last_error) |s| .{ .string = s } else .null);
-        try obj.put(allocator, "next_announce", .{ .integer = endpoint_state.next_announce_ms });
+        try obj.put(allocator, "status", .{ .string = state.trackerShowStatus(tr) });
+        try obj.put(allocator, "last_error", if (tr.last_error) |s| .{ .string = s } else .null);
+        try obj.put(allocator, "next_announce", .{ .integer = tr.next_announce_ms });
         try arr.append(.{ .object = obj });
     }
     return arr;
@@ -526,7 +517,7 @@ fn completionSummaryObject(allocator: std.mem.Allocator, rec: state.CompletionRe
     return obj;
 }
 
-fn summaryObject(daemon: *Daemon, allocator: std.mem.Allocator, rec: state.TorrentRecord) !std.json.ObjectMap {
+fn summaryObject(_: *Daemon, allocator: std.mem.Allocator, rec: state.TorrentRecord) !std.json.ObjectMap {
     var obj: std.json.ObjectMap = .empty;
     errdefer obj.deinit(allocator);
     try obj.put(allocator, "info_hash", .{ .string = rec.info_hash_hex });
@@ -534,24 +525,8 @@ fn summaryObject(daemon: *Daemon, allocator: std.mem.Allocator, rec: state.Torre
     try obj.put(allocator, "lifecycle_status", .{ .string = @tagName(rec.status) });
     try obj.put(allocator, "verified_bytes", .{ .integer = @intCast(verifiedBytes(rec)) });
     try obj.put(allocator, "total_bytes", .{ .integer = @intCast(rec.total_bytes) });
-    try obj.put(allocator, "connected_peer_count", .{ .integer = connectedPeerCount(daemon, rec.info_hash_hex) });
+    try obj.put(allocator, "connected_peer_count", .{ .integer = @intCast(rec.connected_peer_count) });
     return obj;
-}
-
-fn connectedPeerCount(daemon: *Daemon, info_hash_hex: []const u8) i64 {
-    if (daemon.engine.findSession(info_hash_hex)) |session| return @intCast(session.peers.items.len);
-    return 0;
-}
-
-fn derivedActivity(daemon: *Daemon, rec: state.TorrentRecord) []const u8 {
-    if (rec.status != .active) return @tagName(rec.status);
-    if (!rec.metadata_complete) return "fetching_metadata";
-    if (daemon.engine.findSession(rec.info_hash_hex)) |session| {
-        if (session.active_piece != null) return "downloading";
-        if (session.peers.items.len > 0) return "connecting";
-        for (session.trackers.items) |tr| if (tr.state.last_error != null) return "announcing";
-    }
-    return "waiting_for_peers";
 }
 
 fn acceptWithTimeout(server: *net.Server, io: std.Io, timeout_ms: i32) !?net.Stream {

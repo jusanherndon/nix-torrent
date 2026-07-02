@@ -88,6 +88,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const piece_scheduler_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/piece_scheduler.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
     const handoff_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/handoff.zig"),
@@ -155,6 +163,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(tracker_tests).step);
     test_step.dependOn(&b.addRunArtifact(peer_tests).step);
     test_step.dependOn(&b.addRunArtifact(engine_tests).step);
+    test_step.dependOn(&b.addRunArtifact(piece_scheduler_tests).step);
     test_step.dependOn(&b.addRunArtifact(handoff_tests).step);
     test_step.dependOn(&b.addRunArtifact(protocol_tests).step);
     test_step.dependOn(&b.addRunArtifact(state_tests).step);

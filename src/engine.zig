@@ -2,103 +2,21 @@ const std = @import("std");
 const config = @import("config.zig");
 const handoff = @import("handoff.zig");
 const magnet = @import("magnet.zig");
-const peer = @import("peer.zig");
 const state = @import("state.zig");
 const storage = @import("storage.zig");
 const torrent = @import("torrent.zig");
 const tracker = @import("tracker.zig");
 const dht = @import("dht.zig");
 const staging = @import("staging.zig");
+const engine_session = @import("engine_session.zig");
+const peer_pool = @import("peer_pool.zig");
+const piece_scheduler = @import("piece_scheduler.zig");
+const metadata_fetch = @import("metadata_fetch.zig");
 
-pub const DhtContext = struct {
-    routing: *dht.RoutingTable,
-    cfg: dht.Config,
-    bootstrapped: *bool,
-    last_refresh_ms: *i64,
-    slots: *dht.SlotAllocator,
-};
-
-const BlockMap = std.AutoHashMap(u32, void);
-
-pub const PieceDownload = struct {
-    piece_index: usize,
-    peer_index: usize,
-    buffer: []u8,
-    received: BlockMap,
-    block_size: u32,
-    inflight: std.AutoHashMap(u32, i64),
-
-    pub fn deinit(self: *PieceDownload, allocator: std.mem.Allocator) void {
-        allocator.free(self.buffer);
-        self.received.deinit();
-        self.inflight.deinit();
-    }
-
-    pub fn complete(self: PieceDownload, piece_len: usize) bool {
-        return self.received.count() > 0 and self.receivedBytes() >= piece_len;
-    }
-
-    pub fn receivedBytes(self: PieceDownload) usize {
-        var total: usize = 0;
-        var it = self.received.keyIterator();
-        while (it.next()) |begin| {
-            total += @min(self.block_size, self.buffer.len - begin.*);
-        }
-        return total;
-    }
-};
-
-pub const TrackerEndpoint = struct {
-    raw_url: []const u8,
-    parsed: tracker.AnnounceUrl,
-    state: tracker.TrackerState,
-    udp: tracker.UdpSession,
-
-    pub fn deinit(self: *TrackerEndpoint, allocator: std.mem.Allocator) void {
-        allocator.free(self.raw_url);
-        self.state.deinit(allocator);
-        self.parsed.deinit(allocator);
-    }
-};
-
-const metadata_piece_size: u32 = 16 * 1024;
-
-pub const TorrentSession = struct {
-    info_hash_hex: []const u8,
-    info_hash: torrent.InfoHash,
-    fetching_metadata: bool,
-    meta: ?torrent.Metadata,
-    layout: ?storage.Layout,
-    content_dir: ?[]const u8,
-    trackers: std.ArrayList(TrackerEndpoint),
-    announce_port: u16,
-    dht_socket: ?dht.TorrentDhtSocket = null,
-    peers: std.ArrayList(peer.Connection),
-    metadata_peers: std.ArrayList(peer.Connection),
-    metadata_chunks: std.AutoHashMap(u32, []u8),
-    metadata_size: ?usize = null,
-    metadata_next_request: u32 = 0,
-    active_piece: ?PieceDownload,
-    failure_reason: ?[]const u8 = null,
-
-    pub fn deinit(self: *TorrentSession, io: std.Io, allocator: std.mem.Allocator) void {
-        for (self.peers.items) |*p| p.deinit(io);
-        self.peers.deinit(allocator);
-        for (self.metadata_peers.items) |*p| p.deinit(io);
-        self.metadata_peers.deinit(allocator);
-        var chunk_it = self.metadata_chunks.iterator();
-        while (chunk_it.next()) |entry| allocator.free(entry.value_ptr.*);
-        self.metadata_chunks.deinit();
-        if (self.active_piece) |*piece| piece.deinit(allocator);
-        if (self.layout) |*layout| layout.deinit();
-        if (self.meta) |*meta| meta.deinit();
-        if (self.content_dir) |dir| allocator.free(dir);
-        for (self.trackers.items) |*tr| tr.deinit(allocator);
-        self.trackers.deinit(allocator);
-        if (self.dht_socket) |*sock| sock.close(io, allocator);
-        if (self.failure_reason) |s| allocator.free(s);
-    }
-};
+pub const DhtContext = peer_pool.DhtContext;
+pub const PieceDownload = engine_session.PieceDownload;
+pub const TrackerEndpoint = engine_session.TrackerEndpoint;
+pub const TorrentSession = engine_session.TorrentSession;
 
 pub const Engine = struct {
     allocator: std.mem.Allocator,
@@ -258,11 +176,7 @@ pub const Engine = struct {
     }
 
     pub fn projectTrackerStates(self: *Engine, rec: *state.TorrentRecord, session: *TorrentSession) void {
-        const n = @min(session.trackers.items.len, rec.trackers.len);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            state.applyTrackerState(self.allocator, &rec.trackers[i], session.trackers.items[i].state);
-        }
+        projectSessionToRecord(self.allocator, rec, session);
     }
 
     pub fn persistTorrentState(
@@ -272,7 +186,7 @@ pub const Engine = struct {
         rec: *state.TorrentRecord,
         session: ?*TorrentSession,
     ) !void {
-        if (session) |s| self.projectTrackerStates(rec, s);
+        if (session) |s| projectSessionToRecord(self.allocator, rec, s);
         try state.writeTorrentState(io, self.allocator, staging_root, rec.*);
     }
 
@@ -284,6 +198,21 @@ pub const Engine = struct {
         }
     }
 };
+
+fn projectSessionToRecord(allocator: std.mem.Allocator, rec: *state.TorrentRecord, session: *TorrentSession) void {
+    const n = @min(session.trackers.items.len, rec.trackers.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        state.applyTrackerState(allocator, &rec.trackers[i], session.trackers.items[i].state);
+    }
+    rec.connected_peer_count = session.peers.items.len;
+    rec.downloading = session.active_piece != null;
+    if (rec.dht_last_error) |old| allocator.free(old);
+    rec.dht_last_error = if (session.dht_socket) |sock|
+        if (sock.last_error) |e| allocator.dupe(u8, e) catch null else null
+    else
+        null;
+}
 
 fn buildTrackerEndpoints(allocator: std.mem.Allocator, cfg: config.Config, rec: *state.TorrentRecord) !std.ArrayList(TrackerEndpoint) {
     var trackers: std.ArrayList(TrackerEndpoint) = .empty;
@@ -352,12 +281,12 @@ fn tickSession(
     dht_ctx: ?DhtContext,
 ) !void {
     if (rec.status == .paused or rec.status == .failed or rec.status == .complete) {
-        if (rec.status == .paused or rec.status == .failed) peerPoolClose(session, io, engine.allocator);
+        if (rec.status == .paused or rec.status == .failed) peer_pool.close(session, io, engine.allocator);
         return;
     }
 
     if (session.fetching_metadata) {
-        try metadataFetchTick(engine, io, cfg, session, rec, peer_id, now_ms, dht_ctx);
+        try tickMetadataSession(engine, io, cfg, session, rec, peer_id, now_ms, dht_ctx);
         return;
     }
 
@@ -367,174 +296,27 @@ fn tickSession(
     }
 
     try tickTrackerAnnounces(engine, io, cfg, session, rec, peer_id, now_ms);
-    if (dht_ctx) |ctx| try peerPoolTickDht(engine, io, cfg, session, ctx, peer_id, now_ms, .content);
-    try peerPoolMaintain(engine.allocator, io, cfg, session, now_ms);
-    try peerPoolPoll(io, cfg, session, rec, now_ms);
-    rec.verified_piece_count = try pieceSchedulerTick(engine.allocator, io, cfg, session, now_ms);
+    if (dht_ctx) |ctx| try peer_pool.tickDht(engine.allocator, io, cfg, session, ctx, peer_id, now_ms, .content);
+    try peer_pool.poll(io, cfg, session, engine.allocator);
+    try peer_pool.maintain(engine.allocator, io, cfg, session);
+    rec.verified_piece_count = try piece_scheduler.tick(engine.allocator, io, cfg, session, now_ms);
     try engine.persistTorrentState(io, cfg.staging_area, rec, session);
 }
 
-// --- Peer pool ---
-
-const DhtPeerMode = enum { content, metadata };
-
-fn peerListHas(peers: []const peer.Connection, ip: [4]u8, port: u16) bool {
-    for (peers) |p| {
-        if (p.peer_ip[0] == ip[0] and p.peer_ip[1] == ip[1] and p.peer_ip[2] == ip[2] and p.peer_ip[3] == ip[3] and p.peer_port == port) return true;
-    }
-    return false;
-}
-
-fn peerPoolHasContent(session: *TorrentSession, ip: [4]u8, port: u16) bool {
-    return peerListHas(session.peers.items, ip, port);
-}
-
-fn peerPoolHasMetadata(session: *TorrentSession, ip: [4]u8, port: u16) bool {
-    return peerListHas(session.metadata_peers.items, ip, port);
-}
-
-fn peerPoolConnectContent(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    cfg: config.Config,
-    session: *TorrentSession,
-    ip: [4]u8,
-    port: u16,
-    peer_id: [20]u8,
-) !void {
-    if (session.peers.items.len >= cfg.limits.max_peers_per_torrent) return;
-    if (peerPoolHasContent(session, ip, port)) return;
-    var conn = try peer.Connection.connect(io, allocator, ip, port, cfg.network.peer_connect_timeout_ms);
-    errdefer conn.deinit(io);
-    try conn.performHandshake(io, session.info_hash, peer_id, config.encryptionPolicy(cfg.network), false);
-    try conn.sendInterested(io);
-    try session.peers.append(allocator, conn);
-}
-
-fn peerPoolConnectContentBatch(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    cfg: config.Config,
-    session: *TorrentSession,
-    peers: []const tracker.Peer,
-    peer_id: [20]u8,
-) void {
-    for (peers) |tp| {
-        if (session.peers.items.len >= cfg.limits.max_peers_per_torrent) break;
-        peerPoolConnectContent(allocator, io, cfg, session, tp.ip, tp.port, peer_id) catch {};
-    }
-}
-
-fn peerPoolConnectMetadata(
+fn tickMetadataSession(
     engine: *Engine,
     io: std.Io,
     cfg: config.Config,
     session: *TorrentSession,
-    ip: [4]u8,
-    port: u16,
-    peer_id: [20]u8,
-) !void {
-    if (session.metadata_peers.items.len >= cfg.limits.max_peers_per_torrent) return;
-    if (peerPoolHasMetadata(session, ip, port)) return;
-    var conn = try peer.Connection.connect(io, engine.allocator, ip, port, cfg.network.peer_connect_timeout_ms);
-    errdefer conn.deinit(io);
-    try conn.performMetadataHandshake(io, session.info_hash, peer_id, config.encryptionPolicy(cfg.network));
-    if (conn.metadata_size) |size| {
-        if (session.metadata_size == null) session.metadata_size = size;
-    }
-    try session.metadata_peers.append(engine.allocator, conn);
-    if (conn.recv_buffer.items.len == 0) try conn.requestMetadataPiece(io, session.metadata_next_request);
-}
-
-fn peerPoolConnectMetadataBatch(
-    engine: *Engine,
-    io: std.Io,
-    cfg: config.Config,
-    session: *TorrentSession,
-    peers: []const tracker.Peer,
-    peer_id: [20]u8,
-) void {
-    for (peers) |tp| {
-        if (session.metadata_peers.items.len >= cfg.limits.max_peers_per_torrent) break;
-        peerPoolConnectMetadata(engine, io, cfg, session, tp.ip, tp.port, peer_id) catch {};
-    }
-}
-
-fn peerPoolTickDht(
-    engine: *Engine,
-    io: std.Io,
-    cfg: config.Config,
-    session: *TorrentSession,
-    ctx: DhtContext,
+    rec: *state.TorrentRecord,
     peer_id: [20]u8,
     now_ms: i64,
-    mode: DhtPeerMode,
+    dht_ctx: ?DhtContext,
 ) !void {
-    const sock = &(session.dht_socket orelse return);
-    const dht_peers = try sock.tick(io, engine.allocator, ctx.routing, ctx.cfg, session.info_hash, now_ms);
-    defer engine.allocator.free(dht_peers);
-    switch (mode) {
-        .content => peerPoolConnectContentBatch(engine.allocator, io, cfg, session, dht_peers, peer_id),
-        .metadata => peerPoolConnectMetadataBatch(engine, io, cfg, session, dht_peers, peer_id),
-    }
-}
-
-fn peerPoolClose(session: *TorrentSession, io: std.Io, allocator: std.mem.Allocator) void {
-    for (session.peers.items) |*p| p.close(io);
-    session.peers.clearRetainingCapacity();
-    for (session.metadata_peers.items) |*p| p.close(io);
-    session.metadata_peers.clearRetainingCapacity();
-    if (session.active_piece) |*piece| {
-        pieceSchedulerDiscard(session, piece, allocator);
-    }
-}
-
-fn peerPoolMaintain(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, session: *TorrentSession, now_ms: i64) !void {
-    _ = now_ms;
-    var i: usize = 0;
-    while (i < session.peers.items.len) {
-        var conn = &session.peers.items[i];
-        if (conn.recv_buffer.items.len < 4096) {
-            const n = conn.readAvailable(io) catch {
-                conn.deinit(io);
-                _ = session.peers.orderedRemove(i);
-                if (session.active_piece) |*piece| if (piece.peer_index == i) pieceSchedulerDiscard(session, piece, allocator);
-                continue;
-            };
-            if (n == 0 and conn.recv_buffer.items.len == 0) {
-                conn.deinit(io);
-                _ = session.peers.orderedRemove(i);
-                if (session.active_piece) |*piece| if (piece.peer_index == i) pieceSchedulerDiscard(session, piece, allocator);
-                continue;
-            }
-        }
-        while (true) {
-            const msg = conn.pollMessage(cfg.limits.max_peer_message_bytes) catch {
-                conn.deinit(io);
-                _ = session.peers.orderedRemove(i);
-                if (session.active_piece) |*piece| if (piece.peer_index == i) pieceSchedulerDiscard(session, piece, allocator);
-                break;
-            };
-            if (msg == null) break;
-            switch (msg.?) {
-                .bitfield => |bits| conn.state.setBitfield(allocator, session.layout.?.piece_states.len, bits) catch {},
-                .have => |index| conn.state.setHave(allocator, session.layout.?.piece_states.len, index) catch {},
-                .unchoke => {},
-                .piece => |block| try pieceSchedulerHandleBlock(cfg, session, i, block),
-                else => {},
-            }
-            conn.state.apply(msg.?);
-        }
-        i += 1;
-    }
-}
-
-fn peerPoolPoll(io: std.Io, cfg: config.Config, session: *TorrentSession, rec: *state.TorrentRecord, now_ms: i64) !void {
-    _ = io;
-    _ = cfg;
-    _ = session;
-    _ = rec;
-    _ = now_ms;
+    try tickTrackerAnnounces(engine, io, cfg, session, rec, peer_id, now_ms);
+    if (dht_ctx) |ctx| try metadata_fetch.tickDht(engine.allocator, io, cfg, session, ctx, peer_id, now_ms);
+    try metadata_fetch.tick(engine.allocator, io, cfg, session, rec, dht_ctx);
+    try engine.persistTorrentState(io, cfg.staging_area, rec, session);
 }
 
 fn tickTrackerAnnounces(
@@ -596,299 +378,11 @@ fn announceTrackerEndpoint(
     endpoint.state.started_sent = true;
     endpoint.state.scheduleSuccess(now_ms, response.interval);
     if (session.fetching_metadata) {
-        peerPoolConnectMetadataBatch(engine, io, cfg, session, response.peers, peer_id);
+        peer_pool.connectMetadataBatch(engine.allocator, io, cfg, session, response.peers, peer_id);
     } else {
-        peerPoolConnectContentBatch(engine.allocator, io, cfg, session, response.peers, peer_id);
+        peer_pool.connectContentBatch(engine.allocator, io, cfg, session, response.peers, peer_id);
     }
 }
-
-// --- Metadata fetch ---
-
-fn metadataFetchTick(
-    engine: *Engine,
-    io: std.Io,
-    cfg: config.Config,
-    session: *TorrentSession,
-    rec: *state.TorrentRecord,
-    peer_id: [20]u8,
-    now_ms: i64,
-    dht_ctx: ?DhtContext,
-) !void {
-    try tickTrackerAnnounces(engine, io, cfg, session, rec, peer_id, now_ms);
-    if (dht_ctx) |ctx| try peerPoolTickDht(engine, io, cfg, session, ctx, peer_id, now_ms, .metadata);
-    try metadataFetchMaintainPeers(engine, io, cfg, session);
-    try metadataFetchTryComplete(engine, io, cfg, session, rec, dht_ctx);
-    try engine.persistTorrentState(io, cfg.staging_area, rec, session);
-}
-
-fn metadataFetchMaintainPeers(engine: *Engine, io: std.Io, cfg: config.Config, session: *TorrentSession) !void {
-    _ = cfg;
-    var i: usize = 0;
-    while (i < session.metadata_peers.items.len) {
-        var conn = &session.metadata_peers.items[i];
-        const data = conn.readMetadataPiece(io) catch {
-            conn.deinit(io);
-            _ = session.metadata_peers.orderedRemove(i);
-            continue;
-        };
-        if (data) |piece| {
-            defer engine.allocator.free(piece.bytes);
-            if (session.metadata_chunks.fetchRemove(piece.piece)) |old| engine.allocator.free(old.value);
-            try session.metadata_chunks.put(piece.piece, try engine.allocator.dupe(u8, piece.bytes));
-            session.metadata_next_request = piece.piece + 1;
-            if (session.metadata_size) |size| {
-                const piece_count = (size + metadata_piece_size - 1) / metadata_piece_size;
-                if (session.metadata_next_request < piece_count) {
-                    conn.requestMetadataPiece(io, session.metadata_next_request) catch {};
-                }
-            }
-        } else {
-            conn.deinit(io);
-            _ = session.metadata_peers.orderedRemove(i);
-            continue;
-        }
-        i += 1;
-    }
-}
-
-fn metadataFetchTryComplete(
-    engine: *Engine,
-    io: std.Io,
-    cfg: config.Config,
-    session: *TorrentSession,
-    rec: *state.TorrentRecord,
-    dht_ctx: ?DhtContext,
-) !void {
-    const size = session.metadata_size orelse return;
-    const piece_count = (size + metadata_piece_size - 1) / metadata_piece_size;
-    var i: usize = 0;
-    while (i < piece_count) : (i += 1) {
-        if (!session.metadata_chunks.contains(@intCast(i))) return;
-    }
-
-    const assembled = try engine.allocator.alloc(u8, size);
-    defer engine.allocator.free(assembled);
-    i = 0;
-    while (i < piece_count) : (i += 1) {
-        const chunk = session.metadata_chunks.get(@intCast(i)) orelse return;
-        const offset = i * metadata_piece_size;
-        const copy_len = @min(chunk.len, size - offset);
-        @memcpy(assembled[offset .. offset + copy_len], chunk[0..copy_len]);
-    }
-
-    const hash = torrent.infoHashFromInfoBytes(assembled);
-    if (!std.mem.eql(u8, &hash, &session.info_hash)) {
-        metadataFetchSetError(engine, io, rec, session, "metadata info hash mismatch");
-        metadataFetchClearChunks(engine, session);
-        return;
-    }
-
-    const announce = if (rec.trackers.len > 0) rec.trackers[0].url else null;
-    const torrent_bytes = try torrent.wrapInfoBytes(engine.allocator, assembled, announce);
-    defer engine.allocator.free(torrent_bytes);
-    const meta = torrent.Metadata.parseBytes(engine.allocator, torrent_bytes) catch {
-        metadataFetchSetError(engine, io, rec, session, "metadata parse failed");
-        metadataFetchClearChunks(engine, session);
-        return;
-    };
-    errdefer meta.deinit();
-    torrent.validateLimits(meta, cfg.limits, torrent_bytes.len) catch {
-        rec.status = .failed;
-        if (rec.metadata_error) |old| engine.allocator.free(old);
-        rec.metadata_error = try engine.allocator.dupe(u8, "metadata exceeds configured safety limits");
-        meta.deinit();
-        return;
-    };
-    storage.validatePaths(engine.allocator, meta) catch {
-        rec.status = .failed;
-        if (rec.metadata_error) |old| engine.allocator.free(old);
-        rec.metadata_error = try engine.allocator.dupe(u8, "metadata contains unsafe file paths");
-        meta.deinit();
-        return;
-    };
-    meta.deinit();
-
-    var staged = try staging.finalizeMetadata(io, engine.allocator, cfg.staging_area, rec.info_hash_hex, torrent_bytes);
-    errdefer staged.deinit(engine.allocator);
-
-    for (session.metadata_peers.items) |*p| p.deinit(io);
-    session.metadata_peers.clearRetainingCapacity();
-    metadataFetchClearChunks(engine, session);
-
-    rec.metadata_complete = true;
-    staging.applyProvisioned(rec, staged.provisioned);
-    engine.allocator.free(rec.name);
-    rec.name = try engine.allocator.dupe(u8, staged.meta.name);
-    if (rec.metadata_error) |old| engine.allocator.free(old);
-    rec.metadata_error = null;
-
-    if (staged.meta.private_torrent) {
-        if (session.dht_socket) |*sock| sock.close(io, engine.allocator);
-        session.dht_socket = null;
-        if (rec.dht_slot) |slot| {
-            if (dht_ctx) |ctx| ctx.slots.release(slot);
-            rec.dht_slot = null;
-        }
-    }
-
-    session.fetching_metadata = false;
-    session.meta = staged.meta;
-    session.layout = staged.layout;
-    session.content_dir = staged.content_dir;
-    session.info_hash = staged.meta.info_hash;
-    session.metadata_size = null;
-    session.metadata_next_request = 0;
-    for (session.trackers.items) |*endpoint| endpoint.state.next_announce_ms = 0;
-}
-
-fn metadataFetchSetError(engine: *Engine, io: std.Io, rec: *state.TorrentRecord, session: *TorrentSession, message: []const u8) void {
-    if (rec.metadata_error) |old| engine.allocator.free(old);
-    rec.metadata_error = engine.allocator.dupe(u8, message) catch null;
-    for (session.metadata_peers.items) |*p| p.deinit(io);
-    session.metadata_peers.clearRetainingCapacity();
-}
-
-fn metadataFetchClearChunks(engine: *Engine, session: *TorrentSession) void {
-    var it = session.metadata_chunks.iterator();
-    while (it.next()) |entry| engine.allocator.free(entry.value_ptr.*);
-    session.metadata_chunks.clearRetainingCapacity();
-    session.metadata_next_request = 0;
-}
-
-// --- Piece scheduler ---
-
-fn pieceSchedulerCountVerified(layout: storage.Layout) usize {
-    var n: usize = 0;
-    for (layout.piece_states) |ps| {
-        if (ps == .verified) n += 1;
-    }
-    return n;
-}
-
-fn pieceSchedulerTick(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    cfg: config.Config,
-    session: *TorrentSession,
-    now_ms: i64,
-) !usize {
-    if (session.active_piece == null) {
-        if (pieceSchedulerPickPiece(session)) |piece_index| {
-            if (pieceSchedulerPickPeer(session, piece_index)) |peer_index| {
-                const span = session.layout.?.pieceSpan(piece_index);
-                const buffer = try allocator.alloc(u8, span.length);
-                session.active_piece = .{
-                    .piece_index = piece_index,
-                    .peer_index = peer_index,
-                    .buffer = buffer,
-                    .received = std.AutoHashMap(u32, void).init(allocator),
-                    .block_size = @intCast(cfg.engine.block_request_bytes),
-                    .inflight = std.AutoHashMap(u32, i64).init(allocator),
-                };
-                session.layout.?.mark(piece_index, .in_progress);
-            }
-        }
-    }
-    if (session.active_piece) |*piece| {
-        try pieceSchedulerRequestBlocks(allocator, io, cfg, session, piece, now_ms);
-        if (piece.complete(session.layout.?.pieceSpan(piece.piece_index).length)) {
-            try pieceSchedulerFinish(io, allocator, session, piece);
-        }
-    }
-    return pieceSchedulerCountVerified(session.layout.?);
-}
-
-fn pieceSchedulerPickPiece(session: *TorrentSession) ?usize {
-    var sequential: ?usize = null;
-    for (session.layout.?.piece_states, 0..) |ps, i| {
-        if (ps != .missing) continue;
-        if (sequential == null) sequential = i;
-        if (pieceSchedulerPeerHasPiece(session, i)) return i;
-    }
-    return sequential;
-}
-
-fn pieceSchedulerPeerHasPiece(session: *TorrentSession, piece_index: usize) bool {
-    for (session.peers.items) |*conn| {
-        if (!conn.state.peer_choking and conn.state.hasPiece(piece_index)) return true;
-    }
-    return false;
-}
-
-fn pieceSchedulerPickPeer(session: *TorrentSession, piece_index: usize) ?usize {
-    for (session.peers.items, 0..) |*conn, i| {
-        if (!conn.state.peer_choking and conn.state.hasPiece(piece_index)) return i;
-    }
-    return null;
-}
-
-fn pieceSchedulerHandleBlock(cfg: config.Config, session: *TorrentSession, peer_index: usize, block: peer.PieceBlock) !void {
-    const piece_index = @as(usize, @intCast(block.index));
-    if (piece_index >= session.layout.?.piece_states.len) return;
-    if (session.active_piece) |*piece| {
-        if (piece.piece_index != piece_index or piece.peer_index != peer_index) return;
-        if (block.begin + block.block.len > piece.buffer.len) return;
-        @memcpy(piece.buffer[block.begin..][0..block.block.len], block.block);
-        try piece.received.put(block.begin, {});
-        _ = piece.inflight.remove(block.begin);
-    }
-    _ = cfg;
-}
-
-fn pieceSchedulerRequestBlocks(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    cfg: config.Config,
-    session: *TorrentSession,
-    piece: *PieceDownload,
-    now_ms: i64,
-) !void {
-    const conn = &session.peers.items[piece.peer_index];
-    if (conn.state.peer_choking) return;
-    const span = session.layout.?.pieceSpan(piece.piece_index);
-    var begin: u32 = 0;
-    while (begin < span.length) {
-        if (piece.inflight.count() >= cfg.limits.max_in_flight_blocks_per_peer) break;
-        const remaining = span.length - begin;
-        const req_len: u32 = @intCast(@min(remaining, piece.block_size));
-        if (piece.received.contains(begin)) {
-            begin += req_len;
-            continue;
-        }
-        if (piece.inflight.contains(begin)) {
-            begin += req_len;
-            continue;
-        }
-        try conn.sendRequest(io, .{ .index = @intCast(piece.piece_index), .begin = begin, .length = req_len });
-        try piece.inflight.put(begin, now_ms);
-        begin += req_len;
-    }
-    var it = piece.inflight.iterator();
-    while (it.next()) |entry| {
-        if (now_ms - entry.value_ptr.* >= @as(i64, @intCast(cfg.network.peer_request_timeout_ms))) {
-            pieceSchedulerDiscard(session, piece, allocator);
-            return;
-        }
-    }
-}
-
-fn pieceSchedulerFinish(io: std.Io, allocator: std.mem.Allocator, session: *TorrentSession, piece: *PieceDownload) !void {
-    storage.writeVerifiedPiece(io, allocator, session.content_dir.?, session.meta.?, &session.layout.?, piece.piece_index, piece.buffer) catch {
-        session.layout.?.mark(piece.piece_index, .missing);
-        pieceSchedulerDiscard(session, piece, allocator);
-        return;
-    };
-    piece.deinit(allocator);
-    session.active_piece = null;
-}
-
-fn pieceSchedulerDiscard(session: *TorrentSession, piece: *PieceDownload, allocator: std.mem.Allocator) void {
-    session.layout.?.mark(piece.piece_index, .missing);
-    piece.deinit(allocator);
-    session.active_piece = null;
-}
-
-// --- Handoff ---
 
 fn leftBytes(layout: storage.Layout, total_bytes: u64) u64 {
     var verified: u64 = 0;
@@ -908,7 +402,7 @@ fn completeTorrent(
     peer_id: [20]u8,
     now_ms: i64,
 ) !void {
-    peerPoolClose(session, io, engine.allocator);
+    peer_pool.close(session, io, engine.allocator);
     engine.sendTrackerEvent(io, cfg, session, rec, peer_id, .completed, now_ms);
 
     const final_path = handoff.moveCompletedContent(io, engine.allocator, session.content_dir.?, session.meta.?, cfg.final_destination) catch {
@@ -944,32 +438,26 @@ fn deleteTorrentStatePath(io: std.Io, allocator: std.mem.Allocator, staging_area
     if (std.fs.path.isAbsolute(path)) try std.Io.Dir.deleteFileAbsolute(io, path) else try std.Io.Dir.cwd().deleteFile(io, path);
 }
 
-test "selects peer-available missing pieces ahead of unavailable sequential pieces" {
-    var ps: peer.PeerState = .{};
-    defer ps.deinit(std.testing.allocator);
-    try ps.setHave(std.testing.allocator, 4, 2);
-
-    var conn = peer.Connection{
-        .allocator = std.testing.allocator,
-        .stream = undefined,
-        .peer_ip = .{ 127, 0, 0, 1 },
-        .peer_port = 6881,
-        .state = ps,
-        .recv_buffer = .empty,
+test "projectSessionToRecord copies live session fields onto torrent record" {
+    var tr = state.TrackerRecord{ .url = try std.testing.allocator.dupe(u8, "http://127.0.0.1/announce") };
+    defer tr.deinit(std.testing.allocator);
+    var trackers = [_]state.TrackerRecord{tr};
+    var rec = state.TorrentRecord{
+        .info_hash_hex = "abcd",
+        .name = "test",
+        .trackers = trackers[0..],
     };
-    defer conn.recv_buffer.deinit(std.testing.allocator);
-    conn.state.peer_choking = false;
 
-    var states = [_]storage.PieceState{ .missing, .missing, .missing, .missing };
-    var lengths = [_]u64{16};
+    var states = [_]storage.PieceState{ .missing, .missing };
+    var lengths = [_]u64{32};
     const layout = storage.Layout{
         .allocator = std.testing.allocator,
         .file_lengths = &lengths,
-        .piece_length = 4,
-        .total_length = 16,
+        .piece_length = 16,
+        .total_length = 32,
         .piece_states = &states,
     };
-
+    const buffer = try std.testing.allocator.alloc(u8, 16);
     var session = TorrentSession{
         .info_hash_hex = "abcd",
         .info_hash = [_]u8{0} ** 20,
@@ -982,11 +470,22 @@ test "selects peer-available missing pieces ahead of unavailable sequential piec
         .peers = .empty,
         .metadata_peers = .empty,
         .metadata_chunks = std.AutoHashMap(u32, []u8).init(std.testing.allocator),
-        .active_piece = null,
+        .active_piece = .{
+            .piece_index = 0,
+            .peer_index = 0,
+            .buffer = buffer,
+            .received = std.AutoHashMap(u32, void).init(std.testing.allocator),
+            .block_size = 16,
+            .inflight = std.AutoHashMap(u32, i64).init(std.testing.allocator),
+        },
     };
     defer session.metadata_chunks.deinit();
-    defer session.peers.deinit(std.testing.allocator);
     defer session.trackers.deinit(std.testing.allocator);
-    try session.peers.append(std.testing.allocator, conn);
-    try std.testing.expectEqual(@as(?usize, 2), pieceSchedulerPickPiece(&session));
+    defer session.peers.deinit(std.testing.allocator);
+    defer session.metadata_peers.deinit(std.testing.allocator);
+    if (session.active_piece) |*piece| piece.deinit(std.testing.allocator);
+
+    projectSessionToRecord(std.testing.allocator, &rec, &session);
+    try std.testing.expect(rec.downloading);
+    try std.testing.expectEqual(@as(usize, 0), rec.connected_peer_count);
 }
