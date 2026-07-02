@@ -72,6 +72,7 @@ pub fn connectContentBatch(
     for (peers) |tp| {
         if (session.peers.items.len >= cfg.limits.max_peers_per_torrent) break;
         if (attempts >= max_attempts) break;
+        if (!tracker.peerAllowedForEncryption(tp, config.encryptionPolicy(cfg.network))) continue;
         attempts += 1;
         connectContent(allocator, io, cfg, session, tp.ip, tp.port, peer_id) catch |err| {
             logConnectFailure("content", session, tp.ip, tp.port, err);
@@ -114,6 +115,7 @@ pub fn connectMetadataBatch(
     for (peers) |tp| {
         if (session.metadata_peers.items.len >= cfg.limits.max_peers_per_torrent) break;
         if (attempts >= max_attempts) break;
+        if (!tracker.peerAllowedForEncryption(tp, config.encryptionPolicy(cfg.network))) continue;
         attempts += 1;
         connectMetadata(allocator, io, cfg, session, tp.ip, tp.port, peer_id) catch |err| {
             logConnectFailure("metadata", session, tp.ip, tp.port, err);

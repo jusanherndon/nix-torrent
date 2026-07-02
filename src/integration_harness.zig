@@ -251,7 +251,12 @@ fn buildDhtGetPeersResponse(allocator: std.mem.Allocator, tx: []const u8, node_i
     return out.toOwnedSlice(allocator);
 }
 
-pub const ContentPeerMode = enum { plaintext, encrypted };
+pub const MseScheme = enum { rc4_only, plaintext_only, both };
+
+pub const ContentPeerMode = union(enum) {
+    plaintext,
+    mse: MseScheme,
+};
 
 pub fn spawnFakeContentPeer(
     io: std.Io,
@@ -307,7 +312,7 @@ fn contentWorker(ctx: *ContentCtx) void {
 fn handleContentPeerFd(ctx: *ContentCtx, fd: c.fd_t) !void {
     switch (ctx.mode) {
         .plaintext => try servePlainContentPeerFd(fd, ctx.info_hash, ctx.info_bytes, ctx.piece_length, ctx.piece_count),
-        .encrypted => try serveEncryptedContentPeerFd(ctx.allocator, fd, ctx.info_hash, ctx.info_bytes, ctx.piece_length, ctx.piece_count),
+        .mse => |scheme| try serveMseContentPeerFd(ctx.allocator, fd, scheme, ctx.info_hash, ctx.info_bytes, ctx.piece_length, ctx.piece_count),
     }
 }
 
@@ -345,44 +350,95 @@ fn servePlainContentPeerFd(fd: c.fd_t, info_hash: torrent.InfoHash, info_bytes: 
     servePieceRequestsFd(fd, info_bytes, piece_length) catch {};
 }
 
-fn serveEncryptedContentPeerFd(allocator: std.mem.Allocator, fd: c.fd_t, info_hash: torrent.InfoHash, info_bytes: []const u8, piece_length: u64, piece_count: usize) !void {
-    var init_buf: [700]u8 = undefined;
-    const init_len = try readSomeFd(fd, &init_buf);
-    const remote_pub = encryption.extractRemotePublic(init_buf[0..init_len]) orelse return error.MalformedEncryption;
-    const keys = try encryption.generateKeyPair(allocator);
-    defer allocator.free(keys.private);
-    const resp = try encryption.buildResponderPayload(allocator, keys.public);
-    defer allocator.free(resp);
-    try writeAllFd(fd, resp);
-    var select_buf: [8]u8 = undefined;
-    try readExactFd(fd, &select_buf);
-    const shared = try encryption.sharedSecret(allocator, keys.private, remote_pub);
-    defer allocator.free(shared);
-    var session = try encryption.Session.derive(allocator, shared, false);
-    var hs_in: [68]u8 = undefined;
-    try readExactFd(fd, &hs_in);
-    session.decrypt.crypt(&hs_in);
-    var hs_out: [68]u8 = undefined;
+fn readDhPacketFd(fd: c.fd_t, buf: []u8) !usize {
+    var total: usize = 0;
+    while (total < 96) {
+        const n = try readSomeFd(fd, buf[total..96]);
+        if (n == 0) return total;
+        total += n;
+    }
+    while (total < encryption.max_dh_packet_len) {
+        const n = readSomeFdPoll(fd, buf[total..encryption.max_dh_packet_len]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    return 96;
+}
+
+fn serveMseContentPeerFd(allocator: std.mem.Allocator, fd: c.fd_t, scheme: MseScheme, info_hash: torrent.InfoHash, info_bytes: []const u8, piece_length: u64, piece_count: usize) !void {
+    var pe1_buf: [encryption.max_dh_packet_len]u8 = undefined;
+    const pe1_len = try readDhPacketFd(fd, &pe1_buf);
+    if (pe1_len < 96) return error.MalformedEncryption;
+    var remote_pub: [96]u8 = undefined;
+    @memcpy(&remote_pub, pe1_buf[0..96]);
+
+    var dh = try encryption.DhKeyExchange.generate(allocator);
+    defer dh.deinit();
+    try dh.computeShared(allocator, &remote_pub);
+    const shared = dh.shared().*;
+
+    const pe2 = try encryption.buildDhOutgoing(allocator, &dh.local_public);
+    defer allocator.free(pe2);
+    try writeAllFd(fd, pe2);
+
+    var frame_buf: [128]u8 = undefined;
+    var frame_len: usize = 0;
+    while (frame_len < 56) {
+        const n = try readSomeFd(fd, frame_buf[frame_len..56]);
+        if (n == 0) return error.MalformedEncryption;
+        frame_len += n;
+    }
+    var ia_enc: [encryption.handshake_len]u8 = undefined;
+    try readExactFd(fd, &ia_enc);
+
+    var session = encryption.Session.derive(&shared, info_hash, false);
+    const parsed = try encryption.parseInitiatorSync(&session.decrypt, frame_buf[0..frame_len], &ia_enc, &shared, info_hash);
+
+    const offered: u32 = switch (scheme) {
+        .rc4_only => encryption.CryptoFlags.rc4,
+        .plaintext_only => encryption.CryptoFlags.plaintext_within_mse,
+        .both => encryption.CryptoFlags.rc4 | encryption.CryptoFlags.plaintext_within_mse,
+    };
+    const selected = encryption.responderSelectScheme(parsed.crypto_provide, offered) orelse return error.UnsupportedEncryption;
+    const pe4 = try encryption.buildResponderSync(allocator, &session, @intFromEnum(selected));
+    defer allocator.free(pe4);
+    try writeAllFd(fd, pe4);
+
+    var hs_out: [encryption.handshake_len]u8 = undefined;
     peer.encodeHandshake(&hs_out, info_hash, [_]u8{0x2A} ** 20, false);
-    session.encrypt.crypt(&hs_out);
-    try writeAllFd(fd, &hs_out);
+    var hs_scratch = hs_out;
+    session.encrypt.crypt(&hs_scratch);
+    try writeAllFd(fd, &hs_scratch);
+
     const bitfield_len = (piece_count + 7) / 8;
     const bitfield = try allocator.alloc(u8, bitfield_len);
     defer allocator.free(bitfield);
     @memset(bitfield, 0xFF);
     const bf_msg = try peer.encodeMessage(allocator, .{ .bitfield = bitfield });
     defer allocator.free(bf_msg);
-    const bf_scratch = try allocator.dupe(u8, bf_msg);
-    defer allocator.free(bf_scratch);
-    session.encrypt.crypt(bf_scratch);
-    try writeAllFd(fd, bf_scratch);
-    const unchoke = try peer.encodeMessage(allocator, .unchoke);
-    defer allocator.free(unchoke);
-    const uc_scratch = try allocator.dupe(u8, unchoke);
-    defer allocator.free(uc_scratch);
-    session.encrypt.crypt(uc_scratch);
-    try writeAllFd(fd, uc_scratch);
-    serveEncryptedPieceRequestsFd(fd, &session, info_bytes, piece_length) catch {};
+    if (selected == .rc4) {
+        const bf_scratch = try allocator.dupe(u8, bf_msg);
+        defer allocator.free(bf_scratch);
+        session.encrypt.crypt(bf_scratch);
+        try writeAllFd(fd, bf_scratch);
+        const unchoke = try peer.encodeMessage(allocator, .unchoke);
+        defer allocator.free(unchoke);
+        const uc_scratch = try allocator.dupe(u8, unchoke);
+        defer allocator.free(uc_scratch);
+        session.encrypt.crypt(uc_scratch);
+        try writeAllFd(fd, uc_scratch);
+        serveEncryptedPieceRequestsFd(fd, &session, info_bytes, piece_length) catch {};
+    } else {
+        try writeAllFd(fd, bf_msg);
+        const unchoke = try peer.encodeMessage(allocator, .unchoke);
+        defer allocator.free(unchoke);
+        try writeAllFd(fd, unchoke);
+        servePieceRequestsFd(fd, info_bytes, piece_length) catch {};
+    }
+}
+
+fn serveEncryptedContentPeerFd(allocator: std.mem.Allocator, fd: c.fd_t, info_hash: torrent.InfoHash, info_bytes: []const u8, piece_length: u64, piece_count: usize) !void {
+    try serveMseContentPeerFd(allocator, fd, .rc4_only, info_hash, info_bytes, piece_length, piece_count);
 }
 
 fn servePieceRequestsFd(fd: c.fd_t, info_bytes: []const u8, piece_length: u64) !void {
@@ -508,6 +564,8 @@ fn handleMetadataPeerFdInner(ctx: *MetadataCtx, fd: c.fd_t) !void {
     const data_msg = try encodeMetadataData(ctx.allocator, 0, ctx.info_bytes);
     defer ctx.allocator.free(data_msg);
     try writeAllFd(fd, data_msg);
+    var drain: [4096]u8 = undefined;
+    while ((readSomeFdPoll(fd, &drain) catch 0) > 0) {}
 }
 
 fn encodeMetadataHandshake(allocator: std.mem.Allocator, metadata_size: usize) ![]u8 {

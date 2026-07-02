@@ -163,6 +163,7 @@ pub const Engine = struct {
                 downloaded,
                 left,
                 event,
+                config.encryptionPolicy(cfg.network),
                 cfg.network.tracker_request_timeout_ms,
                 now_ms,
             ) catch continue;
@@ -360,6 +361,7 @@ fn announceTrackerEndpoint(
     const event: tracker.Event = if (!endpoint.state.started_sent) .started else .none;
     const downloaded = if (session.fetching_metadata) @as(u64, 0) else rec.total_bytes - left;
     log.debug("engine", "announcing to {s} ({s})", .{ endpoint.raw_url, endpoint.parsed.host });
+    const enc_policy = config.encryptionPolicy(cfg.network);
     const response = tracker.announce(
         io,
         engine.allocator,
@@ -372,6 +374,7 @@ fn announceTrackerEndpoint(
         downloaded,
         left,
         event,
+        enc_policy,
         cfg.network.tracker_request_timeout_ms,
         now_ms,
     ) catch |announce_err| {
@@ -392,10 +395,12 @@ fn announceTrackerEndpoint(
     endpoint.state.started_sent = true;
     endpoint.state.scheduleSuccess(now_ms, response.interval);
     log.debug("engine", "tracker announce ok for {s}: {d} peers, interval {d}s", .{ endpoint.raw_url, response.peers.len, response.interval });
+    const sorted_peers = tracker.sortPeersForEncryption(engine.allocator, response.peers, enc_policy) catch response.peers;
+    defer if (sorted_peers.ptr != response.peers.ptr) engine.allocator.free(sorted_peers);
     if (session.fetching_metadata) {
-        peer_pool.connectMetadataBatch(engine.allocator, io, cfg, session, response.peers, peer_id);
+        peer_pool.connectMetadataBatch(engine.allocator, io, cfg, session, sorted_peers, peer_id);
     } else {
-        peer_pool.connectContentBatch(engine.allocator, io, cfg, session, response.peers, peer_id);
+        peer_pool.connectContentBatch(engine.allocator, io, cfg, session, sorted_peers, peer_id);
     }
 }
 

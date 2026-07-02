@@ -110,7 +110,7 @@ test "integration: udp tracker returns fake peer" {
     const parsed = try tracker.parseAnnounceUrl(allocator, url);
     defer parsed.deinit(allocator);
     var udp_session: tracker.UdpSession = .{};
-    const response = try tracker.announce(io, allocator, parsed, &udp_session, meta.info_hash, [_]u8{1} ** 20, 6881, 0, 0, meta.mode.single_file, .started, 2000, 0);
+    const response = try tracker.announce(io, allocator, parsed, &udp_session, meta.info_hash, [_]u8{1} ** 20, 6881, 0, 0, meta.mode.single_file, .started, .disable, 2000, 0);
     defer response.deinit(allocator);
     try std.testing.expect(response.peers.len >= 1);
     try std.testing.expectEqual(peer_ep.port, response.peers[0].port);
@@ -171,6 +171,53 @@ test "integration: encrypted policy rejects plaintext peer" {
     var conn = try peer.Connection.connect(io, allocator, .{ 127, 0, 0, 1 }, peer_srv.port, 2000, 2000);
     defer conn.deinit(io);
     try std.testing.expectError(error.EncryptionRequired, conn.performHandshake(io, meta.info_hash, [_]u8{4} ** 20, encryption.Policy.require, false));
+}
+
+test "integration: prefer connects to rc4 mse peer as encrypted" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const fixture = @embedFile("fixtures/single-file.torrent");
+    const meta = try torrent.Metadata.parseBytes(allocator, fixture);
+    defer meta.deinit();
+
+    var peer_srv = try harness.spawnFakeContentPeer(io, allocator, meta, .{ .mse = .rc4_only });
+    defer peer_srv.join(io);
+
+    var conn = try peer.Connection.connect(io, allocator, .{ 127, 0, 0, 1 }, peer_srv.port, 2000, 2000);
+    defer conn.deinit(io);
+    try conn.performHandshake(io, meta.info_hash, [_]u8{4} ** 20, encryption.Policy.prefer, false);
+    try std.testing.expectEqual(encryption.Mode.encrypted, conn.encryption_mode);
+}
+
+test "integration: prefer connects to plaintext-within-mse peer as obfuscated" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const fixture = @embedFile("fixtures/single-file.torrent");
+    const meta = try torrent.Metadata.parseBytes(allocator, fixture);
+    defer meta.deinit();
+
+    var peer_srv = try harness.spawnFakeContentPeer(io, allocator, meta, .{ .mse = .plaintext_only });
+    defer peer_srv.join(io);
+
+    var conn = try peer.Connection.connect(io, allocator, .{ 127, 0, 0, 1 }, peer_srv.port, 2000, 2000);
+    defer conn.deinit(io);
+    try conn.performHandshake(io, meta.info_hash, [_]u8{4} ** 20, encryption.Policy.prefer, false);
+    try std.testing.expectEqual(encryption.Mode.obfuscated, conn.encryption_mode);
+}
+
+test "integration: prefer skips non-mse plaintext peer" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const fixture = @embedFile("fixtures/single-file.torrent");
+    const meta = try torrent.Metadata.parseBytes(allocator, fixture);
+    defer meta.deinit();
+
+    var peer_srv = try harness.spawnFakeContentPeer(io, allocator, meta, .plaintext);
+    defer peer_srv.join(io);
+
+    var conn = try peer.Connection.connect(io, allocator, .{ 127, 0, 0, 1 }, peer_srv.port, 2000, 2000);
+    defer conn.deinit(io);
+    try std.testing.expectError(error.UnsupportedEncryption, conn.performHandshake(io, meta.info_hash, [_]u8{4} ** 20, encryption.Policy.prefer, false));
 }
 
 test "integration: metadata peer handshake and piece fetch" {

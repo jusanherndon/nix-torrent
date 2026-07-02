@@ -1,20 +1,23 @@
 const std = @import("std");
 const bencode = @import("bencode.zig");
 const dns = @import("dns.zig");
+const encryption = @import("encryption.zig");
 const tcp = @import("tcp.zig");
 const torrent = @import("torrent.zig");
 
 const net = std.Io.net;
 
-pub const Peer = struct { ip: [4]u8, port: u16 };
+pub const Peer = struct { ip: [4]u8, port: u16, crypto_required: bool = false };
 pub const Announce = struct {
     interval: u64,
     peers: []Peer,
     failure_reason: ?[]const u8 = null,
+    crypto_flags: ?[]u8 = null,
 
     pub fn deinit(self: Announce, allocator: std.mem.Allocator) void {
         allocator.free(self.peers);
         if (self.failure_reason) |s| allocator.free(s);
+        if (self.crypto_flags) |flags| allocator.free(flags);
     }
 };
 
@@ -115,6 +118,7 @@ pub fn buildAnnouncePath(
     downloaded: u64,
     left: u64,
     event: Event,
+    enc_policy: encryption.Policy,
 ) ![]u8 {
     const ih = try percentEncode(allocator, &info_hash);
     defer allocator.free(ih);
@@ -127,11 +131,16 @@ pub fn buildAnnouncePath(
         .stopped => "&event=stopped",
         .completed => "&event=completed",
     };
-    return std.fmt.allocPrint(allocator, "{s}{c}info_hash={s}&peer_id={s}&port={d}&uploaded={d}&downloaded={d}&left={d}&compact=1{s}", .{ base_path, sep, ih, pid, port, uploaded, downloaded, left, event_param });
+    const crypto_param = switch (enc_policy) {
+        .disable => "",
+        .prefer => "&supportcrypto=1",
+        .require => "&supportcrypto=1&requirecrypto=1",
+    };
+    return std.fmt.allocPrint(allocator, "{s}{c}info_hash={s}&peer_id={s}&port={d}&uploaded={d}&downloaded={d}&left={d}&compact=1{s}{s}", .{ base_path, sep, ih, pid, port, uploaded, downloaded, left, event_param, crypto_param });
 }
 
 pub fn buildAnnouncePathLegacy(allocator: std.mem.Allocator, base_path: []const u8, info_hash: torrent.InfoHash, peer_id: [20]u8, port: u16, uploaded: u64, downloaded: u64, left: u64) ![]u8 {
-    return buildAnnouncePath(allocator, base_path, false, info_hash, peer_id, port, uploaded, downloaded, left, .started);
+    return buildAnnouncePath(allocator, base_path, false, info_hash, peer_id, port, uploaded, downloaded, left, .started, .disable);
 }
 
 pub fn announceGet(
@@ -182,12 +191,13 @@ pub fn announce(
     downloaded: u64,
     left: u64,
     event: Event,
+    enc_policy: encryption.Policy,
     timeout_ms: u64,
     now_ms: i64,
 ) !Announce {
     return switch (parsed.scheme) {
         .http => {
-            const path = try buildAnnouncePath(allocator, parsed.path, parsed.has_query, info_hash, peer_id, port, uploaded, downloaded, left, event);
+            const path = try buildAnnouncePath(allocator, parsed.path, parsed.has_query, info_hash, peer_id, port, uploaded, downloaded, left, event, enc_policy);
             defer allocator.free(path);
             return announceGet(io, allocator, parsed, path, timeout_ms);
         },
@@ -316,7 +326,7 @@ pub fn parseUdpAnnounceResponse(allocator: std.mem.Allocator, bytes: []const u8,
     if (action != 1 or tx != transaction_id or bytes.len < 20) return error.InvalidTrackerResponse;
     const interval = std.mem.readInt(u32, bytes[8..12], .big);
     const peers_bytes = bytes[20..];
-    const peers = try parseCompactPeers(allocator, peers_bytes);
+    const peers = try parseCompactPeers(allocator, peers_bytes, null);
     return .{ .interval = interval, .peers = peers };
 }
 
@@ -352,19 +362,56 @@ pub fn parseAnnounceResponse(allocator: std.mem.Allocator, bytes: []const u8) !A
     };
     const peers_v = root.dictGet("peers") orelse return error.InvalidTrackerResponse;
     const peers = switch (peers_v) {
-        .string => |compact| try parseCompactPeers(allocator, compact),
+        .string => |compact| try parseCompactPeers(allocator, compact, root.dictGet("crypto_flags")),
         .list => |list| try parseDictionaryPeers(allocator, list),
         else => return error.InvalidTrackerResponse,
     };
-    return .{ .interval = interval, .peers = peers };
+    const crypto_flags = if (peers_v == .string) blk: {
+        if (root.dictGet("crypto_flags")) |flags_v| {
+            if (flags_v == .string) break :blk try allocator.dupe(u8, flags_v.string);
+        }
+        break :blk null;
+    } else null;
+    return .{ .interval = interval, .peers = peers, .crypto_flags = crypto_flags };
 }
 
-pub fn parseCompactPeers(allocator: std.mem.Allocator, bytes: []const u8) ![]Peer {
+pub fn peerAllowedForEncryption(peer: Peer, policy: encryption.Policy) bool {
+    return switch (policy) {
+        .require => peer.crypto_required,
+        else => true,
+    };
+}
+
+pub fn peerConnectPriority(peer: Peer) u8 {
+    return if (peer.crypto_required) 0 else 1;
+}
+
+pub fn sortPeersForEncryption(allocator: std.mem.Allocator, peers: []const Peer, policy: encryption.Policy) ![]Peer {
+    if (policy != .prefer or peers.len <= 1) return allocator.dupe(Peer, peers);
+    const sorted = try allocator.dupe(Peer, peers);
+    const Context = struct {
+        fn less(_: void, a: Peer, b: Peer) bool {
+            return peerConnectPriority(a) < peerConnectPriority(b);
+        }
+    };
+    std.mem.sort(Peer, sorted, {}, Context.less);
+    return sorted;
+}
+
+pub fn parseCompactPeers(allocator: std.mem.Allocator, bytes: []const u8, crypto_flags_v: ?bencode.Value) ![]Peer {
     if (bytes.len % 6 != 0) return error.InvalidCompactPeers;
     const peers = try allocator.alloc(Peer, bytes.len / 6);
+    const flag_bytes = if (crypto_flags_v) |v| switch (v) {
+        .string => |s| s,
+        else => &[_]u8{},
+    } else &[_]u8{};
     for (peers, 0..) |*peer, i| {
         const off = i * 6;
-        peer.* = .{ .ip = .{ bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3] }, .port = std.mem.readInt(u16, bytes[off + 4 .. off + 6][0..2], .big) };
+        peer.* = .{
+            .ip = .{ bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3] },
+            .port = std.mem.readInt(u16, bytes[off + 4 .. off + 6][0..2], .big),
+            .crypto_required = i < flag_bytes.len and flag_bytes[i] != 0,
+        };
     }
     return peers;
 }
@@ -405,7 +452,7 @@ fn percentEncode(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
 }
 
 test "parses compact tracker peers" {
-    const peers = try parseCompactPeers(std.testing.allocator, &.{ 127, 0, 0, 1, 0x1A, 0xE1 });
+    const peers = try parseCompactPeers(std.testing.allocator, &.{ 127, 0, 0, 1, 0x1A, 0xE1 }, null);
     defer std.testing.allocator.free(peers);
     try std.testing.expectEqual(@as(usize, 1), peers.len);
     try std.testing.expectEqual(@as(u16, 6881), peers[0].port);
@@ -422,12 +469,13 @@ test "parses announce interval and compact peers" {
 test "builds announce path with and without existing query parameters" {
     const ih: torrent.InfoHash = [_]u8{1} ** 20;
     const pid: [20]u8 = [_]u8{2} ** 20;
-    const plain = try buildAnnouncePath(std.testing.allocator, "/announce", false, ih, pid, 6881, 0, 0, 100, .started);
+    const plain = try buildAnnouncePath(std.testing.allocator, "/announce", false, ih, pid, 6881, 0, 0, 100, .started, .prefer);
     defer std.testing.allocator.free(plain);
     try std.testing.expect(std.mem.startsWith(u8, plain, "/announce?info_hash="));
     try std.testing.expect(std.mem.indexOf(u8, plain, "&event=started") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "&supportcrypto=1") != null);
 
-    const with_query = try buildAnnouncePath(std.testing.allocator, "/announce?pass=key", true, ih, pid, 6881, 0, 0, 100, .none);
+    const with_query = try buildAnnouncePath(std.testing.allocator, "/announce?pass=key", true, ih, pid, 6881, 0, 0, 100, .none, .require);
     defer std.testing.allocator.free(with_query);
     try std.testing.expect(std.mem.startsWith(u8, with_query, "/announce?pass=key&info_hash="));
     try std.testing.expect(std.mem.indexOf(u8, with_query, "&event=") == null);

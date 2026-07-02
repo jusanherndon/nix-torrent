@@ -152,18 +152,19 @@ pub const Connection = struct {
 
     pub fn performHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8, policy: encryption.Policy, extensions: bool) !void {
         switch (policy) {
-            .disable => try self.plaintextHandshake(io, info_hash, peer_id, extensions),
+            .disable => {
+                try self.plaintextHandshake(io, info_hash, peer_id, extensions);
+                self.encryption_mode = .plaintext;
+            },
             .prefer => {
-                if (try self.tryEncryptedHandshake(io, info_hash, peer_id, extensions)) {
+                if (try self.tryEncryptedHandshake(io, info_hash, peer_id, policy, extensions)) {
                     self.handshake_done = true;
                     return;
                 }
-                self.crypto = null;
-                self.encryption_mode = .plaintext;
-                try self.plaintextHandshake(io, info_hash, peer_id, extensions);
+                return error.UnsupportedEncryption;
             },
             .require => {
-                if (!try self.tryEncryptedHandshake(io, info_hash, peer_id, extensions)) return error.EncryptionRequired;
+                if (!try self.tryEncryptedHandshake(io, info_hash, peer_id, policy, extensions)) return error.EncryptionRequired;
                 self.handshake_done = true;
             },
         }
@@ -189,45 +190,88 @@ pub const Connection = struct {
         }
         const decoded = try decodeHandshake(&in);
         if (!std.mem.eql(u8, &decoded.info_hash, &info_hash)) return error.InfoHashMismatch;
+        self.encryption_mode = .plaintext;
         self.handshake_done = true;
     }
 
-    fn tryEncryptedHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8, extensions: bool) !bool {
-        const keys = try encryption.generateKeyPair(self.allocator);
-        defer self.allocator.free(keys.private);
-        const init_payload = try encryption.buildInitiatorPayload(self.allocator, keys.public);
-        defer self.allocator.free(init_payload);
-        try self.sendRawPlain(io, init_payload);
-
-        var resp_buf: [700]u8 = undefined;
-        const n = try self.readStreamSlice(io, &resp_buf);
-        const resp = resp_buf[0..n];
-        if (resp.len >= 1 and resp[0] == 19) return false;
-        const remote_pub = encryption.extractRemotePublic(resp) orelse return error.MalformedEncryption;
-        if (!encryption.supportsRc4(resp)) return error.UnsupportedEncryption;
-        const select = try encryption.buildSelectPayload(self.allocator);
-        defer self.allocator.free(select);
-        try self.sendRawPlain(io, select);
-
-        const shared = try encryption.sharedSecret(self.allocator, keys.private, remote_pub);
-        defer self.allocator.free(shared);
-        self.crypto = try encryption.Session.derive(self.allocator, shared, true);
-        self.encryption_mode = .encrypted;
-
-        var hs: [68]u8 = undefined;
-        encodeHandshake(&hs, info_hash, peer_id, extensions);
-        self.crypto.?.encrypt.crypt(&hs);
-        try self.sendRawPlain(io, &hs);
-
-        var in: [68]u8 = undefined;
-        var got: usize = 0;
-        while (got < in.len) {
-            const read_n = try self.readStreamSlice(io, in[got..]);
-            if (read_n == 0) return error.ShortMessage;
-            got += read_n;
+    fn readDhResponse(self: *Connection, io: std.Io, buf: []u8) !usize {
+        var total: usize = 0;
+        while (total < 96) {
+            const n = try self.readStreamSlice(io, buf[total..]);
+            if (n == 0) return total;
+            total += n;
+            if (buf[0] == 19) return total;
         }
-        self.crypto.?.decrypt.crypt(&in);
-        const decoded = try decodeHandshake(&in);
+        while (total < encryption.max_dh_packet_len) {
+            const n = self.readStreamSlice(io, buf[total..encryption.max_dh_packet_len]) catch |err| switch (err) {
+                error.Timeout => break,
+                else => return err,
+            };
+            if (n == 0) break;
+            total += n;
+        }
+        return 96;
+    }
+
+    fn tryEncryptedHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8, policy: encryption.Policy, extensions: bool) !bool {
+        var dh = try encryption.DhKeyExchange.generate(self.allocator);
+        defer dh.deinit();
+
+        const pe1 = try encryption.buildDhOutgoing(self.allocator, &dh.local_public);
+        defer self.allocator.free(pe1);
+        try self.sendRawPlain(io, pe1);
+
+        var pe2_buf: [encryption.max_dh_packet_len]u8 = undefined;
+        const pe2_len = try self.readDhResponse(io, &pe2_buf);
+        if (pe2_len >= 1 and pe2_buf[0] == 19) return false;
+        if (pe2_len < 96) return error.MalformedEncryption;
+
+        var remote_pub: [96]u8 = undefined;
+        @memcpy(&remote_pub, pe2_buf[0..96]);
+        try dh.computeShared(self.allocator, &remote_pub);
+        const shared = dh.shared().*;
+
+        const crypto_provide = encryption.cryptoProvideForPolicy(policy);
+        var ia_session = encryption.Session.derive(&shared, info_hash, true);
+        const pe3 = try encryption.buildInitiatorSync(self.allocator, &shared, info_hash, crypto_provide, &ia_session);
+        defer self.allocator.free(pe3);
+        try self.sendRawPlain(io, pe3);
+
+        var hs_out: [encryption.handshake_len]u8 = undefined;
+        encodeHandshake(&hs_out, info_hash, peer_id, extensions);
+        var hs_scratch = hs_out;
+        ia_session.encrypt.crypt(&hs_scratch);
+        try self.sendRawPlain(io, &hs_scratch);
+
+        var pe4_buf: [encryption.max_dh_packet_len]u8 = undefined;
+        var pe4_len: usize = 0;
+        while (pe4_len < 14) {
+            const n = try self.readStreamSlice(io, pe4_buf[pe4_len..14]);
+            if (n == 0) return error.MalformedEncryption;
+            pe4_len += n;
+        }
+        const pe4_total = try encryption.responderFrameTotalLen(pe4_buf[0..pe4_len], &ia_session.decrypt);
+        while (pe4_len < pe4_total) {
+            const n = try self.readStreamSlice(io, pe4_buf[pe4_len..pe4_total]);
+            if (n == 0) return error.MalformedEncryption;
+            pe4_len += n;
+        }
+        var hs_enc: [encryption.handshake_len]u8 = undefined;
+        var hs_got: usize = 0;
+        while (hs_got < hs_enc.len) {
+            const n = try self.readStreamSlice(io, hs_enc[hs_got..]);
+            if (n == 0) return error.MalformedEncryption;
+            hs_got += n;
+        }
+        const parsed = try encryption.parseResponderSync(&ia_session.decrypt, pe4_buf[0..pe4_len], &hs_enc, crypto_provide, policy);
+        const scheme = parsed.scheme;
+        self.encryption_mode = encryption.modeForScheme(scheme);
+        if (scheme == .rc4) {
+            self.crypto = ia_session;
+        } else {
+            self.crypto = null;
+        }
+        const decoded = try decodeHandshake(&parsed.remote_handshake);
         if (!std.mem.eql(u8, &decoded.info_hash, &info_hash)) return error.InfoHashMismatch;
         return true;
     }

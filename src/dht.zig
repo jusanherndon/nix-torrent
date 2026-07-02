@@ -151,7 +151,7 @@ pub const TorrentDhtSocket = struct {
             self.last_error = null;
             if (response.nodes) |nodes| try routing.addCompactNodes(nodes);
             if (response.peers) |compact| {
-                const parsed = try tracker.parseCompactPeers(allocator, compact);
+                const parsed = try tracker.parseCompactPeers(allocator, compact, null);
                 defer allocator.free(parsed);
                 for (parsed) |p| try peers.append(allocator, p);
             }
