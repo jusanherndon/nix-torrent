@@ -147,15 +147,15 @@ pub fn main(init: std.process.Init) !void {
         if (try acceptWithTimeout(&server, init.io, 100)) |stream| {
             handleConnection(&daemon, stream, daemon.started_ms) catch |conn_err| {
                 log.err("daemon", "connection failed: {s}", .{@errorName(conn_err)});
-                try stderr.flush();
             };
+            try stderr.flush();
         }
 
         const now_ms = nowMs(init.io);
         daemon.engine.tick(daemon.io, daemon.cfg, &daemon.registry, daemon.peer_id, now_ms, daemon.dhtContext()) catch |tick_err| {
             log.err("engine", "tick failed: {s}", .{@errorName(tick_err)});
-            try stderr.flush();
         };
+        try stderr.flush();
     }
 
     log.info("daemon", "controlled shutdown complete", .{});

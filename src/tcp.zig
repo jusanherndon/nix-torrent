@@ -12,9 +12,66 @@ pub const ConnectError = error{
 /// Opens a TCP stream to an IPv4 endpoint and applies read/write timeouts.
 pub fn connectStream(io: std.Io, ip: [4]u8, port: u16, timeout_ms: u64) ConnectError!net.Stream {
     const addr = net.IpAddress{ .ip4 = .{ .bytes = ip, .port = port } };
-    const stream = net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch return error.ConnectionFailed;
-    if (timeout_ms > 0) setIoTimeouts(stream.socket.handle, timeout_ms);
-    return stream;
+    if (timeout_ms == 0) {
+        const stream = net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch |err| switch (err) {
+            error.ConnectionRefused => return error.ConnectionRefused,
+            else => return error.ConnectionFailed,
+        };
+        return stream;
+    }
+    return try connectStreamWithTimeout(addr, timeout_ms);
+}
+
+fn connectStreamWithTimeout(addr: net.IpAddress, timeout_ms: u64) ConnectError!net.Stream {
+    const ip4 = addr.ip4;
+    const sock = c.socket(c.AF.INET, c.SOCK.STREAM, 0);
+    if (sock == -1) return error.ConnectionFailed;
+    errdefer _ = c.close(sock);
+
+    const flags = c.fcntl(sock, c.F.GETFL, @as(c_int, 0));
+    if (flags == -1) return error.ConnectionFailed;
+    const o_nonblock: c_int = 0x800;
+    if (c.fcntl(sock, c.F.SETFL, flags | o_nonblock) == -1) return error.ConnectionFailed;
+
+    var sockaddr: c.sockaddr.in = .{
+        .family = c.AF.INET,
+        .port = std.mem.nativeToBig(u16, ip4.port),
+        .addr = @bitCast(ip4.bytes),
+        .zero = .{0} ** 8,
+    };
+
+    const rc = c.connect(sock, @ptrCast(&sockaddr), @sizeOf(c.sockaddr.in));
+    switch (c.errno(rc)) {
+        .SUCCESS => {
+            _ = c.fcntl(sock, c.F.SETFL, flags);
+            setIoTimeouts(sock, timeout_ms);
+            return .{ .socket = .{ .handle = sock, .address = addr } };
+        },
+        .INPROGRESS, .ALREADY => {},
+        .CONNREFUSED => return error.ConnectionRefused,
+        .TIMEDOUT => return error.Timeout,
+        .NETUNREACH, .HOSTUNREACH => return error.ConnectionFailed,
+        else => return error.ConnectionFailed,
+    }
+
+    var pollfd = c.pollfd{ .fd = sock, .events = c.POLL.OUT, .revents = 0 };
+    const poll_ms: c_int = @intCast(@min(timeout_ms, @as(u64, @intCast(std.math.maxInt(c_int)))));
+    const ready = c.poll(@ptrCast(&pollfd), 1, poll_ms);
+    if (ready == 0) return error.Timeout;
+    if (ready < 0) return error.ConnectionFailed;
+
+    var sock_err: c_int = 0;
+    var sock_err_len: c.socklen_t = @sizeOf(c_int);
+    if (c.getsockopt(sock, c.SOL.SOCKET, c.SO.ERROR, @ptrCast(&sock_err), &sock_err_len) == -1) return error.ConnectionFailed;
+    if (sock_err != 0) {
+        if (sock_err == @intFromEnum(std.posix.E.CONNREFUSED)) return error.ConnectionRefused;
+        if (sock_err == @intFromEnum(std.posix.E.TIMEDOUT)) return error.Timeout;
+        return error.ConnectionFailed;
+    }
+
+    _ = c.fcntl(sock, c.F.SETFL, flags);
+    setIoTimeouts(sock, timeout_ms);
+    return .{ .socket = .{ .handle = sock, .address = addr } };
 }
 
 pub fn setIoTimeouts(sock: c.fd_t, timeout_ms: u64) void {
@@ -92,6 +149,20 @@ fn extractHttpBody(allocator: std.mem.Allocator, raw: []const u8) ReadError![]u8
 
 fn nowMs(io: std.Io) i64 {
     return std.Io.Timestamp.now(io, .real).toMilliseconds();
+}
+
+test "connectStream reaches localhost listener" {
+    const io = std.testing.io;
+    const addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var server = try addr.listen(io, .{ .mode = .stream, .kernel_backlog = 1 });
+    defer server.deinit(io);
+    const port = server.socket.address.ip4.port;
+
+    const stream = try connectStream(io, .{ 127, 0, 0, 1 }, port, 2000);
+    defer stream.close(io);
+    const client = c.accept(server.socket.handle, null, null);
+    try std.testing.expect(client >= 0);
+    _ = c.close(@intCast(client));
 }
 
 test "extracts http body" {
