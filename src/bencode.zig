@@ -56,6 +56,12 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Value {
     return value;
 }
 
+pub fn parsePrefix(allocator: std.mem.Allocator, input: []const u8) !struct { value: Value, consumed: usize } {
+    var parser = Parser{ .allocator = allocator, .input = input };
+    const value = try parser.value();
+    return .{ .value = value, .consumed = parser.pos };
+}
+
 const Parser = struct {
     allocator: std.mem.Allocator,
     input: []const u8,
@@ -150,4 +156,12 @@ test "parses nested dictionaries" {
 
 test "rejects trailing data" {
     try std.testing.expectError(ParseError.TrailingData, parse(std.testing.allocator, "i1ee"));
+}
+
+test "parsePrefix allows trailing data" {
+    const parsed = try parsePrefix(std.testing.allocator, "d8:msg_typei1e5:piecei0eehello");
+    defer parsed.value.deinit(std.testing.allocator);
+    try std.testing.expect(parsed.value == .dict);
+    try std.testing.expectEqual(@as(usize, 25), parsed.consumed);
+    try std.testing.expectEqualStrings("hello", "d8:msg_typei1e5:piecei0eehello"[parsed.consumed..]);
 }

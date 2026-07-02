@@ -66,6 +66,10 @@ pub fn parse(allocator: std.mem.Allocator, uri: []const u8) ParseError!Magnet {
     };
 }
 
+pub fn hasDiscoverySource(m: Magnet, dht_enabled: bool) bool {
+    return m.tracker_urls.len > 0 or dht_enabled;
+}
+
 pub fn deinit(m: Magnet, allocator: std.mem.Allocator) void {
     if (m.display_name) |n| allocator.free(n);
     for (m.tracker_urls) |u| allocator.free(u);

@@ -72,12 +72,19 @@ pub const Connection = struct {
     peer_port: u16,
     state: PeerState,
     recv_buffer: std.ArrayList(u8),
+    message_slices: std.ArrayList([]const u8) = .empty,
     handshake_done: bool = false,
     closed: bool = false,
     encryption_mode: encryption.Mode = .plaintext,
     crypto: ?encryption.Session = null,
     ut_metadata_id: ?u8 = null,
     metadata_size: ?usize = null,
+    read_scratch: [4096]u8 = undefined,
+
+    fn readStreamSlice(self: *Connection, io: std.Io, dest: []u8) !usize {
+        var reader = self.stream.reader(io, &self.read_scratch);
+        return reader.interface.readSliceShort(dest);
+    }
 
     pub fn connect(io: std.Io, allocator: std.mem.Allocator, ip: [4]u8, port: u16, timeout_ms: u64) !Connection {
         const addr = net.IpAddress{ .ip4 = .{ .bytes = ip, .port = port } };
@@ -96,7 +103,43 @@ pub const Connection = struct {
     pub fn deinit(self: *Connection, io: std.Io) void {
         if (!self.closed) self.stream.close(io);
         self.state.deinit(self.allocator);
+        self.clearMessageSlices();
+        self.message_slices.deinit(self.allocator);
         self.recv_buffer.deinit(self.allocator);
+    }
+
+    pub fn release(self: *Connection) void {
+        self.clearMessageSlices();
+        self.message_slices.deinit(self.allocator);
+        self.state.deinit(self.allocator);
+        self.recv_buffer.deinit(self.allocator);
+    }
+
+    fn clearMessageSlices(self: *Connection) void {
+        for (self.message_slices.items) |slice| self.allocator.free(slice);
+        self.message_slices.clearRetainingCapacity();
+    }
+
+    fn owningMessage(self: *Connection, msg: Message) !Message {
+        self.clearMessageSlices();
+        return switch (msg) {
+            .bitfield => |bits| b: {
+                const owned = try self.allocator.dupe(u8, bits);
+                try self.message_slices.append(self.allocator, owned);
+                break :b .{ .bitfield = owned };
+            },
+            .extended => |payload| e: {
+                const owned = try self.allocator.dupe(u8, payload);
+                try self.message_slices.append(self.allocator, owned);
+                break :e .{ .extended = owned };
+            },
+            .piece => |p| p2: {
+                const owned = try self.allocator.dupe(u8, p.block);
+                try self.message_slices.append(self.allocator, owned);
+                break :p2 .{ .piece = .{ .index = p.index, .begin = p.begin, .block = owned } };
+            },
+            else => msg,
+        };
     }
 
     pub fn close(self: *Connection, io: std.Io) void {
@@ -129,8 +172,20 @@ pub const Connection = struct {
         var out: [68]u8 = undefined;
         encodeHandshake(&out, info_hash, peer_id, extensions);
         try self.sendRawPlain(io, &out);
+        while (self.recv_buffer.items.len < 68) {
+            var buf: [4096]u8 = undefined;
+            const n = try self.readStreamSlice(io, &buf);
+            if (n == 0) return error.ShortMessage;
+            try self.recv_buffer.appendSlice(self.allocator, buf[0..n]);
+        }
         var in: [68]u8 = undefined;
-        try readExact(io, self.stream, &in);
+        @memcpy(&in, self.recv_buffer.items[0..68]);
+        try self.recv_buffer.replaceRange(self.allocator, 0, 68, &.{});
+        if (self.recv_buffer.items.len == 0) {
+            var extra: [4096]u8 = undefined;
+            const n = try self.readStreamSlice(io, &extra);
+            if (n > 0) try self.recv_buffer.appendSlice(self.allocator, extra[0..n]);
+        }
         const decoded = try decodeHandshake(&in);
         if (!std.mem.eql(u8, &decoded.info_hash, &info_hash)) return error.InfoHashMismatch;
         self.handshake_done = true;
@@ -144,7 +199,7 @@ pub const Connection = struct {
         try self.sendRawPlain(io, init_payload);
 
         var resp_buf: [700]u8 = undefined;
-        const n = try readSome(io, self.stream, &resp_buf);
+        const n = try self.readStreamSlice(io, &resp_buf);
         const resp = resp_buf[0..n];
         if (resp.len >= 1 and resp[0] == 19) return false;
         const remote_pub = encryption.extractRemotePublic(resp) orelse return error.MalformedEncryption;
@@ -164,7 +219,12 @@ pub const Connection = struct {
         try self.sendRawPlain(io, &hs);
 
         var in: [68]u8 = undefined;
-        try readExact(io, self.stream, &in);
+        var got: usize = 0;
+        while (got < in.len) {
+            const read_n = try self.readStreamSlice(io, in[got..]);
+            if (read_n == 0) return error.ShortMessage;
+            got += read_n;
+        }
         self.crypto.?.decrypt.crypt(&in);
         const decoded = try decodeHandshake(&in);
         if (!std.mem.eql(u8, &decoded.info_hash, &info_hash)) return error.InfoHashMismatch;
@@ -173,21 +233,41 @@ pub const Connection = struct {
 
     pub fn performMetadataHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8, policy: encryption.Policy) !void {
         try self.performHandshake(io, info_hash, peer_id, policy, true);
+        while (true) {
+            if (self.recv_buffer.items.len < 4) {
+                var buf: [4096]u8 = undefined;
+                const n = try self.readStreamSlice(io, &buf);
+                if (n == 0) return error.MetadataHandshakeFailed;
+                try self.recv_buffer.appendSlice(self.allocator, buf[0..n]);
+                continue;
+            }
+            const len = std.mem.readInt(u32, self.recv_buffer.items[0..4], .big);
+            const frame_len = 4 + @as(usize, @intCast(len));
+            if (self.recv_buffer.items.len < frame_len) {
+                var buf: [4096]u8 = undefined;
+                const n = try self.readStreamSlice(io, &buf);
+                if (n == 0) return error.MetadataHandshakeFailed;
+                try self.recv_buffer.appendSlice(self.allocator, buf[0..n]);
+                continue;
+            }
+            const frame = self.recv_buffer.items[0..frame_len];
+            const msg = decodeMessage(frame) catch return error.MetadataHandshakeFailed;
+            if (msg != .extended or msg.extended.len == 0 or msg.extended[0] != 0) break;
+            const parsed = try parsePeerExtendedHandshake(self.allocator, msg.extended);
+            try self.recv_buffer.replaceRange(self.allocator, 0, frame_len, &.{});
+            const handshake = parsed orelse return error.MetadataHandshakeFailed;
+            self.ut_metadata_id = handshake.ut_metadata_id;
+            self.metadata_size = handshake.metadata_size;
+            break;
+        }
         const ext = try encodeExtendedHandshake(self.allocator, 1);
         defer self.allocator.free(ext);
         try self.sendRaw(io, ext);
-        const msg = self.readMessage(io, 1_048_576) catch return error.MetadataHandshakeFailed;
-        const payload = msg orelse return error.MetadataHandshakeFailed;
-        if (payload != .extended) return error.MetadataHandshakeFailed;
-        const parsed = try parsePeerExtendedHandshake(self.allocator, payload.extended);
-        const handshake = parsed orelse return error.MetadataHandshakeFailed;
-        self.ut_metadata_id = handshake.ut_metadata_id;
-        self.metadata_size = handshake.metadata_size;
     }
 
     pub fn requestMetadataPiece(self: *Connection, io: std.Io, piece: u32) !void {
         const id = self.ut_metadata_id orelse return error.MetadataUnsupported;
-        const body = try std.fmt.allocPrint(self.allocator, "d11:msg_typei0e5:piecei{d}e", .{piece});
+        const body = try std.fmt.allocPrint(self.allocator, "d8:msg_typei0e5:piecei{d}ee", .{piece});
         defer self.allocator.free(body);
         const msg = try encodeExtendedMessage(self.allocator, id, body);
         defer self.allocator.free(msg);
@@ -195,10 +275,12 @@ pub const Connection = struct {
     }
 
     pub fn readMetadataPiece(self: *Connection, io: std.Io) !?UtMetadataData {
-        const msg = try self.readMessage(io, 1_048_576);
-        const payload = msg orelse return null;
-        if (payload != .extended) return null;
-        return parseUtMetadataData(self.allocator, payload.extended) catch null;
+        while (true) {
+            const msg = try self.readMessage(io, 1_048_576);
+            const payload = msg orelse return null;
+            if (payload != .extended or payload.extended.len == 0 or payload.extended[0] == 0) continue;
+            return parseUtMetadataData(self.allocator, payload.extended) catch null;
+        }
     }
 
     pub fn sendInterested(self: *Connection, io: std.Io) !void {
@@ -232,6 +314,10 @@ pub const Connection = struct {
         try writer.interface.flush();
     }
 
+    pub fn pollMessage(self: *Connection, max_message_bytes: u64) !?Message {
+        return try self.tryDecodeMessage(max_message_bytes);
+    }
+
     pub fn readMessage(self: *Connection, io: std.Io, max_message_bytes: u64) !?Message {
         while (true) {
             if (try self.tryDecodeMessage(max_message_bytes)) |msg| return msg;
@@ -240,10 +326,13 @@ pub const Connection = struct {
         }
     }
 
+    pub fn readAvailable(self: *Connection, io: std.Io) !usize {
+        return self.readMore(io);
+    }
+
     fn readMore(self: *Connection, io: std.Io) !usize {
         var buf: [4096]u8 = undefined;
-        var reader = self.stream.reader(io, &buf);
-        const n = try reader.interface.readSliceShort(&buf);
+        const n = try self.readStreamSlice(io, &buf);
         if (n == 0) return 0;
         if (self.crypto) |*session| session.decrypt.crypt(buf[0..n]);
         try self.recv_buffer.appendSlice(self.allocator, buf[0..n]);
@@ -260,8 +349,9 @@ pub const Connection = struct {
         const frame = data[0..frame_len];
         const msg = decodeMessage(frame) catch return error.MalformedMessage;
         if (msg == .request) return error.PeerSentRequest;
+        const owned = try self.owningMessage(msg);
         try self.recv_buffer.replaceRange(self.allocator, 0, frame_len, &.{});
-        return msg;
+        return owned;
     }
 };
 
@@ -308,7 +398,7 @@ pub fn encodeMessage(allocator: std.mem.Allocator, msg: Message) ![]u8 {
             try out.appendSlice(allocator, p.block);
         },
         .extended => |payload| {
-            try writeLen(&out, allocator, @intCast(2 + payload.len));
+            try writeLen(&out, allocator, @intCast(1 + payload.len));
             try out.append(allocator, 20);
             try out.appendSlice(allocator, payload);
         },
@@ -340,10 +430,10 @@ pub fn decodeMessage(bytes: []const u8) !Message {
 
 fn encodeExtendedHandshake(allocator: std.mem.Allocator, ut_metadata_id: u8) ![]u8 {
     var body: std.ArrayList(u8) = .empty;
-    errdefer body.deinit(allocator);
-    try body.appendSlice(allocator, "d2:md11:ut_metadatai");
+    defer body.deinit(allocator);
+    try body.appendSlice(allocator, "d1:md11:ut_metadatai");
     try body.append(allocator, '0' + ut_metadata_id);
-    try body.append(allocator, 'e');
+    try body.appendSlice(allocator, "ee");
     return encodeExtendedMessage(allocator, 0, body.items);
 }
 
@@ -378,14 +468,15 @@ pub fn parsePeerExtendedHandshake(allocator: std.mem.Allocator, payload: []const
 
 fn parseUtMetadataData(allocator: std.mem.Allocator, payload: []const u8) !?UtMetadataData {
     if (payload.len < 2) return null;
-    const root = bencode.parse(allocator, payload[1..]) catch return null;
-    defer root.deinit(allocator);
-    if (root != .dict) return null;
+    const parsed = bencode.parsePrefix(allocator, payload[1..]) catch return null;
+    defer parsed.value.deinit(allocator);
+    if (parsed.value != .dict) return null;
+    const root = parsed.value;
     const msg_type = root.dictGet("msg_type") orelse return null;
     if (msg_type != .int or msg_type.int != 1) return null;
     const piece_val = root.dictGet("piece") orelse return null;
     if (piece_val != .int or piece_val.int < 0) return null;
-    const data_start = 1 + root.dict.raw.len;
+    const data_start = 1 + parsed.consumed;
     if (data_start > payload.len) return null;
     return .{
         .piece = @intCast(piece_val.int),
@@ -483,4 +574,50 @@ test "closes peer connection when peer sends request" {
     defer std.testing.allocator.free(encoded);
     try conn.recv_buffer.appendSlice(std.testing.allocator, encoded);
     try std.testing.expectError(error.PeerSentRequest, conn.tryDecodeMessage(15_728_640));
+}
+
+test "readMessage decodes buffered metadata extension handshake" {
+    const fixture = @embedFile("fixtures/single-file.torrent");
+    const meta = try torrent.Metadata.parseBytes(std.testing.allocator, fixture);
+    defer meta.deinit();
+    const info = meta.root.dictGet("info").?;
+    const dict = try std.fmt.allocPrint(std.testing.allocator, "d1:md11:ut_metadatai1ee13:metadata_sizei{d}ee", .{info.dict.raw.len});
+    defer std.testing.allocator.free(dict);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(std.testing.allocator);
+    try payload.append(std.testing.allocator, 0);
+    try payload.appendSlice(std.testing.allocator, dict);
+    const ext = try encodeMessage(std.testing.allocator, .{ .extended = payload.items });
+    defer std.testing.allocator.free(ext);
+
+    var conn = Connection{
+        .allocator = std.testing.allocator,
+        .stream = undefined,
+        .peer_ip = .{ 127, 0, 0, 1 },
+        .peer_port = 6881,
+        .state = .{},
+        .recv_buffer = .empty,
+    };
+    defer conn.release();
+    try conn.recv_buffer.appendSlice(std.testing.allocator, ext);
+    const msg = (try conn.readMessage(std.testing.io, 1_048_576)) orelse return error.TestExpectedEqual;
+    try std.testing.expect(msg == .extended);
+    const parsed = try parsePeerExtendedHandshake(std.testing.allocator, msg.extended);
+    const hs = parsed orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(usize, info.dict.raw.len), hs.metadata_size);
+}
+
+test "parses ut_metadata data with trailing info bytes" {
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(std.testing.allocator);
+    try payload.append(std.testing.allocator, 1);
+    try payload.appendSlice(std.testing.allocator, "d8:msg_typei1e5:piecei0ee");
+    try payload.appendSlice(std.testing.allocator, "d4:infod4:name4:teste12:piece lengthi16384e6:pieces20:");
+    try payload.appendSlice(std.testing.allocator, &[_]u8{1} ** 20);
+    try payload.append(std.testing.allocator, 'e');
+    const parsed = try parseUtMetadataData(std.testing.allocator, payload.items);
+    const piece = parsed orelse return error.TestExpectedEqual;
+    defer std.testing.allocator.free(piece.bytes);
+    try std.testing.expectEqual(@as(u32, 0), piece.piece);
+    try std.testing.expect(piece.bytes.len > 0);
 }

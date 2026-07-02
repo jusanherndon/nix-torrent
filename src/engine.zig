@@ -477,7 +477,7 @@ fn connectMetadataPeer(
         if (session.metadata_size == null) session.metadata_size = size;
     }
     try session.metadata_peers.append(engine.allocator, conn);
-    try conn.requestMetadataPiece(io, session.metadata_next_request);
+    if (conn.recv_buffer.items.len == 0) try conn.requestMetadataPiece(io, session.metadata_next_request);
 }
 
 fn maintainMetadataPeers(engine: *Engine, io: std.Io, cfg: config.Config, session: *TorrentSession) !void {
@@ -501,6 +501,10 @@ fn maintainMetadataPeers(engine: *Engine, io: std.Io, cfg: config.Config, sessio
                     conn.requestMetadataPiece(io, session.metadata_next_request) catch {};
                 }
             }
+        } else {
+            conn.deinit(io);
+            _ = session.metadata_peers.orderedRemove(i);
+            continue;
         }
         i += 1;
     }
@@ -613,6 +617,10 @@ fn tryCompleteMetadata(
     session.info_hash = meta.info_hash;
     session.metadata_size = null;
     session.metadata_next_request = 0;
+    for (session.trackers.items, 0..) |*endpoint, tracker_i| {
+        endpoint.state.next_announce_ms = 0;
+        syncTrackerRecord(engine.allocator, rec, tracker_i, endpoint);
+    }
 }
 
 fn setMetadataError(engine: *Engine, io: std.Io, rec: *state.TorrentRecord, session: *TorrentSession, message: []const u8) void {
@@ -707,24 +715,37 @@ fn maintainPeers(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, s
     var i: usize = 0;
     while (i < session.peers.items.len) {
         var conn = &session.peers.items[i];
-        const msg = conn.readMessage(io, cfg.limits.max_peer_message_bytes) catch {
-            conn.deinit(io);
-            _ = session.peers.orderedRemove(i);
-            if (session.active_piece) |*piece| if (piece.peer_index == i) discardPiece(session, piece, allocator);
-            continue;
-        };
-        if (msg == null) {
-            i += 1;
-            continue;
+        if (conn.recv_buffer.items.len < 4096) {
+            const n = conn.readAvailable(io) catch {
+                conn.deinit(io);
+                _ = session.peers.orderedRemove(i);
+                if (session.active_piece) |*piece| if (piece.peer_index == i) discardPiece(session, piece, allocator);
+                continue;
+            };
+            if (n == 0 and conn.recv_buffer.items.len == 0) {
+                conn.deinit(io);
+                _ = session.peers.orderedRemove(i);
+                if (session.active_piece) |*piece| if (piece.peer_index == i) discardPiece(session, piece, allocator);
+                continue;
+            }
         }
-        switch (msg.?) {
-            .bitfield => |bits| conn.state.setBitfield(allocator, session.layout.?.piece_states.len, bits) catch {},
-            .have => |index| conn.state.setHave(allocator, session.layout.?.piece_states.len, index) catch {},
-            .unchoke => {},
-            .piece => |block| try handlePieceBlock(cfg, session, i, block, now_ms),
-            else => {},
+        while (true) {
+            const msg = conn.pollMessage(cfg.limits.max_peer_message_bytes) catch {
+                conn.deinit(io);
+                _ = session.peers.orderedRemove(i);
+                if (session.active_piece) |*piece| if (piece.peer_index == i) discardPiece(session, piece, allocator);
+                break;
+            };
+            if (msg == null) break;
+            switch (msg.?) {
+                .bitfield => |bits| conn.state.setBitfield(allocator, session.layout.?.piece_states.len, bits) catch {},
+                .have => |index| conn.state.setHave(allocator, session.layout.?.piece_states.len, index) catch {},
+                .unchoke => {},
+                .piece => |block| try handlePieceBlock(cfg, session, i, block, now_ms),
+                else => {},
+            }
+            conn.state.apply(msg.?);
         }
-        conn.state.apply(msg.?);
         i += 1;
     }
 }
