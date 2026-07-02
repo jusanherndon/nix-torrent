@@ -79,7 +79,7 @@ tracker_retry_max_ms = 300000
 
 [logging]
 # Supported v2 levels: "error", "warn", "info", "debug".
-level = "info"
+level = "debug"
 
 # v2 supports JSON structured logs.
 format = "json"

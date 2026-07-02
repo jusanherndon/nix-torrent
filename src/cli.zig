@@ -57,6 +57,8 @@ pub fn main(init: std.process.Init) !void {
     };
     defer cfg.deinit(allocator);
 
+    log.set(stderr, cfg.logging.level);
+
     try log.configEvent(stderr, "cli", cfg.staging_area, cfg.final_destination, cfg.socket_path);
 
     switch (command) {
@@ -76,6 +78,9 @@ pub fn main(init: std.process.Init) !void {
         .status => .status,
         .help => unreachable,
     }, .argument = if (command_args.len == 2) command_args[1] else null };
+
+    log.debug("cli", "sending {s} request", .{@tagName(request.command)});
+    if (request.argument) |arg| log.debug("cli", "request argument: {s}", .{arg});
 
     try verifyDaemonProtocol(init.io, allocator, cfg.socket_path);
 

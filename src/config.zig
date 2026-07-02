@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("log.zig");
 
 pub const Limits = struct {
     max_peer_message_bytes: u64 = 1_048_576,
@@ -43,7 +44,7 @@ pub const Network = struct {
     dht: Dht = .{},
     encryption: Encryption = .{},
 };
-pub const Logging = struct { level: []const u8 = "info", format: []const u8 = "json" };
+pub const Logging = struct { level: []const u8 = log.default_level, format: []const u8 = "json" };
 
 pub const Config = struct {
     staging_area: []const u8,
@@ -58,7 +59,7 @@ pub const Config = struct {
         allocator.free(self.staging_area);
         allocator.free(self.final_destination);
         allocator.free(self.socket_path);
-        if (!std.mem.eql(u8, self.logging.level, "info")) allocator.free(self.logging.level);
+        if (!std.mem.eql(u8, self.logging.level, log.default_level)) allocator.free(self.logging.level);
         if (!std.mem.eql(u8, self.logging.format, "json")) allocator.free(self.logging.format);
         if (!std.mem.eql(u8, self.network.encryption.policy, "prefer")) allocator.free(self.network.encryption.policy);
         for (self.network.dht.bootstrap_nodes) |node| {
@@ -184,6 +185,7 @@ pub fn validateDaemon(cfg: Config) !void {
     if (cfg.network.dht_base_port + cfg.limits.max_active_torrents > 65535) return ConfigError.InvalidConfig;
     if (cfg.network.tracker_retry_min_ms > cfg.network.tracker_retry_max_ms) return ConfigError.InvalidConfig;
     if (!std.mem.eql(u8, cfg.logging.format, "json")) return ConfigError.InvalidConfig;
+    if (log.parseLevel(cfg.logging.level) == null) return ConfigError.InvalidConfig;
 }
 
 pub fn usage(program_name: []const u8, writer: anytype) !void {
@@ -325,8 +327,9 @@ fn parseStringArray(allocator: std.mem.Allocator, value: []const u8) ![]const []
 fn parseLogging(allocator: std.mem.Allocator, logging: *Logging, key: []const u8, value: []const u8) !void {
     const s = try parseString(value);
     if (std.mem.eql(u8, key, "level")) {
-        if (!std.mem.eql(u8, logging.level, "info")) allocator.free(logging.level);
-        logging.level = if (std.mem.eql(u8, s, "info")) "info" else try allocator.dupe(u8, s);
+        if (!std.mem.eql(u8, logging.level, log.default_level)) allocator.free(logging.level);
+        if (log.parseLevel(s) == null) return ConfigError.InvalidConfig;
+        logging.level = if (std.mem.eql(u8, s, log.default_level)) log.default_level else try allocator.dupe(u8, s);
     } else if (std.mem.eql(u8, key, "format")) {
         if (!std.mem.eql(u8, logging.format, "json")) allocator.free(logging.format);
         logging.format = if (std.mem.eql(u8, s, "json")) "json" else try allocator.dupe(u8, s);

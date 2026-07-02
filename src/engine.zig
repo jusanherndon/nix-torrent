@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const handoff = @import("handoff.zig");
+const log = @import("log.zig");
 const magnet = @import("magnet.zig");
 const state = @import("state.zig");
 const storage = @import("storage.zig");
@@ -81,6 +82,7 @@ pub const Engine = struct {
             .active_piece = null,
         };
         try self.sessions.append(self.allocator, session);
+        log.debug("engine", "started content session for {s} ({d} trackers)", .{ rec.info_hash_hex, trackers.items.len });
     }
 
     fn addMetadataSession(self: *Engine, io: std.Io, cfg: config.Config, rec: *state.TorrentRecord, dht_ctx: ?DhtContext) !void {
@@ -113,11 +115,13 @@ pub const Engine = struct {
             .active_piece = null,
         };
         try self.sessions.append(self.allocator, session);
+        log.debug("engine", "started metadata session for {s} ({d} trackers)", .{ rec.info_hash_hex, trackers.items.len });
     }
 
     pub fn removeSession(self: *Engine, io: std.Io, info_hash_hex: []const u8) void {
         for (self.sessions.items, 0..) |*session, i| {
             if (std.mem.eql(u8, session.info_hash_hex, info_hash_hex)) {
+                log.debug("engine", "removed session for {s}", .{info_hash_hex});
                 session.deinit(io, self.allocator);
                 _ = self.sessions.orderedRemove(i);
                 return;
@@ -362,14 +366,16 @@ fn announceTrackerEndpoint(
         event,
         cfg.network.tracker_request_timeout_ms,
         now_ms,
-    ) catch |err| {
-        const msg = try std.fmt.allocPrint(engine.allocator, "tracker announce failed: {s}", .{@errorName(err)});
+    ) catch |announce_err| {
+        const msg = try std.fmt.allocPrint(engine.allocator, "tracker announce failed: {s}", .{@errorName(announce_err)});
         defer engine.allocator.free(msg);
+        log.debug("engine", "tracker announce failed for {s}: {s}", .{ endpoint.raw_url, @errorName(announce_err) });
         try endpoint.state.scheduleFailure(now_ms, msg, engine.allocator);
         return;
     };
     defer response.deinit(engine.allocator);
     if (response.failure_reason) |reason| {
+        log.debug("engine", "tracker rejected announce for {s}: {s}", .{ endpoint.raw_url, reason });
         try endpoint.state.scheduleFailure(now_ms, reason, engine.allocator);
         return;
     }
@@ -377,6 +383,7 @@ fn announceTrackerEndpoint(
     endpoint.state.last_error = null;
     endpoint.state.started_sent = true;
     endpoint.state.scheduleSuccess(now_ms, response.interval);
+    log.debug("engine", "tracker announce ok for {s}: {d} peers, interval {d}s", .{ endpoint.raw_url, response.peers.len, response.interval });
     if (session.fetching_metadata) {
         peer_pool.connectMetadataBatch(engine.allocator, io, cfg, session, response.peers, peer_id);
     } else {
@@ -404,6 +411,7 @@ fn completeTorrent(
 ) !void {
     peer_pool.close(session, io, engine.allocator);
     engine.sendTrackerEvent(io, cfg, session, rec, peer_id, .completed, now_ms);
+    log.info("engine", "torrent {s} download complete, moving to final destination", .{rec.info_hash_hex});
 
     const final_path = handoff.moveCompletedContent(io, engine.allocator, session.content_dir.?, session.meta.?, cfg.final_destination) catch {
         rec.status = .failed;

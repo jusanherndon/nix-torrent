@@ -101,6 +101,8 @@ pub fn main(init: std.process.Init) !void {
     };
     defer cfg.deinit(allocator);
 
+    log.set(stderr, cfg.logging.level);
+
     if (validate_config) {
         try stderr.writeAll("configuration OK\n");
         try stderr.flush();
@@ -136,27 +138,27 @@ pub fn main(init: std.process.Init) !void {
     installSignalHandlers();
 
     try log.configEvent(stderr, "daemon", cfg.staging_area, cfg.final_destination, cfg.socket_path);
-    try log.event(stderr, .info, "daemon", "control socket listening");
+    log.info("daemon", "control socket listening", .{});
     try stderr.flush();
 
     daemon.started_ms = nowMs(init.io);
 
     while (!shutting_down) {
         const now_ms = nowMs(init.io);
-        daemon.engine.tick(daemon.io, daemon.cfg, &daemon.registry, daemon.peer_id, now_ms, daemon.dhtContext()) catch |err| {
-            try stderr.print("{{\"level\":\"error\",\"component\":\"engine\",\"message\":\"tick failed: {s}\"}}\n", .{@errorName(err)});
+        daemon.engine.tick(daemon.io, daemon.cfg, &daemon.registry, daemon.peer_id, now_ms, daemon.dhtContext()) catch |tick_err| {
+            log.err("engine", "tick failed: {s}", .{@errorName(tick_err)});
             try stderr.flush();
         };
 
         if (try acceptWithTimeout(&server, init.io, 100)) |stream| {
-            handleConnection(&daemon, stream, daemon.started_ms) catch |err| {
-                try stderr.print("{{\"level\":\"error\",\"component\":\"daemon\",\"message\":\"connection failed: {s}\"}}\n", .{@errorName(err)});
+            handleConnection(&daemon, stream, daemon.started_ms) catch |conn_err| {
+                log.err("daemon", "connection failed: {s}", .{@errorName(conn_err)});
                 try stderr.flush();
             };
         }
     }
 
-    try log.event(stderr, .info, "daemon", "controlled shutdown complete");
+    log.info("daemon", "controlled shutdown complete", .{});
     try stderr.flush();
 }
 
@@ -192,11 +194,13 @@ fn handleConnection(daemon: *Daemon, stream: net.Stream, started: i64) !void {
     };
 
     const response = response: {
-        const req = protocol.parseRequest(allocator, line) catch |err| switch (err) {
+        const req = protocol.parseRequest(allocator, line) catch |parse_err| switch (parse_err) {
             error.UnknownCommand => break :response protocol.Response{ .failure = .{ .code = .unknown_command, .message = "unknown command" } },
             else => break :response protocol.Response{ .failure = .{ .code = .invalid_request, .message = "invalid JSON-line request" } },
         };
         defer protocol.deinitRequest(req, allocator);
+        log.debug("daemon", "control request: {s}", .{@tagName(req.command)});
+        if (req.argument) |arg| log.debug("daemon", "control argument: {s}", .{arg});
         break :response try handleRequest(daemon, req, started);
     };
 
@@ -255,6 +259,7 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
             rec.status = .paused;
             rec.connected_peer_count = 0;
             rec.downloading = false;
+            log.info("daemon", "paused torrent {s}", .{info_hash});
             if (rec.dht_last_error) |old| {
                 daemon.allocator.free(old);
                 rec.dht_last_error = null;
@@ -276,6 +281,7 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
                 }
             }
             rec.status = .active;
+            log.info("daemon", "resumed torrent {s}", .{info_hash});
             try state.writeTorrentState(daemon.io, allocator, daemon.cfg.staging_area, rec.*);
             try daemon.engine.addSession(daemon.io, daemon.cfg, &daemon.registry, rec, daemon.dhtContext());
             if (daemon.engine.findSession(info_hash)) |session| {
@@ -299,6 +305,7 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
             }
             daemon.engine.removeSession(daemon.io, info_hash);
             deleteTorrentStateFile(daemon, info_hash) catch {};
+            log.info("daemon", "removed torrent {s}", .{info_hash});
             var root: std.json.ObjectMap = .empty;
             errdefer root.deinit(allocator);
             try root.put(allocator, "removed", .{ .bool = true });
@@ -365,6 +372,7 @@ fn addMagnet(daemon: *Daemon, uri: []const u8) !protocol.Response {
     const stored = daemon.registry.find(hex).?;
     try state.writeTorrentState(daemon.io, allocator, daemon.cfg.staging_area, stored.*);
     try daemon.engine.addSession(daemon.io, daemon.cfg, &daemon.registry, stored, daemon.dhtContext());
+    log.info("daemon", "added magnet torrent {s}", .{hex});
     return showResponse(daemon, stored.*);
 }
 
@@ -407,6 +415,7 @@ fn addTorrentFile(daemon: *Daemon, path: []const u8) !protocol.Response {
     const stored = daemon.registry.find(hex).?;
     try state.writeTorrentState(daemon.io, allocator, daemon.cfg.staging_area, stored.*);
     try daemon.engine.addSession(daemon.io, daemon.cfg, &daemon.registry, stored, daemon.dhtContext());
+    log.info("daemon", "added torrent file {s} ({s})", .{ hex, path });
     return showResponse(daemon, stored.*);
 }
 
@@ -573,6 +582,7 @@ fn loadPersistedSessions(daemon: *Daemon) !void {
         else => return err,
     };
     defer state.freeHistory(daemon.allocator, history);
+    log.debug("daemon", "loaded {d} completion records from history", .{history.len});
     for (history) |record| try daemon.registry.addCompletion(record);
 
     var dir = std.Io.Dir.cwd().openDir(daemon.io, daemon.cfg.staging_area, .{ .iterate = true }) catch return;
@@ -600,6 +610,7 @@ fn loadPersistedSessions(daemon: *Daemon) !void {
         };
         try daemon.registry.add(rec);
         const stored = daemon.registry.find(entry.name).?;
+        log.debug("daemon", "restored torrent session {s} (metadata_complete={})", .{ entry.name, stored.metadata_complete });
         try allocateDhtSlot(daemon, stored, stored.private_torrent);
         try state.writeTorrentState(daemon.io, daemon.allocator, daemon.cfg.staging_area, stored.*);
     }

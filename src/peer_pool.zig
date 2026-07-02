@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("config.zig");
+const log = @import("log.zig");
 const peer = @import("peer.zig");
 const tracker = @import("tracker.zig");
 const dht = @import("dht.zig");
@@ -49,6 +50,7 @@ pub fn connectContent(
     try conn.performHandshake(io, session.info_hash, peer_id, config.encryptionPolicy(cfg.network), false);
     try conn.sendInterested(io);
     try session.peers.append(allocator, conn);
+    log.debug("peer_pool", "connected content peer {d}.{d}.{d}.{d}:{d} for {s} ({d} total)", .{ ip[0], ip[1], ip[2], ip[3], port, session.info_hash_hex, session.peers.items.len });
 }
 
 pub fn connectContentBatch(
@@ -83,6 +85,7 @@ pub fn connectMetadata(
         if (session.metadata_size == null) session.metadata_size = size;
     }
     try session.metadata_peers.append(allocator, conn);
+    log.debug("peer_pool", "connected metadata peer {d}.{d}.{d}.{d}:{d} for {s} ({d} total)", .{ ip[0], ip[1], ip[2], ip[3], port, session.info_hash_hex, session.metadata_peers.items.len });
     if (conn.recv_buffer.items.len == 0) try conn.requestMetadataPiece(io, session.metadata_next_request);
 }
 
@@ -113,6 +116,9 @@ pub fn tickDht(
     const sock = &(session.dht_socket orelse return);
     const dht_peers = try sock.tick(io, allocator, ctx.routing, ctx.cfg, session.info_hash, now_ms);
     defer allocator.free(dht_peers);
+    if (dht_peers.len > 0) {
+        log.debug("peer_pool", "DHT returned {d} peers for {s}", .{ dht_peers.len, session.info_hash_hex });
+    }
     switch (mode) {
         .content => connectContentBatch(allocator, io, cfg, session, dht_peers, peer_id),
         .metadata => connectMetadataBatch(allocator, io, cfg, session, dht_peers, peer_id),
@@ -130,8 +136,10 @@ pub fn close(session: *TorrentSession, io: std.Io, allocator: std.mem.Allocator)
 }
 
 fn removeContentPeer(session: *TorrentSession, io: std.Io, allocator: std.mem.Allocator, index: usize) void {
-    var conn = session.peers.items[index];
-    conn.deinit(io);
+    const conn = session.peers.items[index];
+    log.debug("peer_pool", "disconnecting content peer {d}.{d}.{d}.{d}:{d} from {s}", .{ conn.peer_ip[0], conn.peer_ip[1], conn.peer_ip[2], conn.peer_ip[3], conn.peer_port, session.info_hash_hex });
+    var conn_mut = conn;
+    conn_mut.deinit(io);
     _ = session.peers.orderedRemove(index);
     if (session.active_piece) |*piece| {
         if (piece.peer_index == index) piece_scheduler.discard(session, piece, allocator);

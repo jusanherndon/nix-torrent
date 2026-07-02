@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("config.zig");
+const log = @import("log.zig");
 const peer = @import("peer.zig");
 const staging = @import("staging.zig");
 const state = @import("state.zig");
@@ -47,6 +48,7 @@ fn maintainPeers(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, s
         };
         if (data) |piece| {
             defer allocator.free(piece.bytes);
+            log.debug("metadata_fetch", "received metadata piece {d} ({d} bytes) for {s}", .{ piece.piece, piece.bytes.len, session.info_hash_hex });
             if (session.metadata_chunks.fetchRemove(piece.piece)) |old| allocator.free(old.value);
             try session.metadata_chunks.put(piece.piece, try allocator.dupe(u8, piece.bytes));
             session.metadata_next_request = piece.piece + 1;
@@ -92,6 +94,7 @@ fn tryComplete(
 
     const hash = torrent.infoHashFromInfoBytes(assembled);
     if (!std.mem.eql(u8, &hash, &session.info_hash)) {
+        log.warn("metadata_fetch", "metadata info hash mismatch for {s}", .{session.info_hash_hex});
         setError(allocator, io, rec, session, "metadata info hash mismatch");
         clearChunks(allocator, session);
         return;
@@ -153,6 +156,7 @@ fn tryComplete(
     session.metadata_size = null;
     session.metadata_next_request = 0;
     for (session.trackers.items) |*endpoint| endpoint.state.next_announce_ms = 0;
+    log.info("metadata_fetch", "metadata complete for {s} ({d} bytes)", .{ rec.info_hash_hex, size });
 }
 
 fn setError(allocator: std.mem.Allocator, io: std.Io, rec: *state.TorrentRecord, session: *TorrentSession, message: []const u8) void {

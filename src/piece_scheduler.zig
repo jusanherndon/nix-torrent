@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("config.zig");
+const log = @import("log.zig");
 const peer = @import("peer.zig");
 const storage = @import("storage.zig");
 const engine_session = @import("engine_session.zig");
@@ -36,6 +37,7 @@ pub fn tick(
                     .inflight = std.AutoHashMap(u32, i64).init(allocator),
                 };
                 session.layout.?.mark(piece_index, .in_progress);
+                log.debug("piece_scheduler", "started piece {d} from peer {d} for {s}", .{ piece_index, peer_index, session.info_hash_hex });
             }
         }
     }
@@ -124,15 +126,18 @@ fn requestBlocks(
 
 fn finish(io: std.Io, allocator: std.mem.Allocator, session: *TorrentSession, piece: *PieceDownload) !void {
     storage.writeVerifiedPiece(io, allocator, session.content_dir.?, session.meta.?, &session.layout.?, piece.piece_index, piece.buffer) catch {
+        log.warn("piece_scheduler", "failed to verify piece {d} for {s}", .{ piece.piece_index, session.info_hash_hex });
         session.layout.?.mark(piece.piece_index, .missing);
         discard(session, piece, allocator);
         return;
     };
+    log.debug("piece_scheduler", "verified piece {d} for {s}", .{ piece.piece_index, session.info_hash_hex });
     piece.deinit(allocator);
     session.active_piece = null;
 }
 
 pub fn discard(session: *TorrentSession, piece: *PieceDownload, allocator: std.mem.Allocator) void {
+    log.debug("piece_scheduler", "discarding piece {d} for {s}", .{ piece.piece_index, session.info_hash_hex });
     session.layout.?.mark(piece.piece_index, .missing);
     piece.deinit(allocator);
     session.active_piece = null;
