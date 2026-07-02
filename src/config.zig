@@ -12,6 +12,7 @@ pub const Limits = struct {
     max_piece_count: u64 = 1_000_000,
     max_active_torrents: u64 = 20,
     max_peers_per_torrent: u64 = 50,
+    max_peer_connect_attempts_per_tick: u64 = 5,
     max_in_progress_pieces_per_torrent: u64 = 4,
     max_in_flight_blocks_per_peer: u64 = 8,
 };
@@ -180,6 +181,7 @@ pub fn validateDaemon(cfg: Config) !void {
     if (cfg.limits.max_files_per_torrent == 0 or cfg.limits.max_path_depth == 0 or cfg.limits.max_path_component_bytes == 0) return ConfigError.InvalidConfig;
     if (cfg.limits.max_piece_bytes == 0 or cfg.limits.max_piece_count == 0 or cfg.limits.max_active_torrents == 0) return ConfigError.InvalidConfig;
     if (cfg.limits.max_peers_per_torrent == 0 or cfg.limits.max_in_progress_pieces_per_torrent == 0 or cfg.limits.max_in_flight_blocks_per_peer == 0) return ConfigError.InvalidConfig;
+    if (cfg.limits.max_peer_connect_attempts_per_tick == 0 or cfg.limits.max_peer_connect_attempts_per_tick > cfg.limits.max_peers_per_torrent) return ConfigError.InvalidConfig;
     if (cfg.engine.block_request_bytes == 0 or cfg.engine.block_request_bytes > cfg.limits.max_piece_bytes) return ConfigError.InvalidConfig;
     if (cfg.network.dht_base_port == 0 or cfg.network.dht_base_port > 65535) return ConfigError.InvalidConfig;
     if (cfg.network.dht_base_port + cfg.limits.max_active_torrents > 65535) return ConfigError.InvalidConfig;

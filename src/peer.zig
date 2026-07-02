@@ -81,14 +81,15 @@ pub const Connection = struct {
     ut_metadata_id: ?u8 = null,
     metadata_size: ?usize = null,
     read_scratch: [4096]u8 = undefined,
+    read_timeout_ms: u64 = 30_000,
 
     fn readStreamSlice(self: *Connection, io: std.Io, dest: []u8) !usize {
-        var reader = self.stream.reader(io, &self.read_scratch);
-        return reader.interface.readSliceShort(dest);
+        _ = io;
+        return tcp.readSome(self.stream.socket.handle, dest, self.read_timeout_ms);
     }
 
-    pub fn connect(io: std.Io, allocator: std.mem.Allocator, ip: [4]u8, port: u16, timeout_ms: u64) !Connection {
-        const stream = try tcp.connectStream(io, ip, port, timeout_ms);
+    pub fn connect(io: std.Io, allocator: std.mem.Allocator, ip: [4]u8, port: u16, connect_timeout_ms: u64, read_timeout_ms: u64) !Connection {
+        const stream = try tcp.connectStream(io, ip, port, connect_timeout_ms);
         return .{
             .allocator = allocator,
             .stream = stream,
@@ -96,6 +97,7 @@ pub const Connection = struct {
             .peer_port = port,
             .state = .{},
             .recv_buffer = .empty,
+            .read_timeout_ms = read_timeout_ms,
         };
     }
 

@@ -7,6 +7,15 @@ pub const CryptoFlags = struct {
     pub const rc4: u32 = 0x02;
 };
 
+pub const Error = error{
+    MalformedEncryption,
+    UnsupportedEncryption,
+    OutOfMemory,
+};
+
+const mse_key_len = 96;
+const shared_secret_buf_len = mse_key_len * 2;
+
 pub fn parsePolicy(value: []const u8) ?Policy {
     if (std.mem.eql(u8, value, "prefer")) return .prefer;
     if (std.mem.eql(u8, value, "require")) return .require;
@@ -90,17 +99,19 @@ pub fn generateKeyPair(allocator: std.mem.Allocator) !struct { public: [96]u8, p
     return .{ .public = public, .private = private };
 }
 
-pub fn sharedSecret(allocator: std.mem.Allocator, private_key: []const u8, remote_public: []const u8) ![]u8 {
-    var remote: [96]u8 = [_]u8{0} ** 96;
-    const copy_len = @min(remote_public.len, 96);
-    @memcpy(remote[96 - copy_len ..], remote_public[remote_public.len - copy_len ..]);
-    var buf: [192]u8 = undefined;
-    const priv_len = @min(private_key.len, 96);
-    @memcpy(buf[0..priv_len], private_key[0..priv_len]);
-    @memcpy(buf[priv_len .. priv_len + 96], &remote);
-    var out: [96]u8 = [_]u8{0} ** 96;
-    std.crypto.hash.Sha1.hash(buf[0 .. priv_len + 96], out[76..96], .{});
-    return allocator.dupe(u8, &out);
+pub fn sharedSecret(allocator: std.mem.Allocator, private_key: []const u8, remote_public: []const u8) Error![]u8 {
+    if (private_key.len != mse_key_len or remote_public.len != mse_key_len) return error.MalformedEncryption;
+
+    var remote: [mse_key_len]u8 = undefined;
+    @memcpy(&remote, remote_public);
+
+    var buf: [shared_secret_buf_len]u8 = undefined;
+    @memcpy(buf[0..mse_key_len], private_key);
+    @memcpy(buf[mse_key_len..], &remote);
+
+    var out: [mse_key_len]u8 = [_]u8{0} ** mse_key_len;
+    std.crypto.hash.Sha1.hash(&buf, out[76..96], .{});
+    return allocator.dupe(u8, &out) catch error.OutOfMemory;
 }
 
 pub fn buildInitiatorPayload(allocator: std.mem.Allocator, public_key: [96]u8) ![]u8 {
@@ -156,6 +167,22 @@ test "rc4 round trip" {
     var rc2 = Rc4.init("key");
     rc2.crypt(&data);
     try std.testing.expectEqual(@as(u8, 1), data[0]);
+}
+
+test "sharedSecret rejects malformed key lengths" {
+    var keys = try generateKeyPair(std.testing.allocator);
+    defer std.testing.allocator.free(keys.private);
+    const remote_pub = keys.public[0..];
+    try std.testing.expectError(error.MalformedEncryption, sharedSecret(std.testing.allocator, keys.private[0..95], remote_pub));
+    try std.testing.expectError(error.MalformedEncryption, sharedSecret(std.testing.allocator, keys.private, remote_pub[0..95]));
+}
+
+test "sharedSecret derives output for valid mse keys" {
+    var keys = try generateKeyPair(std.testing.allocator);
+    defer std.testing.allocator.free(keys.private);
+    const shared = try sharedSecret(std.testing.allocator, keys.private, &keys.public);
+    defer std.testing.allocator.free(shared);
+    try std.testing.expectEqual(@as(usize, mse_key_len), shared.len);
 }
 
 test "parses encryption policy" {

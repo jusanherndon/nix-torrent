@@ -168,7 +168,7 @@ test "integration: encrypted policy rejects plaintext peer" {
     var peer_srv = try harness.spawnFakeContentPeer(io, allocator, meta, .plaintext);
     defer peer_srv.join(io);
 
-    var conn = try peer.Connection.connect(io, allocator, .{ 127, 0, 0, 1 }, peer_srv.port, 2000);
+    var conn = try peer.Connection.connect(io, allocator, .{ 127, 0, 0, 1 }, peer_srv.port, 2000, 2000);
     defer conn.deinit(io);
     try std.testing.expectError(error.EncryptionRequired, conn.performHandshake(io, meta.info_hash, [_]u8{4} ** 20, encryption.Policy.require, false));
 }
@@ -185,7 +185,7 @@ test "integration: metadata peer handshake and piece fetch" {
     var metadata_peer = try harness.spawnFakeMetadataPeer(io, allocator, meta.info_hash, info_bytes);
     defer metadata_peer.join(io);
 
-    var conn = try peer.Connection.connect(io, allocator, .{ 127, 0, 0, 1 }, metadata_peer.port, 2000);
+    var conn = try peer.Connection.connect(io, allocator, .{ 127, 0, 0, 1 }, metadata_peer.port, 2000, 2000);
     defer conn.deinit(io);
     try conn.performMetadataHandshake(io, meta.info_hash, [_]u8{6} ** 20, .disable);
     try std.testing.expectEqual(@as(usize, info_bytes.len), conn.metadata_size.?);

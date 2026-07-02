@@ -44,6 +44,7 @@ fn connectStreamWithTimeout(addr: net.IpAddress, timeout_ms: u64) ConnectError!n
     switch (c.errno(rc)) {
         .SUCCESS => {
             _ = c.fcntl(sock, c.F.SETFL, flags);
+            try ensureBlocking(sock);
             setIoTimeouts(sock, timeout_ms);
             return .{ .socket = .{ .handle = sock, .address = addr } };
         },
@@ -70,8 +71,30 @@ fn connectStreamWithTimeout(addr: net.IpAddress, timeout_ms: u64) ConnectError!n
     }
 
     _ = c.fcntl(sock, c.F.SETFL, flags);
+    try ensureBlocking(sock);
     setIoTimeouts(sock, timeout_ms);
     return .{ .socket = .{ .handle = sock, .address = addr } };
+}
+
+fn ensureBlocking(sock: c.fd_t) ConnectError!void {
+    const flags = c.fcntl(sock, c.F.GETFL, @as(c_int, 0));
+    if (flags == -1) return error.ConnectionFailed;
+    const o_nonblock: c_int = 0x800;
+    if (flags & o_nonblock != 0 and c.fcntl(sock, c.F.SETFL, flags & ~o_nonblock) == -1) return error.ConnectionFailed;
+}
+
+/// Reads up to `dest.len` bytes, waiting at most `timeout_ms` for data.
+pub fn readSome(sock: c.fd_t, dest: []u8, timeout_ms: u64) ReadError!usize {
+    try pollReadable(sock, timeout_ms);
+    while (true) {
+        const n = c.recv(sock, dest.ptr, dest.len, 0);
+        if (n != -1) return @intCast(n);
+        switch (c.errno(n)) {
+            .INTR => continue,
+            .AGAIN => return error.Timeout,
+            else => return error.ReadFailed,
+        }
+    }
 }
 
 pub fn setIoTimeouts(sock: c.fd_t, timeout_ms: u64) void {

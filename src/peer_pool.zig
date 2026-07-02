@@ -45,7 +45,7 @@ pub fn connectContent(
 ) !void {
     if (session.peers.items.len >= cfg.limits.max_peers_per_torrent) return;
     if (hasContent(session, ip, port)) return;
-    var conn = try peer.Connection.connect(io, allocator, ip, port, cfg.network.peer_connect_timeout_ms);
+    var conn = try peer.Connection.connect(io, allocator, ip, port, cfg.network.peer_connect_timeout_ms, cfg.network.peer_request_timeout_ms);
     errdefer conn.deinit(io);
     try conn.performHandshake(io, session.info_hash, peer_id, config.encryptionPolicy(cfg.network), false);
     try conn.sendInterested(io);
@@ -67,8 +67,12 @@ pub fn connectContentBatch(
     peers: []const tracker.Peer,
     peer_id: [20]u8,
 ) void {
+    var attempts: usize = 0;
+    const max_attempts = @as(usize, @intCast(cfg.limits.max_peer_connect_attempts_per_tick));
     for (peers) |tp| {
         if (session.peers.items.len >= cfg.limits.max_peers_per_torrent) break;
+        if (attempts >= max_attempts) break;
+        attempts += 1;
         connectContent(allocator, io, cfg, session, tp.ip, tp.port, peer_id) catch |err| {
             logConnectFailure("content", session, tp.ip, tp.port, err);
         };
@@ -86,7 +90,7 @@ pub fn connectMetadata(
 ) !void {
     if (session.metadata_peers.items.len >= cfg.limits.max_peers_per_torrent) return;
     if (hasMetadata(session, ip, port)) return;
-    var conn = try peer.Connection.connect(io, allocator, ip, port, cfg.network.peer_connect_timeout_ms);
+    var conn = try peer.Connection.connect(io, allocator, ip, port, cfg.network.peer_connect_timeout_ms, cfg.network.peer_request_timeout_ms);
     errdefer conn.deinit(io);
     try conn.performMetadataHandshake(io, session.info_hash, peer_id, config.encryptionPolicy(cfg.network));
     if (conn.metadata_size) |size| {
@@ -105,8 +109,12 @@ pub fn connectMetadataBatch(
     peers: []const tracker.Peer,
     peer_id: [20]u8,
 ) void {
+    var attempts: usize = 0;
+    const max_attempts = @as(usize, @intCast(cfg.limits.max_peer_connect_attempts_per_tick));
     for (peers) |tp| {
         if (session.metadata_peers.items.len >= cfg.limits.max_peers_per_torrent) break;
+        if (attempts >= max_attempts) break;
+        attempts += 1;
         connectMetadata(allocator, io, cfg, session, tp.ip, tp.port, peer_id) catch |err| {
             logConnectFailure("metadata", session, tp.ip, tp.port, err);
         };
