@@ -1,6 +1,7 @@
 const std = @import("std");
 const bencode = @import("bencode.zig");
 const encryption = @import("encryption.zig");
+const mse = @import("mse.zig");
 const peer = @import("peer.zig");
 const torrent = @import("torrent.zig");
 const tracker = @import("tracker.zig");
@@ -350,71 +351,40 @@ fn servePlainContentPeerFd(fd: c.fd_t, info_hash: torrent.InfoHash, info_bytes: 
     servePieceRequestsFd(fd, info_bytes, piece_length) catch {};
 }
 
-fn readDhPacketFd(fd: c.fd_t, buf: []u8) !usize {
-    var total: usize = 0;
-    while (total < 96) {
-        const n = try readSomeFd(fd, buf[total..96]);
-        if (n == 0) return total;
-        total += n;
+const FdMseBridge = struct {
+    fd: c.fd_t,
+
+    fn read(ptr: *anyopaque, dest: []u8) anyerror!usize {
+        const self: *FdMseBridge = @ptrCast(@alignCast(ptr));
+        return readSomeFd(self.fd, dest);
     }
-    while (total < encryption.max_dh_packet_len) {
-        const n = readSomeFdPoll(fd, buf[total..encryption.max_dh_packet_len]) catch break;
-        if (n == 0) break;
-        total += n;
+
+    fn write(ptr: *anyopaque, bytes: []const u8) anyerror!void {
+        const self: *FdMseBridge = @ptrCast(@alignCast(ptr));
+        try writeAllFd(self.fd, bytes);
     }
-    return 96;
-}
+
+    fn stream(self: *FdMseBridge) mse.ByteStream {
+        return .{ .ptr = self, .readFn = read, .writeFn = write };
+    }
+};
 
 fn serveMseContentPeerFd(allocator: std.mem.Allocator, fd: c.fd_t, scheme: MseScheme, info_hash: torrent.InfoHash, info_bytes: []const u8, piece_length: u64, piece_count: usize) !void {
-    var pe1_buf: [encryption.max_dh_packet_len]u8 = undefined;
-    const pe1_len = try readDhPacketFd(fd, &pe1_buf);
-    if (pe1_len < 96) return error.MalformedEncryption;
-    var remote_pub: [96]u8 = undefined;
-    @memcpy(&remote_pub, pe1_buf[0..96]);
-
-    var dh = try encryption.DhKeyExchange.generate(allocator);
-    defer dh.deinit();
-    try dh.computeShared(allocator, &remote_pub);
-    const shared = dh.shared().*;
-
-    // Send Yb only; leave PadB until after PE3 so the initiator must sync on ENCRYPT(VC).
-    try writeAllFd(fd, dh.local_public[0..]);
-
-    var frame_buf: [128]u8 = undefined;
-    var frame_len: usize = 0;
-    while (frame_len < 56) {
-        const n = try readSomeFd(fd, frame_buf[frame_len..56]);
-        if (n == 0) return error.MalformedEncryption;
-        frame_len += n;
-    }
-    var ia_enc: [encryption.handshake_len]u8 = undefined;
-    try readExactFd(fd, &ia_enc);
-
-    var session = encryption.Session.derive(&shared, info_hash, false);
-    const parsed = try encryption.parseInitiatorSync(&session.decrypt, frame_buf[0..frame_len], &ia_enc, &shared, info_hash);
-
     const offered: u32 = switch (scheme) {
         .rc4_only => encryption.CryptoFlags.rc4,
         .plaintext_only => encryption.CryptoFlags.plaintext_within_mse,
         .both => encryption.CryptoFlags.rc4 | encryption.CryptoFlags.plaintext_within_mse,
     };
-    const selected = encryption.responderSelectScheme(parsed.crypto_provide, offered) orelse return error.UnsupportedEncryption;
-    var pad_b: [32]u8 = undefined;
-    @memset(&pad_b, 0xAB);
-    try writeAllFd(fd, &pad_b);
-    const pe4 = try encryption.buildResponderSync(allocator, &session, @intFromEnum(selected));
-    defer allocator.free(pe4);
-    try writeAllFd(fd, pe4);
 
-    var hs_out: [encryption.handshake_len]u8 = undefined;
-    peer.encodeHandshake(&hs_out, info_hash, [_]u8{0x2A} ** 20, false);
-    if (selected == .rc4) {
-        var hs_scratch = hs_out;
-        session.encrypt.crypt(&hs_scratch);
-        try writeAllFd(fd, &hs_scratch);
-    } else {
-        try writeAllFd(fd, &hs_out);
-    }
+    var bridge = FdMseBridge{ .fd = fd };
+    var established = try mse.establishResponder(
+        allocator,
+        bridge.stream(),
+        info_hash,
+        [_]u8{0x2A} ** 20,
+        offered,
+    );
+    defer established.deinit(allocator);
 
     const bitfield_len = (piece_count + 7) / 8;
     const bitfield = try allocator.alloc(u8, bitfield_len);
@@ -422,18 +392,19 @@ fn serveMseContentPeerFd(allocator: std.mem.Allocator, fd: c.fd_t, scheme: MseSc
     @memset(bitfield, 0xFF);
     const bf_msg = try peer.encodeMessage(allocator, .{ .bitfield = bitfield });
     defer allocator.free(bf_msg);
-    if (selected == .rc4) {
+
+    if (established.crypto) |*keys| {
         const bf_scratch = try allocator.dupe(u8, bf_msg);
         defer allocator.free(bf_scratch);
-        session.encrypt.crypt(bf_scratch);
+        keys.encrypt.crypt(bf_scratch);
         try writeAllFd(fd, bf_scratch);
         const unchoke = try peer.encodeMessage(allocator, .unchoke);
         defer allocator.free(unchoke);
         const uc_scratch = try allocator.dupe(u8, unchoke);
         defer allocator.free(uc_scratch);
-        session.encrypt.crypt(uc_scratch);
+        keys.encrypt.crypt(uc_scratch);
         try writeAllFd(fd, uc_scratch);
-        serveEncryptedPieceRequestsFd(fd, &session, info_bytes, piece_length) catch {};
+        serveEncryptedPieceRequestsFd(fd, keys, info_bytes, piece_length) catch {};
     } else {
         try writeAllFd(fd, bf_msg);
         const unchoke = try peer.encodeMessage(allocator, .unchoke);
@@ -478,7 +449,7 @@ fn servePieceRequestsFd(fd: c.fd_t, info_bytes: []const u8, piece_length: u64) !
     }
 }
 
-fn serveEncryptedPieceRequestsFd(fd: c.fd_t, session: *encryption.Session, info_bytes: []const u8, piece_length: u64) !void {
+fn serveEncryptedPieceRequestsFd(fd: c.fd_t, keys: *encryption.Keystreams, info_bytes: []const u8, piece_length: u64) !void {
     var recv: std.ArrayList(u8) = .empty;
     defer recv.deinit(std.heap.page_allocator);
     var scratch: [4096]u8 = undefined;
@@ -486,7 +457,7 @@ fn serveEncryptedPieceRequestsFd(fd: c.fd_t, session: *encryption.Session, info_
         const n = readSomeFd(fd, &scratch) catch break;
         if (n == 0) break;
         const chunk = scratch[0..n];
-        session.decrypt.crypt(chunk);
+        keys.decrypt.crypt(chunk);
         recv.appendSlice(std.heap.page_allocator, chunk) catch break;
         while (recv.items.len >= 4) {
             const len = std.mem.readInt(u32, recv.items[0..4], .big);
@@ -506,7 +477,7 @@ fn serveEncryptedPieceRequestsFd(fd: c.fd_t, session: *encryption.Session, info_
                 defer std.heap.page_allocator.free(piece_msg);
                 const out = try std.heap.page_allocator.dupe(u8, piece_msg);
                 defer std.heap.page_allocator.free(out);
-                session.encrypt.crypt(out);
+                keys.encrypt.crypt(out);
                 try writeAllFd(fd, out);
             }
             recv.replaceRange(std.heap.page_allocator, 0, 4 + len, &.{}) catch break;

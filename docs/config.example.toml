@@ -51,8 +51,10 @@ max_peers_per_torrent = 50
 # Maximum outbound peer handshake attempts per engine tick (per tracker/DHT batch).
 max_peer_connect_attempts_per_tick = 5
 
-# Maximum tracker announce attempts per engine tick (spreads multi-tracker magnets across ticks).
-max_tracker_announces_per_tick = 1
+# Maximum tracker announce attempts per engine tick (UDP first, then HTTP).
+# Keep this high enough that HTTP trackers are not starved behind a long UDP wave
+# when each tick also spends wall time on peer-connect batches.
+max_tracker_announces_per_tick = 4
 
 # Maximum in-progress pieces per torrent.
 max_in_progress_pieces_per_torrent = 4
@@ -70,6 +72,11 @@ announce_port = 6881
 
 # Timeout for outbound peer TCP connection attempts.
 peer_connect_timeout_ms = 10000
+
+# Wall-clock budget for outbound connect+handshake work per engine tick.
+# At least one attempt always runs; further attempts stop once this budget is spent
+# so control commands (show) are not blocked for max_attempts × connect timeout.
+peer_connect_batch_budget_ms = 15000
 
 # Timeout for in-flight block requests to a peer.
 peer_request_timeout_ms = 30000

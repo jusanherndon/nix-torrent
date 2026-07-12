@@ -41,11 +41,11 @@ Filesystem preparation of a torrent's staging area — directories, metadata on 
 _Avoid_: Session attach, registry update, DHT slot allocation
 
 **Torrent Session**:
-Engine-owned runtime state for a torrent under active download, including peers, piece progress, tracker protocol state, and DHT socket handles.
-_Avoid_: Torrent record, registry entry, completion history
+Engine-owned runtime for one torrent under active download — peers, piece progress, tracker protocol state, and DHT handles — whose tick is the unit of progress for that torrent.
+_Avoid_: Torrent record, registry entry, completion history, engine tick phase
 
 **Registry Projection**:
-The engine materialization of live Torrent Session fields onto the registry `TorrentRecord` at tick boundaries. Control Surface reads use the projected record only — not a parallel session lookup. Ephemeral fields (connected peer count, downloading, DHT last error) are projected each tick but not persisted in `state.json`.
+Materialization of live Torrent Session fields onto the registry `TorrentRecord` at the end of each Session tick. Control Surface reads use the projected record only — not a parallel session lookup. Ephemeral fields (connected peer count, downloading, DHT last error) are projected each tick but not persisted in `state.json`; the Engine owns persistence after the tick returns.
 _Avoid_: Dual lookup, live session DTO, sync glue
 
 **Final Destination**:
@@ -89,8 +89,8 @@ The BitTorrent peer-connection obfuscation handshake that negotiates how the str
 _Avoid_: TLS, HTTPS, transport-layer encryption
 
 **MSE Handshake**:
-The key-exchange and scheme-negotiation exchange between two peers before the BitTorrent handshake. It completes when both peers agree on one encryption scheme via `crypto_select`.
-_Avoid_: BitTorrent handshake, encryption policy
+The key-exchange and scheme-negotiation between two peers that completes when they agree on an Encryption Scheme via `crypto_select`, carrying the BitTorrent handshake as MSE initial payload. Success yields an Encrypted or Obfuscated Peer Connection — never a Plaintext Peer Connection.
+_Avoid_: Plain BitTorrent handshake, encryption policy, plaintext fallback
 
 **Encryption Scheme**:
 A mutually agreed MSE stream-protection option identified by a `crypto_provide` / `crypto_select` bit. The de facto schemes are plaintext-within-MSE (`0x01`, handshake only — stream not RC4-encrypted) and RC4 (`0x02`, stream encrypted after negotiation).

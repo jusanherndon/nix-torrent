@@ -4,10 +4,10 @@ const log = @import("log.zig");
 const peer = @import("peer.zig");
 const tracker = @import("tracker.zig");
 const dht = @import("dht.zig");
-const engine_session = @import("engine_session.zig");
+const session_types = @import("session_types.zig");
 const piece_scheduler = @import("piece_scheduler.zig");
 
-const TorrentSession = engine_session.TorrentSession;
+const TorrentSession = session_types.TorrentSession;
 
 pub const DhtPeerMode = enum { content, metadata };
 
@@ -108,10 +108,13 @@ pub fn connectCandidateBatch(
     const n = session.peer_candidates.items.len;
     if (n == 0) return;
     const max_attempts = @as(usize, @intCast(cfg.limits.max_peer_connect_attempts_per_tick));
+    const batch_budget_ms = @as(i64, @intCast(cfg.network.peer_connect_batch_budget_ms));
+    const batch_start_ms = nowMs(io);
     const policy = config.encryptionPolicy(cfg.network);
     var attempts: usize = 0;
     var examined: usize = 0;
     while (examined < n and attempts < max_attempts) {
+        if (attempts > 0 and nowMs(io) - batch_start_ms >= batch_budget_ms) break;
         const idx = (session.peer_candidate_cursor + examined) % n;
         examined += 1;
         const tp = session.peer_candidates.items[idx];
@@ -172,7 +175,8 @@ pub fn connectMetadata(
     }
     try session.metadata_peers.append(allocator, conn);
     log.debug("peer_pool", "connected metadata peer {d}.{d}.{d}.{d}:{d} for {s} ({d} total)", .{ ip[0], ip[1], ip[2], ip[3], port, session.info_hash_hex, session.metadata_peers.items.len });
-    if (conn.recv_buffer.items.len == 0) try conn.requestMetadataPiece(io, session.metadata_next_request);
+    // Always request; leftover bitfield/have in recv_buffer must not block ut_metadata.
+    try conn.requestMetadataPiece(io, session.metadata_next_request);
 }
 
 pub fn connectMetadataBatch(
@@ -273,6 +277,10 @@ pub fn maintain(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, se
         }
         i += 1;
     }
+}
+
+fn nowMs(io: std.Io) i64 {
+    return std.Io.Timestamp.now(io, .real).toMilliseconds();
 }
 
 test "rejects unroutable peer candidates" {

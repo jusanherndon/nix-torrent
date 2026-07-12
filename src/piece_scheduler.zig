@@ -3,10 +3,10 @@ const config = @import("config.zig");
 const log = @import("log.zig");
 const peer = @import("peer.zig");
 const storage = @import("storage.zig");
-const engine_session = @import("engine_session.zig");
+const session_types = @import("session_types.zig");
 
-const PieceDownload = engine_session.PieceDownload;
-const TorrentSession = engine_session.TorrentSession;
+const PieceDownload = session_types.PieceDownload;
+const TorrentSession = session_types.TorrentSession;
 
 pub fn countVerified(layout: storage.Layout) usize {
     var n: usize = 0;

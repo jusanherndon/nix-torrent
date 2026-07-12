@@ -236,7 +236,7 @@ test "integration: metadata peer handshake and piece fetch" {
     defer conn.deinit(io);
     try conn.performMetadataHandshake(io, meta.info_hash, [_]u8{6} ** 20, .disable);
     try std.testing.expectEqual(@as(usize, info_bytes.len), conn.metadata_size.?);
-    if (conn.recv_buffer.items.len == 0) try conn.requestMetadataPiece(io, 0);
+    try conn.requestMetadataPiece(io, 0);
     const piece = (try conn.readMetadataPiece(io)) orelse return error.TestExpectedEqual;
     defer allocator.free(piece.bytes);
     try std.testing.expectEqual(info_bytes.len, piece.bytes.len);

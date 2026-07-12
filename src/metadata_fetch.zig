@@ -6,11 +6,11 @@ const staging = @import("staging.zig");
 const state = @import("state.zig");
 const storage = @import("storage.zig");
 const torrent = @import("torrent.zig");
-const engine_session = @import("engine_session.zig");
+const session_types = @import("session_types.zig");
 const peer_pool = @import("peer_pool.zig");
 
-const TorrentSession = engine_session.TorrentSession;
-const metadata_piece_size = engine_session.metadata_piece_size;
+const TorrentSession = session_types.TorrentSession;
+const metadata_piece_size = session_types.metadata_piece_size;
 
 pub fn tick(
     allocator: std.mem.Allocator,

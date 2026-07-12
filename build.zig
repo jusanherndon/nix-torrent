@@ -110,6 +110,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const session_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/session.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
     const piece_scheduler_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/piece_scheduler.zig"),
@@ -168,6 +177,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const mse_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mse.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
     const test_step = b.step("test", "Run unit tests");
     const staging_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -188,12 +205,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(peer_tests).step);
     test_step.dependOn(&b.addRunArtifact(peer_pool_tests).step);
     test_step.dependOn(&b.addRunArtifact(engine_tests).step);
+    test_step.dependOn(&b.addRunArtifact(session_tests).step);
     test_step.dependOn(&b.addRunArtifact(piece_scheduler_tests).step);
     test_step.dependOn(&b.addRunArtifact(handoff_tests).step);
     test_step.dependOn(&b.addRunArtifact(protocol_tests).step);
     test_step.dependOn(&b.addRunArtifact(state_tests).step);
     test_step.dependOn(&b.addRunArtifact(dht_tests).step);
     test_step.dependOn(&b.addRunArtifact(encryption_tests).step);
+    test_step.dependOn(&b.addRunArtifact(mse_tests).step);
     const magnet_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/magnet.zig"),

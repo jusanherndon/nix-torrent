@@ -2,6 +2,7 @@ const std = @import("std");
 const tcp = @import("tcp.zig");
 const torrent = @import("torrent.zig");
 const encryption = @import("encryption.zig");
+const mse = @import("mse.zig");
 const bencode = @import("bencode.zig");
 
 const net = std.Io.net;
@@ -77,7 +78,7 @@ pub const Connection = struct {
     handshake_done: bool = false,
     closed: bool = false,
     encryption_mode: encryption.Mode = .plaintext,
-    crypto: ?encryption.Session = null,
+    crypto: ?encryption.Keystreams = null,
     ut_metadata_id: ?u8 = null,
     metadata_size: ?usize = null,
     read_scratch: [4096]u8 = undefined,
@@ -87,6 +88,25 @@ pub const Connection = struct {
         _ = io;
         return tcp.readSome(self.stream.socket.handle, dest, self.read_timeout_ms);
     }
+
+    const MseBridge = struct {
+        conn: *Connection,
+        io: std.Io,
+
+        fn read(ptr: *anyopaque, dest: []u8) anyerror!usize {
+            const self: *MseBridge = @ptrCast(@alignCast(ptr));
+            return self.conn.readStreamSlice(self.io, dest);
+        }
+
+        fn write(ptr: *anyopaque, bytes: []const u8) anyerror!void {
+            const self: *MseBridge = @ptrCast(@alignCast(ptr));
+            try self.conn.sendRawPlain(self.io, bytes);
+        }
+
+        fn stream(self: *MseBridge) mse.ByteStream {
+            return .{ .ptr = self, .readFn = read, .writeFn = write };
+        }
+    };
 
     pub fn connect(io: std.Io, allocator: std.mem.Allocator, ip: [4]u8, port: u16, connect_timeout_ms: u64, read_timeout_ms: u64) !Connection {
         const stream = try tcp.connectStream(io, ip, port, connect_timeout_ms);
@@ -156,15 +176,27 @@ pub const Connection = struct {
                 try self.plaintextHandshake(io, info_hash, peer_id, extensions);
                 self.encryption_mode = .plaintext;
             },
-            .prefer => {
-                if (try self.tryEncryptedHandshake(io, info_hash, peer_id, policy, extensions)) {
-                    self.handshake_done = true;
-                    return;
+            .prefer, .require => {
+                var bridge = MseBridge{ .conn = self, .io = io };
+                var established = mse.establishInitiator(self.allocator, bridge.stream(), .{
+                    .info_hash = info_hash,
+                    .local_peer_id = peer_id,
+                    .policy = policy,
+                    .extensions = extensions,
+                }) catch |err| switch (err) {
+                    error.PeerNotMse => return if (policy == .require) error.EncryptionRequired else error.UnsupportedEncryption,
+                    error.EncryptionRequired => return error.EncryptionRequired,
+                    error.UnsupportedEncryption => return error.UnsupportedEncryption,
+                    error.PolicyDisabled => unreachable,
+                    else => |e| return e,
+                };
+                defer established.deinit(self.allocator);
+
+                self.encryption_mode = established.mode;
+                self.crypto = established.crypto;
+                if (established.leftover.len > 0) {
+                    try self.recv_buffer.appendSlice(self.allocator, established.leftover);
                 }
-                return error.UnsupportedEncryption;
-            },
-            .require => {
-                if (!try self.tryEncryptedHandshake(io, info_hash, peer_id, policy, extensions)) return error.EncryptionRequired;
                 self.handshake_done = true;
             },
         }
@@ -194,119 +226,13 @@ pub const Connection = struct {
         self.handshake_done = true;
     }
 
-    fn readDhResponse(self: *Connection, io: std.Io, buf: []u8) !usize {
-        // Read at least Yb (96). Do not block waiting for more PadB — that delays PE3.
-        // Any PadB that arrived in the same read is returned to the caller for PE4 VC sync.
-        var total: usize = 0;
-        while (total < 96) {
-            const n = try self.readStreamSlice(io, buf[total..]);
-            if (n == 0) return total;
-            total += n;
-            if (buf[0] == 19) return total;
-        }
-        return total;
-    }
-
-    fn tryEncryptedHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8, policy: encryption.Policy, extensions: bool) !bool {
-        var dh = try encryption.DhKeyExchange.generate(self.allocator);
-        defer dh.deinit();
-
-        const pe1 = try encryption.buildDhOutgoing(self.allocator, &dh.local_public);
-        defer self.allocator.free(pe1);
-        try self.sendRawPlain(io, pe1);
-
-        var pe2_buf: [encryption.max_dh_packet_len]u8 = undefined;
-        const pe2_len = try self.readDhResponse(io, &pe2_buf);
-        if (pe2_len >= 1 and pe2_buf[0] == 19) return false;
-        if (pe2_len < 96) return error.MalformedEncryption;
-
-        var remote_pub: [96]u8 = undefined;
-        @memcpy(&remote_pub, pe2_buf[0..96]);
-        try dh.computeShared(self.allocator, &remote_pub);
-        const shared = dh.shared().*;
-
-        const crypto_provide = encryption.cryptoProvideForPolicy(policy);
-        var ia_session = encryption.Session.derive(&shared, info_hash, true);
-        const pe3 = try encryption.buildInitiatorSync(self.allocator, &shared, info_hash, crypto_provide, &ia_session);
-        defer self.allocator.free(pe3);
-
-        var hs_out: [encryption.handshake_len]u8 = undefined;
-        encodeHandshake(&hs_out, info_hash, peer_id, extensions);
-        var hs_scratch = hs_out;
-        ia_session.encrypt.crypt(&hs_scratch);
-
-        // Send sync + IA in one write so peers that read greedily see a complete PE3.
-        const pe3_ia = try self.allocator.alloc(u8, pe3.len + hs_scratch.len);
-        defer self.allocator.free(pe3_ia);
-        @memcpy(pe3_ia[0..pe3.len], pe3);
-        @memcpy(pe3_ia[pe3.len..], &hs_scratch);
-        try self.sendRawPlain(io, pe3_ia);
-
-        // Sync past leftover PadB to PE4 (ENCRYPT(VC...)). Seed with PadB already read with Yb.
-        var pe4_buf: [encryption.pe4_sync_buf_len]u8 = undefined;
-        var pe4_len: usize = 0;
-        if (pe2_len > 96) {
-            const seed = @min(pe2_len - 96, pe4_buf.len);
-            @memcpy(pe4_buf[0..seed], pe2_buf[96 .. 96 + seed]);
-            pe4_len = seed;
-        }
-        const search_limit = encryption.max_pad + encryption.vc_len;
-        const vc_off = blk: {
-            while (true) {
-                if (pe4_len >= encryption.vc_len) {
-                    if (encryption.findVerificationConstant(pe4_buf[0..pe4_len], &ia_session.decrypt, encryption.max_pad)) |off| {
-                        break :blk off;
-                    }
-                }
-                if (pe4_len >= search_limit) return error.MalformedEncryption;
-                const n = try self.readStreamSlice(io, pe4_buf[pe4_len..search_limit]);
-                if (n == 0) return error.MalformedEncryption;
-                pe4_len += n;
-            }
-        };
-        const header_end = vc_off + encryption.vc_len + 6;
-        while (pe4_len < header_end) {
-            const n = try self.readStreamSlice(io, pe4_buf[pe4_len..header_end]);
-            if (n == 0) return error.MalformedEncryption;
-            pe4_len += n;
-        }
-        const pe4_total = try encryption.responderFrameTotalLen(pe4_buf[vc_off..header_end], &ia_session.decrypt);
-        const frame_end = vc_off + pe4_total;
-        if (frame_end > pe4_buf.len) return error.MalformedEncryption;
-        while (pe4_len < frame_end) {
-            const n = try self.readStreamSlice(io, pe4_buf[pe4_len..frame_end]);
-            if (n == 0) return error.MalformedEncryption;
-            pe4_len += n;
-        }
-        var hs_enc: [encryption.handshake_len]u8 = undefined;
-        var hs_got: usize = 0;
-        const leftover = pe4_len - frame_end;
-        if (leftover > 0) {
-            const take = @min(leftover, hs_enc.len);
-            @memcpy(hs_enc[0..take], pe4_buf[frame_end .. frame_end + take]);
-            hs_got = take;
-        }
-        while (hs_got < hs_enc.len) {
-            const n = try self.readStreamSlice(io, hs_enc[hs_got..]);
-            if (n == 0) return error.MalformedEncryption;
-            hs_got += n;
-        }
-        const parsed = try encryption.parseResponderSync(&ia_session.decrypt, pe4_buf[vc_off..frame_end], &hs_enc, crypto_provide, policy);
-        const scheme = parsed.scheme;
-        self.encryption_mode = encryption.modeForScheme(scheme);
-        if (scheme == .rc4) {
-            self.crypto = ia_session;
-        } else {
-            self.crypto = null;
-        }
-        const decoded = try decodeHandshake(&parsed.remote_handshake);
-        if (!std.mem.eql(u8, &decoded.info_hash, &info_hash)) return error.InfoHashMismatch;
-        return true;
-    }
-
     pub fn performMetadataHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8, policy: encryption.Policy) !void {
         try self.performHandshake(io, info_hash, peer_id, policy, true);
-        while (true) {
+        // Offer ut_metadata first so peers that wait on our handshake do not deadlock.
+        const ext = try encodeExtendedHandshake(self.allocator, 1);
+        defer self.allocator.free(ext);
+        try self.sendRaw(io, ext);
+        while (self.ut_metadata_id == null) {
             if (self.recv_buffer.items.len < 4) {
                 var buf: [4096]u8 = undefined;
                 const n = try self.readStreamSlice(io, &buf);
@@ -325,17 +251,17 @@ pub const Connection = struct {
             }
             const frame = self.recv_buffer.items[0..frame_len];
             const msg = decodeMessage(frame) catch return error.MetadataHandshakeFailed;
-            if (msg != .extended or msg.extended.len == 0 or msg.extended[0] != 0) break;
+            // Skip bitfield/have/etc.; keep waiting for the extended handshake.
+            if (msg != .extended or msg.extended.len == 0 or msg.extended[0] != 0) {
+                try self.recv_buffer.replaceRange(self.allocator, 0, frame_len, &.{});
+                continue;
+            }
             const parsed = try parsePeerExtendedHandshake(self.allocator, msg.extended);
             try self.recv_buffer.replaceRange(self.allocator, 0, frame_len, &.{});
-            const handshake = parsed orelse return error.MetadataHandshakeFailed;
+            const handshake = parsed orelse return error.MetadataUnsupported;
             self.ut_metadata_id = handshake.ut_metadata_id;
             self.metadata_size = handshake.metadata_size;
-            break;
         }
-        const ext = try encodeExtendedHandshake(self.allocator, 1);
-        defer self.allocator.free(ext);
-        try self.sendRaw(io, ext);
     }
 
     pub fn requestMetadataPiece(self: *Connection, io: std.Io, piece: u32) !void {

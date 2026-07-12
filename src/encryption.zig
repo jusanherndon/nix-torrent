@@ -91,12 +91,13 @@ pub const Rc4 = struct {
     }
 };
 
-pub const Session = struct {
+/// RC4 encrypt/decrypt keystreams after MSE negotiation (not a Torrent Session).
+pub const Keystreams = struct {
     encrypt: Rc4,
     decrypt: Rc4,
     mode: Mode = .encrypted,
 
-    pub fn derive(shared: *const [dh_key_len]u8, info_hash: torrent.InfoHash, initiator: bool) Session {
+    pub fn derive(shared: *const [dh_key_len]u8, info_hash: torrent.InfoHash, initiator: bool) Keystreams {
         const enc_label = if (initiator) "keyA" else "keyB";
         const dec_label = if (initiator) "keyB" else "keyA";
         const enc_key = deriveRc4Key(enc_label, shared, &info_hash);
@@ -320,7 +321,7 @@ pub fn buildInitiatorSync(
     shared: *const [dh_key_len]u8,
     info_hash: torrent.InfoHash,
     crypto_provide: u32,
-    session: *Session,
+    session: *Keystreams,
 ) Error![]u8 {
     const shared_bytes = shared.*;
     const pad_len: u16 = 0;
@@ -350,7 +351,7 @@ pub fn buildInitiatorSyncWithPad(
     info_hash: torrent.InfoHash,
     crypto_provide: u32,
     pad_len: u16,
-    session: *Session,
+    session: *Keystreams,
 ) Error![]u8 {
     if (pad_len > max_pad) return error.MalformedEncryption;
     const shared_bytes = shared.*;
@@ -375,11 +376,11 @@ pub fn buildInitiatorSyncWithPad(
     return out.toOwnedSlice(allocator) catch error.OutOfMemory;
 }
 
-pub fn buildResponderSync(allocator: std.mem.Allocator, session: *Session, crypto_select: u32) Error![]u8 {
+pub fn buildResponderSync(allocator: std.mem.Allocator, session: *Keystreams, crypto_select: u32) Error![]u8 {
     return buildResponderSyncWithPad(allocator, session, crypto_select, 0);
 }
 
-pub fn buildResponderSyncWithPad(allocator: std.mem.Allocator, session: *Session, crypto_select: u32, pad_len: u16) Error![]u8 {
+pub fn buildResponderSyncWithPad(allocator: std.mem.Allocator, session: *Keystreams, crypto_select: u32, pad_len: u16) Error![]u8 {
     if (pad_len > max_pad) return error.MalformedEncryption;
     const plain_len = vc_len + 4 + 2 + pad_len;
     var plain = try allocator.alloc(u8, plain_len);
@@ -642,7 +643,7 @@ test "sync hash is at start of initiator step3" {
     const shared_a = a.shared().*;
     const shared_b = b.shared().*;
     try std.testing.expectEqualSlices(u8, &shared_a, &shared_b);
-    var ia_session = Session.derive(&shared_a, info_hash, true);
+    var ia_session = Keystreams.derive(&shared_a, info_hash, true);
     const step3 = try buildInitiatorSync(std.testing.allocator, &shared_a, info_hash, cryptoProvideForPolicy(.prefer), &ia_session);
     defer std.testing.allocator.free(step3);
     const sync_a = hashReq1(&shared_a);
@@ -665,7 +666,7 @@ test "initiator and responder sync round trip" {
     const info_hash: torrent.InfoHash = [_]u8{0xAB} ** 20;
     const shared_a = a.shared().*;
     const shared_b = b.shared().*;
-    var ia_session = Session.derive(&shared_a, info_hash, true);
+    var ia_session = Keystreams.derive(&shared_a, info_hash, true);
     const crypto_provide = cryptoProvideForPolicy(.prefer);
     const step3 = try buildInitiatorSync(std.testing.allocator, &shared_a, info_hash, crypto_provide, &ia_session);
     defer std.testing.allocator.free(step3);
@@ -680,7 +681,7 @@ test "initiator and responder sync round trip" {
     try recv.appendSlice(std.testing.allocator, step3);
     try recv.appendSlice(std.testing.allocator, &hs_scratch);
 
-    var b_session = Session.derive(&shared_b, info_hash, false);
+    var b_session = Keystreams.derive(&shared_b, info_hash, false);
     const parsed = try parseInitiatorSync(&b_session.decrypt, step3, &hs_scratch, &shared_b, info_hash);
     try std.testing.expectEqual(crypto_provide, parsed.crypto_provide);
 
@@ -710,8 +711,8 @@ test "findVerificationConstant skips PadB before PE4" {
     const shared = a.shared().*;
     const pad_lens = [_]usize{ 0, 1, 512 };
     for (pad_lens) |pad_b_len| {
-        var ia_session = Session.derive(&shared, info_hash, true);
-        var b_session = Session.derive(&shared, info_hash, false);
+        var ia_session = Keystreams.derive(&shared, info_hash, true);
+        var b_session = Keystreams.derive(&shared, info_hash, false);
         const step4 = try buildResponderSync(std.testing.allocator, &b_session, CryptoFlags.rc4);
         defer std.testing.allocator.free(step4);
 
@@ -741,7 +742,7 @@ test "findVerificationConstant returns null when VC absent" {
     defer b.deinit();
     try a.computeShared(std.testing.allocator, &b.local_public);
     const info_hash: torrent.InfoHash = [_]u8{0xEF} ** 20;
-    var ia_session = Session.derive(a.shared(), info_hash, true);
+    var ia_session = Keystreams.derive(a.shared(), info_hash, true);
     var junk: [64]u8 = undefined;
     @memset(&junk, 0x7E);
     try std.testing.expect(findVerificationConstant(&junk, &ia_session.decrypt, max_pad) == null);
@@ -757,8 +758,8 @@ test "parseResponderSync plaintext-within-mse uses cleartext handshake" {
 
     const info_hash: torrent.InfoHash = [_]u8{0x11} ** 20;
     const shared = a.shared().*;
-    var ia_session = Session.derive(&shared, info_hash, true);
-    var b_session = Session.derive(&shared, info_hash, false);
+    var ia_session = Keystreams.derive(&shared, info_hash, true);
+    var b_session = Keystreams.derive(&shared, info_hash, false);
     const step4 = try buildResponderSync(std.testing.allocator, &b_session, CryptoFlags.plaintext_within_mse);
     defer std.testing.allocator.free(step4);
 

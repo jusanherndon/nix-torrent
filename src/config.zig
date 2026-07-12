@@ -13,7 +13,7 @@ pub const Limits = struct {
     max_active_torrents: u64 = 20,
     max_peers_per_torrent: u64 = 50,
     max_peer_connect_attempts_per_tick: u64 = 5,
-    max_tracker_announces_per_tick: u64 = 1,
+    max_tracker_announces_per_tick: u64 = 4,
     max_in_progress_pieces_per_torrent: u64 = 4,
     max_in_flight_blocks_per_peer: u64 = 8,
 };
@@ -39,6 +39,9 @@ pub const Encryption = struct {
 pub const Network = struct {
     dht_base_port: u64 = 6881,
     peer_connect_timeout_ms: u64 = 10_000,
+    /// Wall-clock cap for outbound connect+handshake work in one engine tick.
+    /// Always allows at least one attempt; further attempts stop once elapsed time hits this budget.
+    peer_connect_batch_budget_ms: u64 = 15_000,
     peer_request_timeout_ms: u64 = 30_000,
     tracker_request_timeout_ms: u64 = 10_000,
     tracker_retry_min_ms: u64 = 30_000,
@@ -187,6 +190,8 @@ pub fn validateDaemon(cfg: Config) !void {
     if (cfg.engine.block_request_bytes == 0 or cfg.engine.block_request_bytes > cfg.limits.max_piece_bytes) return ConfigError.InvalidConfig;
     if (cfg.network.dht_base_port == 0 or cfg.network.dht_base_port > 65535) return ConfigError.InvalidConfig;
     if (cfg.network.dht_base_port + cfg.limits.max_active_torrents > 65535) return ConfigError.InvalidConfig;
+    if (cfg.network.peer_connect_timeout_ms == 0) return ConfigError.InvalidConfig;
+    if (cfg.network.peer_connect_batch_budget_ms == 0) return ConfigError.InvalidConfig;
     if (cfg.network.tracker_retry_min_ms > cfg.network.tracker_retry_max_ms) return ConfigError.InvalidConfig;
     if (!std.mem.eql(u8, cfg.logging.format, "json")) return ConfigError.InvalidConfig;
     if (log.parseLevel(cfg.logging.level) == null) return ConfigError.InvalidConfig;
@@ -269,6 +274,7 @@ fn parseNetwork(n: *Network, key: []const u8, value: []const u8) !void {
     }
     if (std.mem.eql(u8, key, "dht_base_port")) n.dht_base_port = v
     else if (std.mem.eql(u8, key, "peer_connect_timeout_ms")) n.peer_connect_timeout_ms = v
+    else if (std.mem.eql(u8, key, "peer_connect_batch_budget_ms")) n.peer_connect_batch_budget_ms = v
     else if (std.mem.eql(u8, key, "peer_request_timeout_ms")) n.peer_request_timeout_ms = v
     else if (std.mem.eql(u8, key, "tracker_request_timeout_ms")) n.tracker_request_timeout_ms = v
     else if (std.mem.eql(u8, key, "tracker_retry_min_ms")) n.tracker_retry_min_ms = v

@@ -1,3 +1,4 @@
+// Leaf types for Torrent Session. Split from session.zig so collaborators can import without a cycle against session.tick.
 const std = @import("std");
 const peer = @import("peer.zig");
 const storage = @import("storage.zig");
