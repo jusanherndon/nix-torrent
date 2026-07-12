@@ -65,6 +65,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const tcp_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tcp.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
     const tracker_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/tracker.zig"),
@@ -77,6 +86,15 @@ pub fn build(b: *std.Build) void {
     const peer_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/peer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
+    const peer_pool_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/peer_pool.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -165,8 +183,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(bencode_tests).step);
     test_step.dependOn(&b.addRunArtifact(torrent_tests).step);
     test_step.dependOn(&b.addRunArtifact(storage_tests).step);
+    test_step.dependOn(&b.addRunArtifact(tcp_tests).step);
     test_step.dependOn(&b.addRunArtifact(tracker_tests).step);
     test_step.dependOn(&b.addRunArtifact(peer_tests).step);
+    test_step.dependOn(&b.addRunArtifact(peer_pool_tests).step);
     test_step.dependOn(&b.addRunArtifact(engine_tests).step);
     test_step.dependOn(&b.addRunArtifact(piece_scheduler_tests).step);
     test_step.dependOn(&b.addRunArtifact(handoff_tests).step);

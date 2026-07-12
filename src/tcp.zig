@@ -155,19 +155,55 @@ fn extractHttpBody(allocator: std.mem.Allocator, raw: []const u8) ReadError![]u8
     const headers = raw[0..sep];
     const body = raw[header_end..];
     var content_length: ?usize = null;
+    var chunked = false;
     var lines = std.mem.splitScalar(u8, headers, '\n');
     while (lines.next()) |line| {
         const trimmed = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
-        if (std.mem.startsWith(u8, trimmed, "Content-Length:")) {
-            const val = std.mem.trim(u8, trimmed["Content-Length:".len..], " \t");
+        if (headerNameEquals(trimmed, "Content-Length")) {
+            const val = headerValue(trimmed);
             content_length = std.fmt.parseInt(usize, val, 10) catch return error.InvalidHttpResponse;
+        } else if (headerNameEquals(trimmed, "Transfer-Encoding")) {
+            const val = headerValue(trimmed);
+            if (std.ascii.indexOfIgnoreCase(val, "chunked") != null) chunked = true;
         }
     }
     if (content_length) |len| {
         if (body.len < len) return error.InvalidHttpResponse;
         return try allocator.dupe(u8, body[0..len]);
     }
+    if (chunked) return try decodeChunkedBody(allocator, body);
     return try allocator.dupe(u8, body);
+}
+
+fn headerNameEquals(line: []const u8, name: []const u8) bool {
+    if (line.len < name.len + 1) return false;
+    if (!std.ascii.eqlIgnoreCase(line[0..name.len], name)) return false;
+    return line[name.len] == ':';
+}
+
+fn headerValue(line: []const u8) []const u8 {
+    const colon = std.mem.indexOfScalar(u8, line, ':') orelse return "";
+    return std.mem.trim(u8, line[colon + 1 ..], " \t");
+}
+
+fn decodeChunkedBody(allocator: std.mem.Allocator, body: []const u8) ReadError![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var pos: usize = 0;
+    while (pos < body.len) {
+        const line_end = std.mem.indexOfPos(u8, body, pos, "\r\n") orelse return error.InvalidHttpResponse;
+        const size_line = body[pos..line_end];
+        const size_end = std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len;
+        const size = std.fmt.parseInt(usize, std.mem.trim(u8, size_line[0..size_end], " \t"), 16) catch return error.InvalidHttpResponse;
+        pos = line_end + 2;
+        if (size == 0) break;
+        if (pos + size + 2 > body.len) return error.InvalidHttpResponse;
+        try out.appendSlice(allocator, body[pos .. pos + size]);
+        pos += size;
+        if (!std.mem.startsWith(u8, body[pos..], "\r\n")) return error.InvalidHttpResponse;
+        pos += 2;
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn nowMs(io: std.Io) i64 {
@@ -193,4 +229,18 @@ test "extracts http body" {
     const body = try extractHttpBody(std.testing.allocator, raw);
     defer std.testing.allocator.free(body);
     try std.testing.expectEqualStrings("hello", body);
+}
+
+test "extracts chunked http body" {
+    const raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    const body = try extractHttpBody(std.testing.allocator, raw);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("hello", body);
+}
+
+test "extracts chunked tracker-style body" {
+    const raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3e\r\nd8:completei1e10:incompletei1e8:intervali1800e5:peers6:\x7f\x00\x00\x01\x1a\xe1e\r\n0\r\n\r\n";
+    const body = try extractHttpBody(std.testing.allocator, raw);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.startsWith(u8, body, "d8:complete"));
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 const bencode = @import("bencode.zig");
 const dns = @import("dns.zig");
 const encryption = @import("encryption.zig");
+const log = @import("log.zig");
 const tcp = @import("tcp.zig");
 const torrent = @import("torrent.zig");
 
@@ -158,7 +159,7 @@ pub fn announceGet(
     defer stream.close(io);
 
     var req_buf: [4096]u8 = undefined;
-    const req = try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.0\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{ request_path, parsed.host });
+    const req = try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{ request_path, parsed.host });
 
     var write_buffer: [4096]u8 = undefined;
     var writer = stream.writer(io, &write_buffer);
@@ -167,7 +168,17 @@ pub fn announceGet(
 
     const body = try tcp.readHttpResponse(io, stream.socket.handle, allocator, timeout_ms);
     defer allocator.free(body);
-    return parseAnnounceResponse(allocator, body);
+    return parseAnnounceResponse(allocator, body) catch |err| {
+        const preview_len = @min(body.len, 48);
+        log.debug("tracker", "HTTP announce parse failed for {s}:{d}: {s} (body_len={d}, prefix={s})", .{
+            parsed.host,
+            parsed.port,
+            @errorName(err),
+            body.len,
+            body[0..preview_len],
+        });
+        return err;
+    };
 }
 
 const udp_connect_magic: i64 = 0x0000041727101980;

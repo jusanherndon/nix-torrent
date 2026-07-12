@@ -302,6 +302,7 @@ fn tickSession(
 
     try tickTrackerAnnounces(engine, io, cfg, session, rec, peer_id, now_ms);
     if (dht_ctx) |ctx| try peer_pool.tickDht(engine.allocator, io, cfg, session, ctx, peer_id, now_ms, .content);
+    peer_pool.connectCandidateBatch(engine.allocator, io, cfg, session, peer_id, .content);
     try peer_pool.poll(io, cfg, session, engine.allocator);
     try peer_pool.maintain(engine.allocator, io, cfg, session);
     rec.verified_piece_count = try piece_scheduler.tick(engine.allocator, io, cfg, session, now_ms);
@@ -320,6 +321,7 @@ fn tickMetadataSession(
 ) !void {
     try tickTrackerAnnounces(engine, io, cfg, session, rec, peer_id, now_ms);
     if (dht_ctx) |ctx| try metadata_fetch.tickDht(engine.allocator, io, cfg, session, ctx, peer_id, now_ms);
+    peer_pool.connectCandidateBatch(engine.allocator, io, cfg, session, peer_id, .metadata);
     try metadata_fetch.tick(engine.allocator, io, cfg, session, rec, dht_ctx);
     try engine.persistTorrentState(io, cfg.staging_area, rec, session);
 }
@@ -333,17 +335,21 @@ fn tickTrackerAnnounces(
     peer_id: [20]u8,
     now_ms: i64,
 ) !void {
+    const max_announces = @as(usize, @intCast(cfg.limits.max_tracker_announces_per_tick));
+    var announced: usize = 0;
     for (session.trackers.items) |*endpoint| {
         if (endpoint.parsed.scheme != .udp) continue;
-        if (endpoint.state.due(now_ms)) {
-            try announceTrackerEndpoint(engine, io, cfg, session, rec, endpoint, peer_id, now_ms);
-        }
+        if (!endpoint.state.due(now_ms)) continue;
+        try announceTrackerEndpoint(engine, io, cfg, session, rec, endpoint, peer_id, now_ms);
+        announced += 1;
+        if (announced >= max_announces) return;
     }
     for (session.trackers.items) |*endpoint| {
         if (endpoint.parsed.scheme != .http) continue;
-        if (endpoint.state.due(now_ms)) {
-            try announceTrackerEndpoint(engine, io, cfg, session, rec, endpoint, peer_id, now_ms);
-        }
+        if (!endpoint.state.due(now_ms)) continue;
+        try announceTrackerEndpoint(engine, io, cfg, session, rec, endpoint, peer_id, now_ms);
+        announced += 1;
+        if (announced >= max_announces) return;
     }
 }
 

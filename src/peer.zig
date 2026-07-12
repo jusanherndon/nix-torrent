@@ -195,6 +195,8 @@ pub const Connection = struct {
     }
 
     fn readDhResponse(self: *Connection, io: std.Io, buf: []u8) !usize {
+        // Read at least Yb (96). Do not block waiting for more PadB — that delays PE3.
+        // Any PadB that arrived in the same read is returned to the caller for PE4 VC sync.
         var total: usize = 0;
         while (total < 96) {
             const n = try self.readStreamSlice(io, buf[total..]);
@@ -202,15 +204,7 @@ pub const Connection = struct {
             total += n;
             if (buf[0] == 19) return total;
         }
-        while (total < encryption.max_dh_packet_len) {
-            const n = self.readStreamSlice(io, buf[total..encryption.max_dh_packet_len]) catch |err| switch (err) {
-                error.Timeout => break,
-                else => return err,
-            };
-            if (n == 0) break;
-            total += n;
-        }
-        return 96;
+        return total;
     }
 
     fn tryEncryptedHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8, policy: encryption.Policy, extensions: bool) !bool {
@@ -235,35 +229,69 @@ pub const Connection = struct {
         var ia_session = encryption.Session.derive(&shared, info_hash, true);
         const pe3 = try encryption.buildInitiatorSync(self.allocator, &shared, info_hash, crypto_provide, &ia_session);
         defer self.allocator.free(pe3);
-        try self.sendRawPlain(io, pe3);
 
         var hs_out: [encryption.handshake_len]u8 = undefined;
         encodeHandshake(&hs_out, info_hash, peer_id, extensions);
         var hs_scratch = hs_out;
         ia_session.encrypt.crypt(&hs_scratch);
-        try self.sendRawPlain(io, &hs_scratch);
 
-        var pe4_buf: [encryption.max_dh_packet_len]u8 = undefined;
+        // Send sync + IA in one write so peers that read greedily see a complete PE3.
+        const pe3_ia = try self.allocator.alloc(u8, pe3.len + hs_scratch.len);
+        defer self.allocator.free(pe3_ia);
+        @memcpy(pe3_ia[0..pe3.len], pe3);
+        @memcpy(pe3_ia[pe3.len..], &hs_scratch);
+        try self.sendRawPlain(io, pe3_ia);
+
+        // Sync past leftover PadB to PE4 (ENCRYPT(VC...)). Seed with PadB already read with Yb.
+        var pe4_buf: [encryption.pe4_sync_buf_len]u8 = undefined;
         var pe4_len: usize = 0;
-        while (pe4_len < 14) {
-            const n = try self.readStreamSlice(io, pe4_buf[pe4_len..14]);
+        if (pe2_len > 96) {
+            const seed = @min(pe2_len - 96, pe4_buf.len);
+            @memcpy(pe4_buf[0..seed], pe2_buf[96 .. 96 + seed]);
+            pe4_len = seed;
+        }
+        const search_limit = encryption.max_pad + encryption.vc_len;
+        const vc_off = blk: {
+            while (true) {
+                if (pe4_len >= encryption.vc_len) {
+                    if (encryption.findVerificationConstant(pe4_buf[0..pe4_len], &ia_session.decrypt, encryption.max_pad)) |off| {
+                        break :blk off;
+                    }
+                }
+                if (pe4_len >= search_limit) return error.MalformedEncryption;
+                const n = try self.readStreamSlice(io, pe4_buf[pe4_len..search_limit]);
+                if (n == 0) return error.MalformedEncryption;
+                pe4_len += n;
+            }
+        };
+        const header_end = vc_off + encryption.vc_len + 6;
+        while (pe4_len < header_end) {
+            const n = try self.readStreamSlice(io, pe4_buf[pe4_len..header_end]);
             if (n == 0) return error.MalformedEncryption;
             pe4_len += n;
         }
-        const pe4_total = try encryption.responderFrameTotalLen(pe4_buf[0..pe4_len], &ia_session.decrypt);
-        while (pe4_len < pe4_total) {
-            const n = try self.readStreamSlice(io, pe4_buf[pe4_len..pe4_total]);
+        const pe4_total = try encryption.responderFrameTotalLen(pe4_buf[vc_off..header_end], &ia_session.decrypt);
+        const frame_end = vc_off + pe4_total;
+        if (frame_end > pe4_buf.len) return error.MalformedEncryption;
+        while (pe4_len < frame_end) {
+            const n = try self.readStreamSlice(io, pe4_buf[pe4_len..frame_end]);
             if (n == 0) return error.MalformedEncryption;
             pe4_len += n;
         }
         var hs_enc: [encryption.handshake_len]u8 = undefined;
         var hs_got: usize = 0;
+        const leftover = pe4_len - frame_end;
+        if (leftover > 0) {
+            const take = @min(leftover, hs_enc.len);
+            @memcpy(hs_enc[0..take], pe4_buf[frame_end .. frame_end + take]);
+            hs_got = take;
+        }
         while (hs_got < hs_enc.len) {
             const n = try self.readStreamSlice(io, hs_enc[hs_got..]);
             if (n == 0) return error.MalformedEncryption;
             hs_got += n;
         }
-        const parsed = try encryption.parseResponderSync(&ia_session.decrypt, pe4_buf[0..pe4_len], &hs_enc, crypto_provide, policy);
+        const parsed = try encryption.parseResponderSync(&ia_session.decrypt, pe4_buf[vc_off..frame_end], &hs_enc, crypto_provide, policy);
         const scheme = parsed.scheme;
         self.encryption_mode = encryption.modeForScheme(scheme);
         if (scheme == .rc4) {

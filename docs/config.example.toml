@@ -51,6 +51,9 @@ max_peers_per_torrent = 50
 # Maximum outbound peer handshake attempts per engine tick (per tracker/DHT batch).
 max_peer_connect_attempts_per_tick = 5
 
+# Maximum tracker announce attempts per engine tick (spreads multi-tracker magnets across ticks).
+max_tracker_announces_per_tick = 1
+
 # Maximum in-progress pieces per torrent.
 max_in_progress_pieces_per_torrent = 4
 

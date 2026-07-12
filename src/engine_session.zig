@@ -62,6 +62,9 @@ pub const TorrentSession = struct {
     dht_socket: ?dht.TorrentDhtSocket = null,
     peers: std.ArrayList(peer.Connection),
     metadata_peers: std.ArrayList(peer.Connection),
+    /// Deduplicated peer candidates from trackers and DHT (V2_NETWORK_PLAN).
+    peer_candidates: std.ArrayList(tracker.Peer) = .empty,
+    peer_candidate_cursor: usize = 0,
     metadata_chunks: std.AutoHashMap(u32, []u8),
     metadata_size: ?usize = null,
     metadata_next_request: u32 = 0,
@@ -73,6 +76,7 @@ pub const TorrentSession = struct {
         self.peers.deinit(allocator);
         for (self.metadata_peers.items) |*p| p.deinit(io);
         self.metadata_peers.deinit(allocator);
+        self.peer_candidates.deinit(allocator);
         var chunk_it = self.metadata_chunks.iterator();
         while (chunk_it.next()) |entry| allocator.free(entry.value_ptr.*);
         self.metadata_chunks.deinit();

@@ -23,9 +23,11 @@ pub const max_dh_packet_len = 608;
 pub const handshake_len = 68;
 
 const dh_key_len = 96;
-const vc_len = 8;
-const max_pad = 512;
+pub const vc_len = 8;
+pub const max_pad = 512;
 const max_dh_packet = max_dh_packet_len;
+/// Buffer large enough for leftover PadB + full PE4 frame (VC/header/PadD).
+pub const pe4_sync_buf_len = max_pad + vc_len + 6 + max_pad;
 const rc4_discard = 1024;
 
 fn bitIsSet(n: *const Managed, bit: usize) bool {
@@ -288,8 +290,9 @@ pub fn selectScheme(crypto_provide: u32, policy: Policy) ?Scheme {
 }
 
 pub fn validateCryptoSelect(crypto_select: u32, crypto_provide: u32) Error!Scheme {
+    // Ignore undefined high bits — some peers set reserved flags. Require exactly one known scheme.
     const known = crypto_select & (CryptoFlags.plaintext_within_mse | CryptoFlags.rc4);
-    if (known == 0 or known != crypto_select) return error.MalformedEncryption;
+    if (known == 0) return error.MalformedEncryption;
     if (@popCount(known) != 1) return error.MalformedEncryption;
     if (known & crypto_provide == 0) return error.MalformedEncryption;
     return @enumFromInt(known);
@@ -471,16 +474,17 @@ pub fn parseResponderSync(
         decrypt.crypt(pad_buf[0..pad_len]);
     }
     cursor += pad_len;
-    if (remote_handshake_enc.len != handshake_len) return error.MalformedEncryption;
-    var hs: [handshake_len]u8 = undefined;
-    @memcpy(&hs, remote_handshake_enc);
-    decrypt.crypt(&hs);
     const scheme = validateCryptoSelect(crypto_select, crypto_provide) catch |err| switch (err) {
         error.MalformedEncryption => return err,
         else => return error.MalformedEncryption,
     };
     if (selectScheme(crypto_provide, policy) == null) return error.UnsupportedEncryption;
     if (policy == .require and scheme != .rc4) return error.UnsupportedEncryption;
+    if (remote_handshake_enc.len != handshake_len) return error.MalformedEncryption;
+    var hs: [handshake_len]u8 = undefined;
+    @memcpy(&hs, remote_handshake_enc);
+    // Plaintext-within-MSE (0x01): payload after PE4 is cleartext. RC4 (0x02): continue keystream.
+    if (scheme == .rc4) decrypt.crypt(&hs);
     return .{ .scheme = scheme, .remote_handshake = hs };
 }
 
@@ -601,6 +605,8 @@ test "validate crypto select rejects invalid values" {
     try std.testing.expectError(error.MalformedEncryption, validateCryptoSelect(CryptoFlags.rc4 | CryptoFlags.plaintext_within_mse, CryptoFlags.rc4 | CryptoFlags.plaintext_within_mse));
     try std.testing.expectError(error.MalformedEncryption, validateCryptoSelect(CryptoFlags.rc4, CryptoFlags.plaintext_within_mse));
     try std.testing.expectEqual(Scheme.rc4, try validateCryptoSelect(CryptoFlags.rc4, CryptoFlags.rc4));
+    // Reserved high bits are ignored when exactly one known scheme bit is set.
+    try std.testing.expectEqual(Scheme.rc4, try validateCryptoSelect(CryptoFlags.rc4 | 0x8000_0000, CryptoFlags.rc4 | CryptoFlags.plaintext_within_mse));
 }
 
 test "select scheme prefers rc4 under prefer policy" {
@@ -689,5 +695,82 @@ test "initiator and responder sync round trip" {
 
     const resp_parsed = try parseResponderSync(&ia_session.decrypt, step4, &hs_in_scratch, crypto_provide, .prefer);
     try std.testing.expectEqual(Scheme.rc4, resp_parsed.scheme);
+    try std.testing.expectEqual(@as(u8, 0x24), resp_parsed.remote_handshake[0]);
+}
+
+test "findVerificationConstant skips PadB before PE4" {
+    var a = try DhKeyExchange.generate(std.testing.allocator);
+    defer a.deinit();
+    var b = try DhKeyExchange.generate(std.testing.allocator);
+    defer b.deinit();
+    try a.computeShared(std.testing.allocator, &b.local_public);
+    try b.computeShared(std.testing.allocator, &a.local_public);
+
+    const info_hash: torrent.InfoHash = [_]u8{0xCD} ** 20;
+    const shared = a.shared().*;
+    const pad_lens = [_]usize{ 0, 1, 512 };
+    for (pad_lens) |pad_b_len| {
+        var ia_session = Session.derive(&shared, info_hash, true);
+        var b_session = Session.derive(&shared, info_hash, false);
+        const step4 = try buildResponderSync(std.testing.allocator, &b_session, CryptoFlags.rc4);
+        defer std.testing.allocator.free(step4);
+
+        var haystack: [max_pad + 64]u8 = undefined;
+        @memset(haystack[0..pad_b_len], 0xAA);
+        @memcpy(haystack[pad_b_len .. pad_b_len + step4.len], step4);
+        const total = pad_b_len + step4.len;
+        const off = findVerificationConstant(haystack[0..total], &ia_session.decrypt, max_pad);
+        try std.testing.expect(off != null);
+        try std.testing.expectEqual(pad_b_len, off.?);
+
+        var hs: [handshake_len]u8 = undefined;
+        @memset(&hs, 0x55);
+        var hs_enc = hs;
+        b_session.encrypt.crypt(&hs_enc);
+
+        const parsed = try parseResponderSync(&ia_session.decrypt, haystack[off.? .. off.? + step4.len], &hs_enc, CryptoFlags.rc4, .prefer);
+        try std.testing.expectEqual(Scheme.rc4, parsed.scheme);
+        try std.testing.expectEqual(@as(u8, 0x55), parsed.remote_handshake[0]);
+    }
+}
+
+test "findVerificationConstant returns null when VC absent" {
+    var a = try DhKeyExchange.generate(std.testing.allocator);
+    defer a.deinit();
+    var b = try DhKeyExchange.generate(std.testing.allocator);
+    defer b.deinit();
+    try a.computeShared(std.testing.allocator, &b.local_public);
+    const info_hash: torrent.InfoHash = [_]u8{0xEF} ** 20;
+    var ia_session = Session.derive(a.shared(), info_hash, true);
+    var junk: [64]u8 = undefined;
+    @memset(&junk, 0x7E);
+    try std.testing.expect(findVerificationConstant(&junk, &ia_session.decrypt, max_pad) == null);
+}
+
+test "parseResponderSync plaintext-within-mse uses cleartext handshake" {
+    var a = try DhKeyExchange.generate(std.testing.allocator);
+    defer a.deinit();
+    var b = try DhKeyExchange.generate(std.testing.allocator);
+    defer b.deinit();
+    try a.computeShared(std.testing.allocator, &b.local_public);
+    try b.computeShared(std.testing.allocator, &a.local_public);
+
+    const info_hash: torrent.InfoHash = [_]u8{0x11} ** 20;
+    const shared = a.shared().*;
+    var ia_session = Session.derive(&shared, info_hash, true);
+    var b_session = Session.derive(&shared, info_hash, false);
+    const step4 = try buildResponderSync(std.testing.allocator, &b_session, CryptoFlags.plaintext_within_mse);
+    defer std.testing.allocator.free(step4);
+
+    var hs_in: [handshake_len]u8 = undefined;
+    @memset(&hs_in, 0x24);
+    const resp_parsed = try parseResponderSync(
+        &ia_session.decrypt,
+        step4,
+        &hs_in,
+        CryptoFlags.plaintext_within_mse,
+        .prefer,
+    );
+    try std.testing.expectEqual(Scheme.plaintext_within_mse, resp_parsed.scheme);
     try std.testing.expectEqual(@as(u8, 0x24), resp_parsed.remote_handshake[0]);
 }

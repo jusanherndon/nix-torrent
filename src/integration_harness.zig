@@ -377,9 +377,8 @@ fn serveMseContentPeerFd(allocator: std.mem.Allocator, fd: c.fd_t, scheme: MseSc
     try dh.computeShared(allocator, &remote_pub);
     const shared = dh.shared().*;
 
-    const pe2 = try encryption.buildDhOutgoing(allocator, &dh.local_public);
-    defer allocator.free(pe2);
-    try writeAllFd(fd, pe2);
+    // Send Yb only; leave PadB until after PE3 so the initiator must sync on ENCRYPT(VC).
+    try writeAllFd(fd, dh.local_public[0..]);
 
     var frame_buf: [128]u8 = undefined;
     var frame_len: usize = 0;
@@ -400,15 +399,22 @@ fn serveMseContentPeerFd(allocator: std.mem.Allocator, fd: c.fd_t, scheme: MseSc
         .both => encryption.CryptoFlags.rc4 | encryption.CryptoFlags.plaintext_within_mse,
     };
     const selected = encryption.responderSelectScheme(parsed.crypto_provide, offered) orelse return error.UnsupportedEncryption;
+    var pad_b: [32]u8 = undefined;
+    @memset(&pad_b, 0xAB);
+    try writeAllFd(fd, &pad_b);
     const pe4 = try encryption.buildResponderSync(allocator, &session, @intFromEnum(selected));
     defer allocator.free(pe4);
     try writeAllFd(fd, pe4);
 
     var hs_out: [encryption.handshake_len]u8 = undefined;
     peer.encodeHandshake(&hs_out, info_hash, [_]u8{0x2A} ** 20, false);
-    var hs_scratch = hs_out;
-    session.encrypt.crypt(&hs_scratch);
-    try writeAllFd(fd, &hs_scratch);
+    if (selected == .rc4) {
+        var hs_scratch = hs_out;
+        session.encrypt.crypt(&hs_scratch);
+        try writeAllFd(fd, &hs_scratch);
+    } else {
+        try writeAllFd(fd, &hs_out);
+    }
 
     const bitfield_len = (piece_count + 7) / 8;
     const bitfield = try allocator.alloc(u8, bitfield_len);

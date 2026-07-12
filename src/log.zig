@@ -84,6 +84,11 @@ pub fn err(comptime component: []const u8, comptime fmt: []const u8, args: anyty
     if (current()) |logger| logger.logFmt(.err, component, fmt, args);
 }
 
+/// Flushes the active log writer so mid-tick debug lines reach stderr promptly.
+pub fn flush() void {
+    if (current()) |logger| logger.writer.flush() catch {};
+}
+
 pub fn event(writer: anytype, level: Level, component: []const u8, message: []const u8) !void {
     try writer.writeAll("{\"level\":");
     try jsonString(writer, level.label());
