@@ -6,27 +6,18 @@ The intended shape is a long-running daemon (`torrentd`) controlled by a CLI (`t
 
 ## Current status
 
-Implemented so far:
+Working today:
 
-- Zig package with daemon and CLI executables
-- TOML configuration loading with XDG default path and built-in fallbacks
-- Staging area and final destination directory preparation in the daemon
-- JSON-line structured startup logs
-- Unix-domain-socket control transport between `torrent` and `torrentd`
-- Structured JSON request/response protocol with typed errors
-- Daemon lock and safe stale socket replacement
-- Stable daemon peer ID persisted under the staging area
-- In-memory active torrent registry loaded from per-torrent JSON state
-- Completion history read from/written to daemon-owned `history.json` and surfaced through `list`/`show`
-- `torrent add/list/show/pause/resume/remove/status` control commands
-- Torrent metadata persistence under `<staging>/<info-hash>/metadata.torrent`
-- Storage path safety validation before accepting a torrent
-- Bencode parser for integers, byte strings, lists, and dictionaries
-- `.torrent` metadata parser with raw `info` dictionary SHA-1 info-hash calculation
-- Validation for v1 single-file and multi-file torrent metadata
-- Small fixture torrents covered by unit tests
+- Daemon + CLI over a Unix-domain JSON-line control protocol
+- TOML configuration (`--config`, XDG path, built-in defaults)
+- Staging area, final destination, handoff, and completion history
+- Add `.torrent` or magnet; pause / resume / remove / list / show / status
+- HTTP and UDP trackers, DHT `get_peers`, outbound TCP peers
+- MSE encryption policies (`disable` / `prefer` / `require`)
+- Magnet metadata via `ut_metadata`; piece download, verify, and staging writes
+- Unit and local integration tests with fake trackers/peers
 
-Tracker HTTP I/O, peer TCP I/O, download-engine integration, and handoff are not implemented yet.
+Next work is tracked in [`docs/V3_PLAN.md`](docs/V3_PLAN.md) (IPv6, inbound listen without seeding, DHT announce, PEX/LSD, HTTPS/`announce-list`, control-plane responsiveness).
 
 ## Build
 
@@ -45,7 +36,7 @@ nix develop
 
 ## Configuration
 
-v2 configuration is TOML-based. Both executables accept `--config /path/to/config.toml`; otherwise they try `$XDG_CONFIG_HOME/nix-torrent/config.toml` and fall back to built-in defaults.
+Both executables accept `--config /path/to/config.toml`; otherwise they try `$XDG_CONFIG_HOME/nix-torrent/config.toml` and fall back to built-in defaults. See [`docs/config.example.toml`](docs/config.example.toml).
 
 ```sh
 torrentd --config /tmp/nix-torrent/config.toml
@@ -53,17 +44,7 @@ torrent --config /tmp/nix-torrent/config.toml list
 torrentd --validate-config
 ```
 
-Legacy v1 path flags and `NIX_TORRENT_*` environment variables are ignored.
-
-## Torrent metadata support
-
-Milestone 2 code lives in:
-
-- `src/bencode.zig`
-- `src/torrent.zig`
-- `src/fixtures/*.torrent`
-
-Run metadata and skeleton tests with:
+## Tests
 
 ```sh
 zig build test
@@ -73,6 +54,7 @@ zig build test
 
 ```sh
 torrent add file.torrent
+torrent add 'magnet:?xt=urn:btih:...'
 torrent list
 torrent show <info-hash>
 torrent pause <info-hash>
