@@ -87,6 +87,7 @@ pub fn announceEvent(
             left,
             event,
             config.encryptionPolicy(world.cfg.network),
+            world.cfg.network.tracker_ca_file,
             world.cfg.network.tracker_request_timeout_ms,
             world.now_ms,
         ) catch continue;
@@ -123,6 +124,8 @@ pub fn tick(session: *TorrentSession, world: World, rec: *state.TorrentRecord) !
     peer_pool.connectCandidateBatch(world.allocator, world.io, world.cfg, session, world.peer_id, .content);
     try peer_pool.poll(world.io, world.cfg, session, world.allocator);
     try peer_pool.maintain(world.allocator, world.io, world.cfg, session);
+    if (world.cfg.network.pex.enabled and !rec.private_torrent)
+        peer_pool.emitPex(world.allocator, world.io, session, world.now_ms);
     rec.verified_piece_count = try piece_scheduler.tick(world.allocator, world.io, world.cfg, session, world.now_ms);
     projectToRecord(world.allocator, rec, session);
     return .continued;
@@ -135,23 +138,82 @@ fn tickMetadata(session: *TorrentSession, world: World, rec: *state.TorrentRecor
     try metadata_fetch.tick(world.allocator, world.io, world.cfg, session, rec, world.dht);
 }
 
+/// Tracker announce scheduler. After metadata exists, BEP 12 prefer-working
+/// applies (one due tracker per tick at the cursor). While fetching magnet
+/// metadata, announce every due tracker up to `max_tracker_announces_per_tick`
+/// so peer diversity is not stuck behind a single long interval.
 fn tickTrackerAnnounces(session: *TorrentSession, world: World, rec: *state.TorrentRecord) !void {
-    const max_announces = @as(usize, @intCast(world.cfg.limits.max_tracker_announces_per_tick));
+    const trs = session.trackers.items;
+    if (trs.len == 0) return;
+    if (session.tracker_cursor >= trs.len) session.tracker_cursor = 0;
+
+    if (session.fetching_metadata) {
+        try tickMetadataTrackerAnnounces(session, world, rec);
+        return;
+    }
+
+    const idx = session.tracker_cursor;
+    const endpoint = &trs[idx];
+    if (!endpoint.state.due(world.now_ms)) return;
+
+    const ok = try announceTrackerEndpoint(session, world, rec, endpoint);
+    if (!ok) {
+        // One retry on the same URL after scheduleFailure's backoff, then fail over.
+        if (endpoint.state.consecutive_failures < 2) return;
+        if (endpoint.state.started_sent) {
+            sendStoppedBestEffort(session, world, rec, endpoint);
+            endpoint.state.started_sent = false;
+        }
+        endpoint.state.consecutive_failures = 0;
+        session.tracker_cursor = (idx + 1) % trs.len;
+    }
+}
+
+fn tickMetadataTrackerAnnounces(session: *TorrentSession, world: World, rec: *state.TorrentRecord) !void {
+    const trs = session.trackers.items;
+    const max = @as(usize, @intCast(world.cfg.limits.max_tracker_announces_per_tick));
     var announced: usize = 0;
-    for (session.trackers.items) |*endpoint| {
-        if (endpoint.parsed.scheme != .udp) continue;
+    var examined: usize = 0;
+    while (examined < trs.len and announced < max) : (examined += 1) {
+        const idx = (session.tracker_cursor + examined) % trs.len;
+        const endpoint = &trs[idx];
         if (!endpoint.state.due(world.now_ms)) continue;
-        try announceTrackerEndpoint(session, world, rec, endpoint);
+        const ok = try announceTrackerEndpoint(session, world, rec, endpoint);
         announced += 1;
-        if (announced >= max_announces) return;
+        if (ok) {
+            // Prefer a working tracker as the content-phase cursor once metadata completes.
+            session.tracker_cursor = idx;
+        } else if (endpoint.state.consecutive_failures >= 2) {
+            if (endpoint.state.started_sent) {
+                sendStoppedBestEffort(session, world, rec, endpoint);
+                endpoint.state.started_sent = false;
+            }
+            endpoint.state.consecutive_failures = 0;
+        }
     }
-    for (session.trackers.items) |*endpoint| {
-        if (endpoint.parsed.scheme != .http) continue;
-        if (!endpoint.state.due(world.now_ms)) continue;
-        try announceTrackerEndpoint(session, world, rec, endpoint);
-        announced += 1;
-        if (announced >= max_announces) return;
-    }
+}
+
+fn sendStoppedBestEffort(session: *TorrentSession, world: World, rec: *state.TorrentRecord, endpoint: *TrackerEndpoint) void {
+    const left = leftBytes(session, rec);
+    const downloaded = if (session.fetching_metadata) @as(u64, 0) else rec.total_bytes - left;
+    const response = tracker.announce(
+        world.io,
+        world.allocator,
+        endpoint.parsed,
+        &endpoint.udp,
+        session.info_hash,
+        world.peer_id,
+        session.announce_port,
+        0,
+        downloaded,
+        left,
+        .stopped,
+        config.encryptionPolicy(world.cfg.network),
+        world.cfg.network.tracker_ca_file,
+        world.cfg.network.tracker_request_timeout_ms,
+        world.now_ms,
+    ) catch return;
+    response.deinit(world.allocator);
 }
 
 fn announceTrackerEndpoint(
@@ -159,11 +221,11 @@ fn announceTrackerEndpoint(
     world: World,
     rec: *state.TorrentRecord,
     endpoint: *TrackerEndpoint,
-) !void {
+) !bool {
     const left = leftBytes(session, rec);
     const event: tracker.Event = if (!endpoint.state.started_sent) .started else .none;
     const downloaded = if (session.fetching_metadata) @as(u64, 0) else rec.total_bytes - left;
-    log.debug("session", "announcing to {s} ({s})", .{ endpoint.raw_url, endpoint.parsed.host });
+    log.debug("session", "announcing to tier {d} tracker {s} ({s})", .{ endpoint.tier, endpoint.raw_url, endpoint.parsed.host });
     const enc_policy = config.encryptionPolicy(world.cfg.network);
     const response = tracker.announce(
         world.io,
@@ -178,6 +240,7 @@ fn announceTrackerEndpoint(
         left,
         event,
         enc_policy,
+        world.cfg.network.tracker_ca_file,
         world.cfg.network.tracker_request_timeout_ms,
         world.now_ms,
     ) catch |announce_err| {
@@ -185,13 +248,13 @@ fn announceTrackerEndpoint(
         defer world.allocator.free(msg);
         log.debug("session", "tracker announce failed for {s} ({s}): {s}", .{ endpoint.raw_url, endpoint.parsed.host, @errorName(announce_err) });
         try endpoint.state.scheduleFailure(world.now_ms, msg, world.allocator);
-        return;
+        return false;
     };
     defer response.deinit(world.allocator);
     if (response.failure_reason) |reason| {
         log.debug("session", "tracker rejected announce for {s}: {s}", .{ endpoint.raw_url, reason });
         try endpoint.state.scheduleFailure(world.now_ms, reason, world.allocator);
-        return;
+        return false;
     }
     if (endpoint.state.last_error) |old| world.allocator.free(old);
     endpoint.state.last_error = null;
@@ -205,6 +268,7 @@ fn announceTrackerEndpoint(
     } else {
         peer_pool.connectContentBatch(world.allocator, world.io, world.cfg, session, sorted_peers, world.peer_id);
     }
+    return true;
 }
 
 test "projectToRecord copies live session fields onto torrent record" {

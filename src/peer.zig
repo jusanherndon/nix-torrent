@@ -1,9 +1,11 @@
 const std = @import("std");
+const address = @import("address.zig");
 const tcp = @import("tcp.zig");
 const torrent = @import("torrent.zig");
 const encryption = @import("encryption.zig");
 const mse = @import("mse.zig");
 const bencode = @import("bencode.zig");
+const pex = @import("pex.zig");
 
 const net = std.Io.net;
 
@@ -67,11 +69,13 @@ pub const PeerState = struct {
     }
 };
 
+pub const Direction = enum { outbound, inbound };
+
 pub const Connection = struct {
     allocator: std.mem.Allocator,
     stream: net.Stream,
-    peer_ip: [4]u8,
-    peer_port: u16,
+    peer_addr: address.Address,
+    direction: Direction = .outbound,
     state: PeerState,
     recv_buffer: std.ArrayList(u8),
     message_slices: std.ArrayList([]const u8) = .empty,
@@ -80,6 +84,9 @@ pub const Connection = struct {
     encryption_mode: encryption.Mode = .plaintext,
     crypto: ?encryption.Keystreams = null,
     ut_metadata_id: ?u8 = null,
+    /// The `ut_pex` extension id advertised by the peer in its LTEP handshake
+    /// (BEP 11). Non-null only once the peer's handshake has been observed.
+    peer_ut_pex_id: ?u8 = null,
     metadata_size: ?usize = null,
     read_scratch: [4096]u8 = undefined,
     read_timeout_ms: u64 = 30_000,
@@ -109,12 +116,29 @@ pub const Connection = struct {
     };
 
     pub fn connect(io: std.Io, allocator: std.mem.Allocator, ip: [4]u8, port: u16, connect_timeout_ms: u64, read_timeout_ms: u64) !Connection {
-        const stream = try tcp.connectStream(io, ip, port, connect_timeout_ms);
+        return connectAddr(io, allocator, address.Address.v4(ip, port), connect_timeout_ms, read_timeout_ms);
+    }
+
+    pub fn connectAddr(io: std.Io, allocator: std.mem.Allocator, addr: address.Address, connect_timeout_ms: u64, read_timeout_ms: u64) !Connection {
+        const stream = try tcp.connectStreamAddr(io, addr, connect_timeout_ms);
         return .{
             .allocator = allocator,
             .stream = stream,
-            .peer_ip = ip,
-            .peer_port = port,
+            .peer_addr = addr,
+            .direction = .outbound,
+            .state = .{},
+            .recv_buffer = .empty,
+            .read_timeout_ms = read_timeout_ms,
+        };
+    }
+
+    /// Wraps an already-accepted inbound TCP stream (Listen Socket path).
+    pub fn fromStream(allocator: std.mem.Allocator, stream: net.Stream, addr: address.Address, read_timeout_ms: u64) Connection {
+        return .{
+            .allocator = allocator,
+            .stream = stream,
+            .peer_addr = addr,
+            .direction = .inbound,
             .state = .{},
             .recv_buffer = .empty,
             .read_timeout_ms = read_timeout_ms,
@@ -228,11 +252,72 @@ pub const Connection = struct {
 
     pub fn performMetadataHandshake(self: *Connection, io: std.Io, info_hash: torrent.InfoHash, peer_id: [20]u8, policy: encryption.Policy) !void {
         try self.performHandshake(io, info_hash, peer_id, policy, true);
+        try self.negotiateMetadataAfterHandshake(io);
+    }
+
+    /// Inbound Listen Socket handshake. Probes `candidates` and returns the matched
+    /// info hash, using MSE responder under prefer/require and plaintext under disable.
+    pub fn performInboundHandshake(
+        self: *Connection,
+        io: std.Io,
+        candidates: []const torrent.InfoHash,
+        peer_id: [20]u8,
+        policy: encryption.Policy,
+    ) !torrent.InfoHash {
+        switch (policy) {
+            .disable => return self.plaintextInboundHandshake(io, candidates, peer_id),
+            .prefer, .require => {
+                var bridge = MseBridge{ .conn = self, .io = io };
+                const offered = encryption.cryptoProvideForPolicy(policy);
+                var match = mse.establishResponderMulti(self.allocator, bridge.stream(), candidates, peer_id, offered) catch {
+                    return error.InboundHandshakeFailed;
+                };
+                defer match.established.deinit(self.allocator);
+                self.encryption_mode = match.established.mode;
+                self.crypto = match.established.crypto;
+                if (match.established.leftover.len > 0) {
+                    try self.recv_buffer.appendSlice(self.allocator, match.established.leftover);
+                }
+                self.handshake_done = true;
+                return match.info_hash;
+            },
+        }
+    }
+
+    fn plaintextInboundHandshake(self: *Connection, io: std.Io, candidates: []const torrent.InfoHash, peer_id: [20]u8) !torrent.InfoHash {
+        while (self.recv_buffer.items.len < 68) {
+            var buf: [4096]u8 = undefined;
+            const n = try self.readStreamSlice(io, &buf);
+            if (n == 0) return error.InboundHandshakeFailed;
+            try self.recv_buffer.appendSlice(self.allocator, buf[0..n]);
+        }
+        var in: [68]u8 = undefined;
+        @memcpy(&in, self.recv_buffer.items[0..68]);
+        const decoded = decodeHandshake(&in) catch return error.InboundHandshakeFailed;
+        const matched: torrent.InfoHash = blk: {
+            for (candidates) |candidate| {
+                if (std.mem.eql(u8, &decoded.info_hash, &candidate)) break :blk candidate;
+            }
+            return error.InboundInfoHashUnknown;
+        };
+        try self.recv_buffer.replaceRange(self.allocator, 0, 68, &.{});
+        var out: [68]u8 = undefined;
+        encodeHandshake(&out, matched, peer_id, true);
+        try self.sendRawPlain(io, &out);
+        self.encryption_mode = .plaintext;
+        self.handshake_done = true;
+        return matched;
+    }
+
+    /// Offer ut_metadata after a completed BT handshake and learn the peer's ut_metadata id.
+    pub fn negotiateMetadataAfterHandshake(self: *Connection, io: std.Io) !void {
         // Offer ut_metadata first so peers that wait on our handshake do not deadlock.
         const ext = try encodeExtendedHandshake(self.allocator, 1);
         defer self.allocator.free(ext);
         try self.sendRaw(io, ext);
+        const deadline_ms = nowMs(io) + @as(i64, @intCast(@min(self.read_timeout_ms, 15_000)));
         while (self.ut_metadata_id == null) {
+            if (nowMs(io) >= deadline_ms) return error.MetadataHandshakeFailed;
             if (self.recv_buffer.items.len < 4) {
                 var buf: [4096]u8 = undefined;
                 const n = try self.readStreamSlice(io, &buf);
@@ -256,12 +341,17 @@ pub const Connection = struct {
                 try self.recv_buffer.replaceRange(self.allocator, 0, frame_len, &.{});
                 continue;
             }
+            // LTEP handshake observed: require ut_metadata + metadata_size or fail hard.
             const parsed = try parsePeerExtendedHandshake(self.allocator, msg.extended);
             try self.recv_buffer.replaceRange(self.allocator, 0, frame_len, &.{});
             const handshake = parsed orelse return error.MetadataUnsupported;
             self.ut_metadata_id = handshake.ut_metadata_id;
             self.metadata_size = handshake.metadata_size;
         }
+    }
+
+    fn nowMs(io: std.Io) i64 {
+        return std.Io.Timestamp.now(io, .real).toMilliseconds();
     }
 
     pub fn requestMetadataPiece(self: *Connection, io: std.Io, piece: u32) !void {
@@ -284,6 +374,23 @@ pub const Connection = struct {
 
     pub fn sendInterested(self: *Connection, io: std.Io) !void {
         const msg = try encodeMessage(self.allocator, .interested);
+        defer self.allocator.free(msg);
+        try self.sendRaw(io, msg);
+    }
+
+    /// Send our LTEP handshake advertising `ut_metadata` and `ut_pex` so the
+    /// peer learns our extension ids (BEP 10). Used on content connections.
+    pub fn sendExtendedHandshake(self: *Connection, io: std.Io) !void {
+        const ext = try encodeExtendedHandshake(self.allocator, 1);
+        defer self.allocator.free(ext);
+        try self.sendRaw(io, ext);
+    }
+
+    /// Send a `ut_pex` (BEP 11) message using the peer's advertised id. No-op if
+    /// the peer never advertised `ut_pex`.
+    pub fn sendPex(self: *Connection, io: std.Io, body: []const u8) !void {
+        const id = self.peer_ut_pex_id orelse return;
+        const msg = try encodeExtendedMessage(self.allocator, id, body);
         defer self.allocator.free(msg);
         try self.sendRaw(io, msg);
     }
@@ -430,9 +537,12 @@ pub fn decodeMessage(bytes: []const u8) !Message {
 fn encodeExtendedHandshake(allocator: std.mem.Allocator, ut_metadata_id: u8) ![]u8 {
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(allocator);
+    // Advertise ut_metadata and ut_pex (BEP 9 / BEP 11) in the LTEP `m` dict.
     try body.appendSlice(allocator, "d1:md11:ut_metadatai");
     try body.append(allocator, '0' + ut_metadata_id);
-    try body.appendSlice(allocator, "ee");
+    try body.appendSlice(allocator, "e6:ut_pexi");
+    try body.append(allocator, '0' + pex.local_ut_pex_id);
+    try body.appendSlice(allocator, "eee");
     return encodeExtendedMessage(allocator, 0, body.items);
 }
 
@@ -463,6 +573,20 @@ pub fn parsePeerExtendedHandshake(allocator: std.mem.Allocator, payload: []const
     const size_val = root.dictGet("metadata_size") orelse return null;
     if (size_val != .int or size_val.int <= 0) return null;
     return .{ .ut_metadata_id = @intCast(ut.int), .metadata_size = @intCast(size_val.int) };
+}
+
+/// Extract the peer's `ut_pex` extension id from an LTEP handshake (BEP 11),
+/// or null if absent/unsupported. `payload[0]` must be the extended id 0.
+pub fn parsePeerUtPexId(allocator: std.mem.Allocator, payload: []const u8) ?u8 {
+    if (payload.len < 2 or payload[0] != 0) return null;
+    const root = bencode.parse(allocator, payload[1..]) catch return null;
+    defer root.deinit(allocator);
+    if (root != .dict) return null;
+    const md = root.dictGet("m") orelse return null;
+    if (md != .dict) return null;
+    const up = md.dictGet("ut_pex") orelse return null;
+    if (up != .int or up.int <= 0 or up.int > 255) return null;
+    return @intCast(up.int);
 }
 
 fn parseUtMetadataData(allocator: std.mem.Allocator, payload: []const u8) !?UtMetadataData {
@@ -545,8 +669,7 @@ test "rejects oversized peer messages" {
     var conn = Connection{
         .allocator = std.testing.allocator,
         .stream = undefined,
-        .peer_ip = .{ 127, 0, 0, 1 },
-        .peer_port = 6881,
+        .peer_addr = address.Address.v4(.{ 127, 0, 0, 1 }, 6881),
         .state = .{},
         .recv_buffer = .empty,
     };
@@ -562,8 +685,7 @@ test "closes peer connection when peer sends request" {
     var conn = Connection{
         .allocator = std.testing.allocator,
         .stream = undefined,
-        .peer_ip = .{ 127, 0, 0, 1 },
-        .peer_port = 6881,
+        .peer_addr = address.Address.v4(.{ 127, 0, 0, 1 }, 6881),
         .state = .{},
         .recv_buffer = .empty,
     };
@@ -592,8 +714,7 @@ test "readMessage decodes buffered metadata extension handshake" {
     var conn = Connection{
         .allocator = std.testing.allocator,
         .stream = undefined,
-        .peer_ip = .{ 127, 0, 0, 1 },
-        .peer_port = 6881,
+        .peer_addr = address.Address.v4(.{ 127, 0, 0, 1 }, 6881),
         .state = .{},
         .recv_buffer = .empty,
     };

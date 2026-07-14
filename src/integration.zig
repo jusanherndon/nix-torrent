@@ -1,16 +1,21 @@
 const std = @import("std");
+const address = @import("address.zig");
 const config = @import("config.zig");
 const dht = @import("dht.zig");
 const encryption = @import("encryption.zig");
 const engine_mod = @import("engine.zig");
 const harness = @import("integration_harness.zig");
+const inbound_mod = @import("inbound.zig");
 const magnet = @import("magnet.zig");
 const peer = @import("peer.zig");
 const protocol = @import("protocol.zig");
 const state = @import("state.zig");
 const storage = @import("storage.zig");
+const tcp = @import("tcp.zig");
 const torrent = @import("torrent.zig");
 const tracker = @import("tracker.zig");
+
+const c = std.c;
 
 test "integration: rejects duplicate torrent add by info hash" {
     var registry = state.Registry.init(std.testing.allocator, 4, 20);
@@ -110,7 +115,7 @@ test "integration: udp tracker returns fake peer" {
     const parsed = try tracker.parseAnnounceUrl(allocator, url);
     defer parsed.deinit(allocator);
     var udp_session: tracker.UdpSession = .{};
-    const response = try tracker.announce(io, allocator, parsed, &udp_session, meta.info_hash, [_]u8{1} ** 20, 6881, 0, 0, meta.mode.single_file, .started, .disable, 2000, 0);
+    const response = try tracker.announce(io, allocator, parsed, &udp_session, meta.info_hash, [_]u8{1} ** 20, 6881, 0, 0, meta.mode.single_file, .started, .disable, null, 2000, 0);
     defer response.deinit(allocator);
     try std.testing.expect(response.peers.len >= 1);
     try std.testing.expectEqual(peer_ep.port, response.peers[0].port);
@@ -133,9 +138,9 @@ test "integration: dht routing table targets fake node" {
     var routing = dht.RoutingTable.init(allocator, [_]u8{3} ** 20);
     defer routing.deinit();
     const node_id: [20]u8 = [_]u8{9} ** 20;
-    try routing.addNode(.{ .id = node_id, .ip = .{ 127, 0, 0, 1 }, .port = dht_node.port });
+    try routing.addNode(dht.Node.v4(node_id, .{ 127, 0, 0, 1 }, dht_node.port));
     try std.testing.expectEqual(@as(usize, 1), routing.nodes.items.len);
-    try std.testing.expectEqual(dht_node.port, routing.nodes.items[0].port);
+    try std.testing.expectEqual(dht_node.port, routing.nodes.items[0].addr.port);
 }
 
 test "integration: two dht-eligible torrents bind distinct ports" {
@@ -463,7 +468,87 @@ test "integration: resume magnet torrent after metadata known" {
     try std.testing.expect(session.meta != null);
 }
 
-test "integration: control protocol version 2 in status response" {
+const InboundInitCtx = struct {
+    io: std.Io,
+    addr: address.Address,
+    info_hash: torrent.InfoHash,
+    matched: bool = false,
+    completed: bool = false,
+};
+
+fn cWriteAll(fd: c.fd_t, bytes: []const u8) bool {
+    var sent: usize = 0;
+    while (sent < bytes.len) {
+        const n = c.write(fd, bytes[sent..].ptr, bytes.len - sent);
+        if (n <= 0) return false;
+        sent += @intCast(n);
+    }
+    return true;
+}
+
+fn cReadExact(fd: c.fd_t, buf: []u8) bool {
+    var got: usize = 0;
+    while (got < buf.len) {
+        const n = c.read(fd, buf[got..].ptr, buf.len - got);
+        if (n <= 0) return false;
+        got += @intCast(n);
+    }
+    return true;
+}
+
+/// Fake inbound peer: dials the Listen Socket, sends a plaintext BitTorrent
+/// handshake, and verifies the daemon's handshake reply carries our info hash.
+fn inboundInitiator(ctx: *InboundInitCtx) void {
+    var stream = tcp.connectStreamAddr(ctx.io, ctx.addr, 2000) catch return;
+    defer stream.close(ctx.io);
+    const fd = stream.socket.handle;
+    var hs: [68]u8 = undefined;
+    peer.encodeHandshake(&hs, ctx.info_hash, [_]u8{0x7} ** 20, false);
+    if (!cWriteAll(fd, &hs)) return;
+    var resp: [68]u8 = undefined;
+    if (!cReadExact(fd, &resp)) return;
+    const dec = peer.decodeHandshake(&resp) catch return;
+    ctx.matched = std.mem.eql(u8, &dec.info_hash, &ctx.info_hash);
+    ctx.completed = true;
+}
+
+fn runInboundAccept(io: std.Io, allocator: std.mem.Allocator, use_ipv6: bool) !void {
+    const fixture = @embedFile("fixtures/single-file.torrent");
+    const meta = try torrent.Metadata.parseBytes(allocator, fixture);
+    defer meta.deinit();
+
+    var listener = inbound_mod.InboundListener.init(0);
+    try listener.start(io);
+    defer listener.deinit(io);
+
+    const bound = address.Address.fromIpAddress(listener.server.?.socket.address);
+    const peer_addr = if (use_ipv6)
+        address.Address.v6([_]u8{0} ** 15 ++ [_]u8{1}, bound.port)
+    else
+        address.Address.v4(.{ 127, 0, 0, 1 }, bound.port);
+
+    var ctx = InboundInitCtx{ .io = io, .addr = peer_addr, .info_hash = meta.info_hash };
+    var thread = try std.Thread.spawn(.{}, inboundInitiator, .{&ctx});
+    defer thread.join();
+
+    const stream = try listener.server.?.accept(io);
+    var conn = peer.Connection.fromStream(allocator, stream, address.Address.fromIpAddress(stream.socket.address), 2000);
+    defer conn.deinit(io);
+    const matched = try conn.performInboundHandshake(io, &.{meta.info_hash}, [_]u8{0x9} ** 20, .disable);
+    try std.testing.expectEqualSlices(u8, &meta.info_hash, &matched);
+}
+
+test "integration: inbound listener accepts plaintext peer over ipv4" {
+    const io = std.testing.io;
+    try runInboundAccept(io, std.testing.allocator, false);
+}
+
+test "integration: inbound listener accepts plaintext peer over ipv6" {
+    const io = std.testing.io;
+    try runInboundAccept(io, std.testing.allocator, true);
+}
+
+test "integration: control protocol version 3 in status response" {
     var root: std.json.ObjectMap = .empty;
     defer root.deinit(std.testing.allocator);
     try root.put(std.testing.allocator, "control_protocol_version", .{ .integer = @intCast(protocol.CONTROL_PROTOCOL_VERSION) });
@@ -475,5 +560,5 @@ test "integration: control protocol version 2 in status response" {
     const result = parsed.value.object.get("result").?.object;
     const version = result.get("control_protocol_version").?.integer;
     try std.testing.expectEqual(@as(i64, @intCast(protocol.CONTROL_PROTOCOL_VERSION)), version);
-    try std.testing.expect(version == 2);
+    try std.testing.expect(version == 3);
 }

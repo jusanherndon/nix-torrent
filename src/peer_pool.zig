@@ -1,11 +1,15 @@
 const std = @import("std");
+const address = @import("address.zig");
 const config = @import("config.zig");
+const encryption = @import("encryption.zig");
 const log = @import("log.zig");
 const peer = @import("peer.zig");
+const pex = @import("pex.zig");
 const tracker = @import("tracker.zig");
 const dht = @import("dht.zig");
 const session_types = @import("session_types.zig");
 const piece_scheduler = @import("piece_scheduler.zig");
+const torrent = @import("torrent.zig");
 
 const TorrentSession = session_types.TorrentSession;
 
@@ -19,51 +23,35 @@ pub const DhtContext = struct {
     slots: *dht.SlotAllocator,
 };
 
-fn peerListHas(peers: []const peer.Connection, ip: [4]u8, port: u16) bool {
+fn peerListHas(peers: []const peer.Connection, addr: address.Address) bool {
     for (peers) |p| {
-        if (p.peer_ip[0] == ip[0] and p.peer_ip[1] == ip[1] and p.peer_ip[2] == ip[2] and p.peer_ip[3] == ip[3] and p.peer_port == port) return true;
+        if (p.peer_addr.eql(addr)) return true;
     }
     return false;
 }
 
-fn hasContent(session: *TorrentSession, ip: [4]u8, port: u16) bool {
-    return peerListHas(session.peers.items, ip, port);
+fn hasContent(session: *TorrentSession, addr: address.Address) bool {
+    return peerListHas(session.peers.items, addr);
 }
 
-fn hasMetadata(session: *TorrentSession, ip: [4]u8, port: u16) bool {
-    return peerListHas(session.metadata_peers.items, ip, port);
+fn hasMetadata(session: *TorrentSession, addr: address.Address) bool {
+    return peerListHas(session.metadata_peers.items, addr);
 }
 
-pub fn connectContent(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    cfg: config.Config,
-    session: *TorrentSession,
-    ip: [4]u8,
-    port: u16,
-    peer_id: [20]u8,
-) !void {
-    if (session.peers.items.len >= cfg.limits.max_peers_per_torrent) return;
-    if (hasContent(session, ip, port)) return;
-    var conn = try peer.Connection.connect(io, allocator, ip, port, cfg.network.peer_connect_timeout_ms, cfg.network.peer_request_timeout_ms);
-    errdefer conn.deinit(io);
-    try conn.performHandshake(io, session.info_hash, peer_id, config.encryptionPolicy(cfg.network), false);
-    try conn.sendInterested(io);
-    try session.peers.append(allocator, conn);
-    log.debug("peer_pool", "connected content peer {d}.{d}.{d}.{d}:{d} for {s} ({d} total)", .{ ip[0], ip[1], ip[2], ip[3], port, session.info_hash_hex, session.peers.items.len });
-}
-
-fn logConnectFailure(mode: []const u8, session: *TorrentSession, ip: [4]u8, port: u16, err: anyerror) void {
-    log.debug("peer_pool", "{s} peer connect failed {d}.{d}.{d}.{d}:{d} for {s}: {s}", .{
-        mode, ip[0], ip[1], ip[2], ip[3], port, session.info_hash_hex, @errorName(err),
+fn logConnectFailure(mode: []const u8, session: *TorrentSession, addr: address.Address, err: anyerror) void {
+    var buf: [64]u8 = undefined;
+    log.debug("peer_pool", "{s} peer connect failed {s} for {s}: {s}", .{
+        mode, addr.render(&buf), session.info_hash_hex, @errorName(err),
     });
     log.flush();
 }
 
 const max_peer_candidates: usize = 512;
+const metadata_lookup_interval_ms: i64 = 15_000;
+const content_lookup_interval_ms: i64 = 60_000;
 
 fn peerKeyEq(a: tracker.Peer, b: tracker.Peer) bool {
-    return a.ip[0] == b.ip[0] and a.ip[1] == b.ip[1] and a.ip[2] == b.ip[2] and a.ip[3] == b.ip[3] and a.port == b.port;
+    return a.addr().eql(b.addr());
 }
 
 fn candidateExists(session: *TorrentSession, candidate: tracker.Peer) bool {
@@ -75,11 +63,23 @@ fn candidateExists(session: *TorrentSession, candidate: tracker.Peer) bool {
 
 /// Rejects unroutable / garbage compact-peer entries some trackers return.
 pub fn isRoutablePeer(candidate: tracker.Peer) bool {
-    if (candidate.port == 0) return false;
-    if (candidate.ip[0] == 0) return false; // 0.0.0.0/8
-    if (candidate.ip[0] == 127) return false; // loopback
-    if (candidate.ip[0] == 255 and candidate.ip[1] == 255 and candidate.ip[2] == 255 and candidate.ip[3] == 255) return false;
-    return true;
+    return address.isRoutable(candidate.addr());
+}
+
+fn ensureCooldownCapacity(allocator: std.mem.Allocator, session: *TorrentSession) void {
+    while (session.peer_candidate_cooldown_until.items.len < session.peer_candidates.items.len) {
+        session.peer_candidate_cooldown_until.append(allocator, 0) catch return;
+    }
+}
+
+fn markCandidateCooldown(session: *TorrentSession, idx: usize, now_ms: i64, cooldown_ms: u64) void {
+    if (idx >= session.peer_candidate_cooldown_until.items.len) return;
+    session.peer_candidate_cooldown_until.items[idx] = now_ms + @as(i64, @intCast(cooldown_ms));
+}
+
+fn candidateOnCooldown(session: *TorrentSession, idx: usize, now_ms: i64) bool {
+    if (idx >= session.peer_candidate_cooldown_until.items.len) return false;
+    return now_ms < session.peer_candidate_cooldown_until.items[idx];
 }
 
 /// Merges discovery results into the session candidate set (deduped, capped).
@@ -90,11 +90,36 @@ pub fn mergeCandidates(allocator: std.mem.Allocator, session: *TorrentSession, p
         if (!isRoutablePeer(tp)) continue;
         if (candidateExists(session, tp)) continue;
         session.peer_candidates.append(allocator, tp) catch break;
+        session.peer_candidate_cooldown_until.append(allocator, 0) catch {
+            _ = session.peer_candidates.pop();
+            break;
+        };
         added += 1;
     }
     if (added > 0) {
         log.debug("peer_pool", "merged {d} peer candidates for {s} ({d} total)", .{ added, session.info_hash_hex, session.peer_candidates.items.len });
     }
+}
+
+fn connectTimeoutMs(cfg: config.Config, mode: DhtPeerMode) u64 {
+    return switch (mode) {
+        .metadata => cfg.network.metadata_peer_connect_timeout_ms,
+        .content => cfg.network.peer_connect_timeout_ms,
+    };
+}
+
+fn maxAttemptsForMode(cfg: config.Config, mode: DhtPeerMode) usize {
+    const base = @as(usize, @intCast(cfg.limits.max_peer_connect_attempts_per_tick));
+    return switch (mode) {
+        // Metadata fetcher is gated on finding any live peer; spend more of the
+        // tick budget probing short-timeout dials through dead candidates.
+        .metadata => @min(base * 2, @as(usize, @intCast(cfg.limits.max_peers_per_torrent))),
+        .content => base,
+    };
+}
+
+fn isPreferPlaintextRetry(err: anyerror) bool {
+    return err == error.MsePe2Short or err == error.MseVcEof or err == error.MseVcNotFound;
 }
 
 pub fn connectCandidateBatch(
@@ -107,38 +132,76 @@ pub fn connectCandidateBatch(
 ) void {
     const n = session.peer_candidates.items.len;
     if (n == 0) return;
-    const max_attempts = @as(usize, @intCast(cfg.limits.max_peer_connect_attempts_per_tick));
+    ensureCooldownCapacity(allocator, session);
+    const max_attempts = maxAttemptsForMode(cfg, mode);
     const batch_budget_ms = @as(i64, @intCast(cfg.network.peer_connect_batch_budget_ms));
     const batch_start_ms = nowMs(io);
     const policy = config.encryptionPolicy(cfg.network);
+    const connect_timeout = connectTimeoutMs(cfg, mode);
     var attempts: usize = 0;
     var examined: usize = 0;
     while (examined < n and attempts < max_attempts) {
         if (attempts > 0 and nowMs(io) - batch_start_ms >= batch_budget_ms) break;
         const idx = (session.peer_candidate_cursor + examined) % n;
         examined += 1;
+        if (candidateOnCooldown(session, idx, batch_start_ms)) continue;
         const tp = session.peer_candidates.items[idx];
         if (!tracker.peerAllowedForEncryption(tp, policy)) continue;
         switch (mode) {
             .content => {
                 if (session.peers.items.len >= cfg.limits.max_peers_per_torrent) break;
-                if (hasContent(session, tp.ip, tp.port)) continue;
+                if (hasContent(session, tp.addr())) continue;
                 attempts += 1;
-                connectContent(allocator, io, cfg, session, tp.ip, tp.port, peer_id) catch |err| {
-                    logConnectFailure("content", session, tp.ip, tp.port, err);
+                connectContentTimed(allocator, io, cfg, session, tp.addr(), peer_id, connect_timeout) catch |err| {
+                    markCandidateCooldown(session, idx, nowMs(io), cfg.network.peer_connect_fail_cooldown_ms);
+                    logConnectFailure("content", session, tp.addr(), err);
                 };
             },
             .metadata => {
                 if (session.metadata_peers.items.len >= cfg.limits.max_peers_per_torrent) break;
-                if (hasMetadata(session, tp.ip, tp.port)) continue;
+                if (hasMetadata(session, tp.addr())) continue;
                 attempts += 1;
-                connectMetadata(allocator, io, cfg, session, tp.ip, tp.port, peer_id) catch |err| {
-                    logConnectFailure("metadata", session, tp.ip, tp.port, err);
+                connectMetadataTimed(allocator, io, cfg, session, tp.addr(), peer_id, connect_timeout) catch |err| {
+                    markCandidateCooldown(session, idx, nowMs(io), cfg.network.peer_connect_fail_cooldown_ms);
+                    logConnectFailure("metadata", session, tp.addr(), err);
                 };
             },
         }
     }
     if (n > 0) session.peer_candidate_cursor = (session.peer_candidate_cursor + examined) % n;
+}
+
+pub fn connectContent(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: config.Config,
+    session: *TorrentSession,
+    addr: address.Address,
+    peer_id: [20]u8,
+) !void {
+    try connectContentTimed(allocator, io, cfg, session, addr, peer_id, cfg.network.peer_connect_timeout_ms);
+}
+
+fn connectContentTimed(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: config.Config,
+    session: *TorrentSession,
+    addr: address.Address,
+    peer_id: [20]u8,
+    connect_timeout_ms: u64,
+) !void {
+    if (session.peers.items.len >= cfg.limits.max_peers_per_torrent) return;
+    if (hasContent(session, addr)) return;
+    const policy = config.encryptionPolicy(cfg.network);
+    var conn = try dialWithPreferPlaintextRetry(io, allocator, addr, connect_timeout_ms, cfg.network.peer_request_timeout_ms, session.info_hash, peer_id, policy, false);
+    errdefer conn.deinit(io);
+    try conn.sendInterested(io);
+    // Advertise our LTEP extensions so the peer can send us `ut_pex` (BEP 11).
+    if (cfg.network.pex.enabled) conn.sendExtendedHandshake(io) catch {};
+    try session.peers.append(allocator, conn);
+    var buf: [64]u8 = undefined;
+    log.debug("peer_pool", "connected content peer {s} ({s}) for {s} ({d} total)", .{ addr.render(&buf), addr.ip.family(), session.info_hash_hex, session.peers.items.len });
 }
 
 pub fn connectContentBatch(
@@ -161,22 +224,89 @@ pub fn connectMetadata(
     io: std.Io,
     cfg: config.Config,
     session: *TorrentSession,
-    ip: [4]u8,
-    port: u16,
+    addr: address.Address,
     peer_id: [20]u8,
 ) !void {
+    try connectMetadataTimed(allocator, io, cfg, session, addr, peer_id, cfg.network.metadata_peer_connect_timeout_ms);
+}
+
+fn connectMetadataTimed(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: config.Config,
+    session: *TorrentSession,
+    addr: address.Address,
+    peer_id: [20]u8,
+    connect_timeout_ms: u64,
+) !void {
     if (session.metadata_peers.items.len >= cfg.limits.max_peers_per_torrent) return;
-    if (hasMetadata(session, ip, port)) return;
-    var conn = try peer.Connection.connect(io, allocator, ip, port, cfg.network.peer_connect_timeout_ms, cfg.network.peer_request_timeout_ms);
+    if (hasMetadata(session, addr)) return;
+    const policy = config.encryptionPolicy(cfg.network);
+    var conn = try dialMetadataWithPreferPlaintextRetry(io, allocator, addr, connect_timeout_ms, cfg.network.peer_request_timeout_ms, session.info_hash, peer_id, policy);
     errdefer conn.deinit(io);
-    try conn.performMetadataHandshake(io, session.info_hash, peer_id, config.encryptionPolicy(cfg.network));
     if (conn.metadata_size) |size| {
         if (session.metadata_size == null) session.metadata_size = size;
     }
     try session.metadata_peers.append(allocator, conn);
-    log.debug("peer_pool", "connected metadata peer {d}.{d}.{d}.{d}:{d} for {s} ({d} total)", .{ ip[0], ip[1], ip[2], ip[3], port, session.info_hash_hex, session.metadata_peers.items.len });
+    var buf: [64]u8 = undefined;
+    log.debug("peer_pool", "connected metadata peer {s} ({s}) for {s} ({d} total)", .{ addr.render(&buf), addr.ip.family(), session.info_hash_hex, session.metadata_peers.items.len });
     // Always request; leftover bitfield/have in recv_buffer must not block ut_metadata.
     try conn.requestMetadataPiece(io, session.metadata_next_request);
+}
+
+/// Outbound dial + handshake. On `prefer`, one reconnect with plaintext after mid-MSE
+/// abort (`MsePe2Short` / `MseVcEof` / `MseVcNotFound`) — ADR 0004 live-swarm refinement.
+fn dialWithPreferPlaintextRetry(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    addr: address.Address,
+    connect_timeout_ms: u64,
+    read_timeout_ms: u64,
+    info_hash: torrent.InfoHash,
+    peer_id: [20]u8,
+    policy: encryption.Policy,
+    extensions: bool,
+) !peer.Connection {
+    var conn = try peer.Connection.connectAddr(io, allocator, addr, connect_timeout_ms, read_timeout_ms);
+    var alive = true;
+    errdefer if (alive) conn.deinit(io);
+    conn.performHandshake(io, info_hash, peer_id, policy, extensions) catch |err| {
+        if (policy != .prefer or !isPreferPlaintextRetry(err)) return err;
+        conn.deinit(io);
+        alive = false;
+        conn = try peer.Connection.connectAddr(io, allocator, addr, connect_timeout_ms, read_timeout_ms);
+        alive = true;
+        try conn.performHandshake(io, info_hash, peer_id, .disable, extensions);
+    };
+    alive = false;
+    return conn;
+}
+
+fn dialMetadataWithPreferPlaintextRetry(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    addr: address.Address,
+    connect_timeout_ms: u64,
+    read_timeout_ms: u64,
+    info_hash: torrent.InfoHash,
+    peer_id: [20]u8,
+    policy: encryption.Policy,
+) !peer.Connection {
+    var conn = try peer.Connection.connectAddr(io, allocator, addr, connect_timeout_ms, read_timeout_ms);
+    var alive = true;
+    errdefer if (alive) conn.deinit(io);
+    conn.performMetadataHandshake(io, info_hash, peer_id, policy) catch |err| {
+        if (policy != .prefer or !isPreferPlaintextRetry(err)) return err;
+        var buf: [64]u8 = undefined;
+        log.debug("peer_pool", "metadata MSE mid-handshake abort from {s}; retrying plaintext", .{addr.render(&buf)});
+        conn.deinit(io);
+        alive = false;
+        conn = try peer.Connection.connectAddr(io, allocator, addr, connect_timeout_ms, read_timeout_ms);
+        alive = true;
+        try conn.performMetadataHandshake(io, info_hash, peer_id, .disable);
+    };
+    alive = false;
+    return conn;
 }
 
 pub fn connectMetadataBatch(
@@ -206,9 +336,13 @@ pub fn tickDht(
 ) !void {
     _ = cfg;
     _ = peer_id;
-    _ = mode;
     const sock = &(session.dht_socket orelse return);
-    const dht_peers = try sock.tick(io, allocator, ctx.routing, ctx.cfg, session.info_hash, now_ms);
+    sock.lookup_interval_ms = switch (mode) {
+        .metadata => metadata_lookup_interval_ms,
+        .content => content_lookup_interval_ms,
+    };
+    // session.announce_port carries the advertised listen port (V3 split).
+    const dht_peers = try sock.tick(io, allocator, ctx.routing, ctx.cfg, session.info_hash, now_ms, session.announce_port);
     defer allocator.free(dht_peers);
     if (dht_peers.len > 0) {
         log.debug("peer_pool", "DHT returned {d} peers for {s}", .{ dht_peers.len, session.info_hash_hex });
@@ -228,7 +362,8 @@ pub fn close(session: *TorrentSession, io: std.Io, allocator: std.mem.Allocator)
 
 fn removeContentPeer(session: *TorrentSession, io: std.Io, allocator: std.mem.Allocator, index: usize) void {
     const conn = session.peers.items[index];
-    log.debug("peer_pool", "disconnecting content peer {d}.{d}.{d}.{d}:{d} from {s}", .{ conn.peer_ip[0], conn.peer_ip[1], conn.peer_ip[2], conn.peer_ip[3], conn.peer_port, session.info_hash_hex });
+    var buf: [64]u8 = undefined;
+    log.debug("peer_pool", "disconnecting content peer {s} from {s}", .{ conn.peer_addr.render(&buf), session.info_hash_hex });
     var conn_mut = conn;
     conn_mut.deinit(io);
     _ = session.peers.orderedRemove(index);
@@ -271,6 +406,11 @@ pub fn maintain(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, se
                 .have => |index| conn.state.setHave(allocator, session.layout.?.piece_states.len, index) catch {},
                 .unchoke => {},
                 .piece => |block| try piece_scheduler.handleBlock(cfg, session, i, block),
+                .extended => |payload| {
+                    if (payload.len >= 1 and payload[0] == 0) {
+                        if (peer.parsePeerUtPexId(allocator, payload)) |id| conn.peer_ut_pex_id = id;
+                    } else consumePex(allocator, session, payload);
+                },
                 else => {},
             }
             conn.state.apply(msg.?);
@@ -279,16 +419,58 @@ pub fn maintain(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, se
     }
 }
 
+/// Minimum wall-clock gap between `ut_pex` emissions on a connection set.
+pub const pex_emit_interval_ms: i64 = 60_000;
+
+/// Emit a `ut_pex` (BEP 11) `added` list of currently connected content peers
+/// to every peer that advertised `ut_pex`. Throttled and best-effort. Callers
+/// must gate on config `pex.enabled` and non-private torrents.
+pub fn emitPex(allocator: std.mem.Allocator, io: std.Io, session: *TorrentSession, now_ms: i64) void {
+    if (now_ms - session.last_pex_emit_ms < pex_emit_interval_ms) return;
+    var any_target = false;
+    for (session.peers.items) |*p| {
+        if (p.peer_ut_pex_id != null) {
+            any_target = true;
+            break;
+        }
+    }
+    if (!any_target) return;
+    session.last_pex_emit_ms = now_ms;
+
+    var added: std.ArrayList(address.Address) = .empty;
+    defer added.deinit(allocator);
+    for (session.peers.items) |*p| added.append(allocator, p.peer_addr) catch return;
+    const body = pex.encodePexBody(allocator, added.items, &.{}) catch return;
+    defer allocator.free(body);
+    for (session.peers.items) |*p| {
+        if (p.peer_ut_pex_id == null) continue;
+        p.sendPex(io, body) catch {};
+    }
+}
+
+/// Consume an incoming `ut_pex` (BEP 11) message and merge its peers into the
+/// candidate set. Non-PEX extended messages (e.g. LTEP handshakes) are ignored.
+fn consumePex(allocator: std.mem.Allocator, session: *TorrentSession, payload: []const u8) void {
+    if (payload.len < 2 or payload[0] != pex.local_ut_pex_id) return;
+    const learned = pex.parsePexPeers(allocator, payload[1..]) catch return;
+    defer allocator.free(learned);
+    if (learned.len > 0) mergeCandidates(allocator, session, learned);
+}
+
 fn nowMs(io: std.Io) i64 {
     return std.Io.Timestamp.now(io, .real).toMilliseconds();
 }
 
 test "rejects unroutable peer candidates" {
-    try std.testing.expect(!isRoutablePeer(.{ .ip = .{ 127, 0, 0, 1 }, .port = 6881 }));
-    try std.testing.expect(!isRoutablePeer(.{ .ip = .{ 0, 0, 0, 0 }, .port = 6881 }));
-    try std.testing.expect(!isRoutablePeer(.{ .ip = .{ 255, 255, 255, 255 }, .port = 45353 }));
-    try std.testing.expect(!isRoutablePeer(.{ .ip = .{ 1, 2, 3, 4 }, .port = 0 }));
-    try std.testing.expect(isRoutablePeer(.{ .ip = .{ 1, 2, 3, 4 }, .port = 6881 }));
+    try std.testing.expect(!isRoutablePeer(tracker.Peer.v4(.{ 127, 0, 0, 1 }, 6881)));
+    try std.testing.expect(!isRoutablePeer(tracker.Peer.v4(.{ 0, 0, 0, 0 }, 6881)));
+    try std.testing.expect(!isRoutablePeer(tracker.Peer.v4(.{ 255, 255, 255, 255 }, 45353)));
+    try std.testing.expect(!isRoutablePeer(tracker.Peer.v4(.{ 1, 2, 3, 4 }, 0)));
+    try std.testing.expect(isRoutablePeer(tracker.Peer.v4(.{ 1, 2, 3, 4 }, 6881)));
+    // IPv6: unspecified and loopback rejected, global unicast accepted.
+    try std.testing.expect(!isRoutablePeer(tracker.Peer.v6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 6881)));
+    try std.testing.expect(!isRoutablePeer(tracker.Peer.v6(.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 6881)));
+    try std.testing.expect(isRoutablePeer(tracker.Peer.v6(.{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, 6881)));
 }
 
 test "mergeCandidates dedupes and skips garbage" {
@@ -309,13 +491,13 @@ test "mergeCandidates dedupes and skips garbage" {
     defer session.deinit(std.testing.io, std.testing.allocator);
 
     const batch = [_]tracker.Peer{
-        .{ .ip = .{ 1, 2, 3, 4 }, .port = 6881 },
-        .{ .ip = .{ 127, 0, 0, 1 }, .port = 6881 },
-        .{ .ip = .{ 1, 2, 3, 4 }, .port = 6881 },
-        .{ .ip = .{ 5, 6, 7, 8 }, .port = 51413 },
+        tracker.Peer.v4(.{ 1, 2, 3, 4 }, 6881),
+        tracker.Peer.v4(.{ 127, 0, 0, 1 }, 6881),
+        tracker.Peer.v4(.{ 1, 2, 3, 4 }, 6881),
+        tracker.Peer.v4(.{ 5, 6, 7, 8 }, 51413),
     };
     mergeCandidates(std.testing.allocator, &session, &batch);
     try std.testing.expectEqual(@as(usize, 2), session.peer_candidates.items.len);
-    try std.testing.expectEqual(@as(u8, 1), session.peer_candidates.items[0].ip[0]);
-    try std.testing.expectEqual(@as(u8, 5), session.peer_candidates.items[1].ip[0]);
+    try std.testing.expectEqual(@as(u8, 1), session.peer_candidates.items[0].ip.v4[0]);
+    try std.testing.expectEqual(@as(u8, 5), session.peer_candidates.items[1].ip.v4[0]);
 }

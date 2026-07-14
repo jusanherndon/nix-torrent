@@ -43,6 +43,8 @@ pub const TrackerEndpoint = struct {
     parsed: tracker.AnnounceUrl,
     state: tracker.TrackerState,
     udp: tracker.UdpSession,
+    /// BEP 12 Tracker Tier index this endpoint belongs to.
+    tier: usize = 0,
 
     pub fn deinit(self: *TrackerEndpoint, allocator: std.mem.Allocator) void {
         allocator.free(self.raw_url);
@@ -65,7 +67,16 @@ pub const TorrentSession = struct {
     metadata_peers: std.ArrayList(peer.Connection),
     /// Deduplicated peer candidates from trackers and DHT (V2_NETWORK_PLAN).
     peer_candidates: std.ArrayList(tracker.Peer) = .empty,
+    /// Parallel to `peer_candidates`: wall-clock ms until a failed dial may be retried.
+    peer_candidate_cooldown_until: std.ArrayList(i64) = .empty,
     peer_candidate_cursor: usize = 0,
+    /// BEP 12 failover cursor: index into `trackers` of the currently preferred
+    /// tracker. Advances on failure, stays put on success (prefer working).
+    tracker_cursor: usize = 0,
+    /// Timestamp of the last PEX emit on content connections (throttle).
+    last_pex_emit_ms: i64 = 0,
+    /// Timestamp of the last LSD announce (throttle).
+    last_lsd_announce_ms: i64 = 0,
     metadata_chunks: std.AutoHashMap(u32, []u8),
     metadata_size: ?usize = null,
     metadata_next_request: u32 = 0,
@@ -78,6 +89,7 @@ pub const TorrentSession = struct {
         for (self.metadata_peers.items) |*p| p.deinit(io);
         self.metadata_peers.deinit(allocator);
         self.peer_candidates.deinit(allocator);
+        self.peer_candidate_cooldown_until.deinit(allocator);
         var chunk_it = self.metadata_chunks.iterator();
         while (chunk_it.next()) |entry| allocator.free(entry.value_ptr.*);
         self.metadata_chunks.deinit();

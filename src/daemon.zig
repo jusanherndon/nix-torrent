@@ -1,8 +1,12 @@
 const std = @import("std");
 
 const config = @import("config.zig");
+const control_plane = @import("control_plane.zig");
 const engine_mod = @import("engine.zig");
+const inbound_mod = @import("inbound.zig");
 const log = @import("log.zig");
+const lsd_service = @import("lsd_service.zig");
+const port_mapping = @import("port_mapping.zig");
 const protocol = @import("protocol.zig");
 const state = @import("state.zig");
 const torrent = @import("torrent.zig");
@@ -18,12 +22,20 @@ const Daemon = struct {
     cfg: config.Config,
     registry: state.Registry,
     engine: engine_mod.Engine,
+    inbound: inbound_mod.InboundListener,
+    lsd: lsd_service.LsdService,
+    port_mapper: port_mapping.PortMapper,
     peer_id: [20]u8,
     started_ms: i64 = 0,
     dht_routing: dht.RoutingTable,
     dht_slots: dht.SlotAllocator,
     dht_bootstrapped: bool = false,
     dht_last_refresh_ms: i64 = 0,
+    projection: control_plane.ProjectionGate = .{},
+    cmd_queue: control_plane.CommandQueue,
+    worker: ?std.Thread = null,
+    /// Mirrored under the projection gate for fast status reads.
+    inbound_peer_count: usize = 0,
 
     fn init(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config) !Daemon {
         const peer_id = try loadOrCreatePeerId(io, allocator, cfg.staging_area);
@@ -33,13 +45,20 @@ const Daemon = struct {
             .cfg = cfg,
             .registry = state.Registry.init(allocator, @intCast(cfg.limits.max_active_torrents), @intCast(cfg.limits.max_peers_per_torrent)),
             .engine = engine_mod.Engine.init(allocator),
+            .inbound = inbound_mod.InboundListener.init(@intCast(cfg.network.listen_port)),
+            .lsd = lsd_service.LsdService.init(cfg.network.lsd.enabled),
+            .port_mapper = port_mapping.PortMapper.init(cfg.network.port_mapping.enabled),
             .peer_id = peer_id,
             .dht_routing = dht.RoutingTable.init(allocator, dht.deriveNodeId(peer_id)),
             .dht_slots = try dht.SlotAllocator.init(allocator, @intCast(cfg.limits.max_active_torrents)),
+            .cmd_queue = control_plane.CommandQueue.init(allocator),
         };
     }
 
     fn deinit(self: *Daemon) void {
+        self.cmd_queue.deinit(self.io);
+        self.lsd.deinit();
+        self.inbound.deinit(self.io);
         self.dht_slots.deinit();
         self.dht_routing.deinit();
         self.engine.deinit(self.io);
@@ -137,11 +156,24 @@ pub fn main(init: std.process.Init) !void {
 
     installSignalHandlers();
 
+    daemon.inbound.start(init.io) catch |err| {
+        log.err("daemon", "failed to bind inbound listen socket on port {d}: {s}", .{ cfg.network.listen_port, @errorName(err) });
+    };
+
+    // Best-effort NAT port mapping for the Listen Port. Failure must not crash.
+    if (daemon.cfg.network.port_mapping.enabled) {
+        const st = daemon.port_mapper.mapListenPort(init.io, @intCast(cfg.network.listen_port));
+        daemon.inbound.listen_port_mapped = (st == .mapped);
+    }
+
+    daemon.lsd.start();
+
     try log.configEvent(stderr, "daemon", cfg.staging_area, cfg.final_destination, cfg.socket_path);
     log.info("daemon", "control socket listening", .{});
     try stderr.flush();
 
     daemon.started_ms = nowMs(init.io);
+    daemon.worker = try std.Thread.spawn(.{}, workerMain, .{&daemon});
 
     while (!shutting_down) {
         if (try acceptWithTimeout(&server, init.io, 100)) |stream| {
@@ -150,16 +182,78 @@ pub fn main(init: std.process.Init) !void {
             };
             try stderr.flush();
         }
-
-        const now_ms = nowMs(init.io);
-        daemon.engine.tick(daemon.io, daemon.cfg, &daemon.registry, daemon.peer_id, now_ms, daemon.dhtContext()) catch |tick_err| {
-            log.err("engine", "tick failed: {s}", .{@errorName(tick_err)});
-        };
-        try stderr.flush();
     }
+
+    daemon.cmd_queue.requestShutdown(init.io);
+    if (daemon.worker) |t| t.join();
+    daemon.worker = null;
 
     log.info("daemon", "controlled shutdown complete", .{});
     try stderr.flush();
+}
+
+fn workerMain(daemon: *Daemon) void {
+    while (!daemon.cmd_queue.isShutdown() and !shutting_down) {
+        // Drain mutate commands between ticks so they never race peer I/O.
+        while (daemon.cmd_queue.waitNext(daemon.io, 5 * std.time.ns_per_ms)) |cmd| {
+            handleWorkerCmd(daemon, cmd);
+        }
+        if (daemon.cmd_queue.isShutdown() or shutting_down) break;
+
+        daemon.inbound.poll(daemon.io, daemon.cfg, &daemon.engine, daemon.peer_id);
+        daemon.lsd.poll(daemon.allocator, &daemon.engine, &daemon.registry);
+        const now_ms = nowMs(daemon.io);
+        daemon.lsd.announce(daemon.allocator, &daemon.registry, @intCast(daemon.cfg.network.listen_port), now_ms);
+
+        daemon.engine.tick(daemon.io, daemon.cfg, &daemon.registry, daemon.peer_id, now_ms, daemon.dhtContext()) catch |tick_err| {
+            log.err("engine", "tick failed: {s}", .{@errorName(tick_err)});
+        };
+
+        // Publish projected inbound count under the short-hold projection gate.
+        daemon.projection.lock(daemon.io);
+        daemon.inbound_peer_count = daemon.engine.inboundPeerCount();
+        daemon.projection.unlock(daemon.io);
+
+        std.Io.sleep(daemon.io, .fromMilliseconds(20), .real) catch {};
+    }
+    // Drain remaining commands so submitters are not left hanging.
+    while (daemon.cmd_queue.waitNext(daemon.io, 0)) |cmd| {
+        handleWorkerCmd(daemon, cmd);
+    }
+}
+
+fn handleWorkerCmd(daemon: *Daemon, cmd: control_plane.MutateCmd) void {
+    defer {
+        daemon.allocator.free(cmd.argument);
+        cmd.done.set(daemon.io);
+    }
+    const req = protocol.Request{
+        .command = switch (cmd.kind) {
+            .add => .add,
+            .pause => .pause,
+            .@"resume" => .@"resume",
+            .remove => .remove,
+        },
+        .argument = cmd.argument,
+    };
+    const response = handleMutateLocked(daemon, req) catch |err| protocol.Response{
+        .failure = .{ .code = .internal_error, .message = @errorName(err) },
+    };
+    const boxed = daemon.allocator.create(protocol.Response) catch {
+        response.deinit(daemon.allocator);
+        return;
+    };
+    boxed.* = response;
+    cmd.result.ptr = boxed;
+}
+
+/// Runs mutate handlers on the worker thread (exclusive with the tick).
+fn handleMutateLocked(daemon: *Daemon, req: protocol.Request) !protocol.Response {
+    return switch (req.command) {
+        .add => try addTorrent(daemon, req.argument orelse return .{ .failure = .{ .code = .invalid_arguments, .message = "torrent file or magnet URI argument is required" } }),
+        .pause, .@"resume", .remove => try handleMutateRequest(daemon, req),
+        else => .{ .failure = .{ .code = .internal_error, .message = "unexpected command on worker" } },
+    };
 }
 
 fn nowMs(io: std.Io) i64 {
@@ -217,19 +311,33 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
     const allocator = daemon.allocator;
     switch (req.command) {
         .status => {
+            daemon.projection.lock(daemon.io);
+            defer daemon.projection.unlock(daemon.io);
             var root: std.json.ObjectMap = .empty;
             errdefer root.deinit(allocator);
-            try root.put(allocator, "daemon_version", .{ .string = "0.2.0" });
+            try root.put(allocator, "daemon_version", .{ .string = "0.3.0" });
             try root.put(allocator, "control_protocol_version", .{ .integer = protocol.CONTROL_PROTOCOL_VERSION });
             const uptime = @max(@as(i64, 0), @divFloor(nowMs(daemon.io) - started, 1000));
             try root.put(allocator, "uptime_seconds", .{ .integer = uptime });
             try root.put(allocator, "active_torrent_count", .{ .integer = @intCast(daemon.registry.records.items.len) });
+            try root.put(allocator, "listen_port", .{ .integer = @intCast(daemon.cfg.network.listen_port) });
+            try root.put(allocator, "inbound_peer_count", .{ .integer = @intCast(daemon.inbound_peer_count) });
             var limits: std.json.ObjectMap = .empty;
             errdefer limits.deinit(allocator);
             try limits.put(allocator, "max_active_torrents", .{ .integer = @intCast(daemon.cfg.limits.max_active_torrents) });
             try limits.put(allocator, "max_peers_per_torrent", .{ .integer = @intCast(daemon.cfg.limits.max_peers_per_torrent) });
+            try limits.put(allocator, "max_inbound_peers_per_torrent", .{ .integer = @intCast(daemon.cfg.limits.max_inbound_peers_per_torrent) });
+            try limits.put(allocator, "max_inbound_handshakes", .{ .integer = @intCast(daemon.cfg.limits.max_inbound_handshakes) });
             try limits.put(allocator, "max_torrent_file_bytes", .{ .integer = @intCast(daemon.cfg.limits.max_torrent_file_bytes) });
             try root.put(allocator, "limits", .{ .object = limits });
+            var pm_obj: std.json.ObjectMap = .empty;
+            errdefer pm_obj.deinit(allocator);
+            try pm_obj.put(allocator, "enabled", .{ .bool = daemon.cfg.network.port_mapping.enabled });
+            try pm_obj.put(allocator, "listen_port_mapped", .{ .bool = daemon.inbound.listen_port_mapped });
+            try pm_obj.put(allocator, "listen_state", .{ .string = daemon.port_mapper.listen_state.label() });
+            if (daemon.port_mapper.listen_external_port != 0)
+                try pm_obj.put(allocator, "external_port", .{ .integer = @intCast(daemon.port_mapper.listen_external_port) });
+            try root.put(allocator, "port_mapping", .{ .object = pm_obj });
             var dht_obj: std.json.ObjectMap = .empty;
             errdefer dht_obj.deinit(allocator);
             try dht_obj.put(allocator, "enabled", .{ .bool = daemon.cfg.network.dht.enabled });
@@ -238,13 +346,55 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
             try root.put(allocator, "dht", .{ .object = dht_obj });
             return .{ .success = .{ .object = root } };
         },
-        .list => return listResponse(daemon),
+        .list => {
+            daemon.projection.lock(daemon.io);
+            defer daemon.projection.unlock(daemon.io);
+            return listResponse(daemon);
+        },
         .show => {
+            daemon.projection.lock(daemon.io);
+            defer daemon.projection.unlock(daemon.io);
             const info_hash = req.argument orelse return .{ .failure = .{ .code = .invalid_arguments, .message = "info hash argument is required" } };
             if (daemon.registry.find(info_hash)) |rec| return showResponse(daemon, rec.*);
             if (daemon.registry.findCompletion(info_hash)) |rec| return showCompletionResponse(daemon, rec.*);
             return .{ .failure = .{ .code = .not_found, .message = "torrent is not known to this daemon" } };
         },
+        .add, .pause, .@"resume", .remove => return submitMutate(daemon, req),
+    }
+}
+
+fn submitMutate(daemon: *Daemon, req: protocol.Request) !protocol.Response {
+    const argument = req.argument orelse return switch (req.command) {
+        .add => .{ .failure = .{ .code = .invalid_arguments, .message = "torrent file or magnet URI argument is required" } },
+        else => .{ .failure = .{ .code = .invalid_arguments, .message = "info hash argument is required" } },
+    };
+    const owned = try daemon.allocator.dupe(u8, argument);
+    errdefer daemon.allocator.free(owned);
+    var done: std.Io.Event = .unset;
+    var slot: control_plane.ResponseSlot = .{};
+    try daemon.cmd_queue.enqueue(daemon.io, .{
+        .kind = switch (req.command) {
+            .add => .add,
+            .pause => .pause,
+            .@"resume" => .@"resume",
+            .remove => .remove,
+            else => unreachable,
+        },
+        .argument = owned,
+        .done = &done,
+        .result = &slot,
+    });
+    done.waitUncancelable(daemon.io);
+    const boxed: *protocol.Response = @ptrCast(@alignCast(slot.ptr orelse {
+        return .{ .failure = .{ .code = .internal_error, .message = "worker did not return a response" } };
+    }));
+    defer daemon.allocator.destroy(boxed);
+    return boxed.*;
+}
+
+fn handleMutateRequest(daemon: *Daemon, req: protocol.Request) !protocol.Response {
+    const allocator = daemon.allocator;
+    switch (req.command) {
         .pause => {
             const info_hash = req.argument orelse return .{ .failure = .{ .code = .invalid_arguments, .message = "info hash argument is required" } };
             const rec = daemon.registry.find(info_hash) orelse {
@@ -312,6 +462,7 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
             return .{ .success = .{ .object = root } };
         },
         .add => return addTorrent(daemon, req.argument orelse return .{ .failure = .{ .code = .invalid_arguments, .message = "torrent file or magnet URI argument is required" } }),
+        else => return .{ .failure = .{ .code = .internal_error, .message = "unexpected command on mutate worker" } },
     }
 }
 
@@ -385,12 +536,19 @@ fn addTorrentFile(daemon: *Daemon, path: []const u8) !protocol.Response {
 
     storage.validatePaths(allocator, meta) catch return .{ .failure = .{ .code = .storage_error, .message = "torrent contains unsafe or unsupported file paths" } };
 
-    const announce = validateTracker(meta) catch |err| switch (err) {
-        error.UnsupportedTrackerScheme => return .{ .failure = .{ .code = .unsupported_tracker_scheme, .message = "only plain http:// and udp:// trackers are supported in v2" } },
-        else => return .{ .failure = .{ .code = .unsupported_tracker_metadata, .message = "torrent requires a usable top-level announce tracker" } },
-    };
-    const tracker_records = try buildTrackerRecords(daemon.allocator, &.{announce});
+    const tiered = torrent.collectTrackers(allocator, meta) catch return .{ .failure = .{ .code = .internal_error, .message = "out of memory" } };
+    defer allocator.free(tiered);
+    const built = buildTieredTrackerRecords(allocator, tiered) catch return .{ .failure = .{ .code = .internal_error, .message = "out of memory" } };
+    const tracker_records = built.records;
+    const unsupported = built.unsupported;
     defer freeTrackerRecords(daemon.allocator, tracker_records);
+    defer freeStringSlice(daemon.allocator, unsupported);
+
+    const dht_ok = daemon.cfg.network.dht.enabled and !meta.private_torrent;
+    if (tracker_records.len == 0 and !dht_ok) {
+        if (unsupported.len > 0) return .{ .failure = .{ .code = .unsupported_tracker_scheme, .message = "torrent trackers use unsupported schemes and DHT is unavailable" } };
+        return .{ .failure = .{ .code = .no_discovery_source, .message = "torrent has no supported trackers and DHT is unavailable" } };
+    }
     const hex_buf = state.infoHashHex(meta.info_hash);
     const hex = &hex_buf;
     if (daemon.registry.findCompletion(hex) != null) return .{ .failure = .{ .code = .already_completed, .message = "torrent already completed and cannot be re-added in v2" } };
@@ -407,6 +565,7 @@ fn addTorrentFile(daemon: *Daemon, path: []const u8) !protocol.Response {
         .status = .active,
         .trackers = tracker_records,
         .private_torrent = meta.private_torrent,
+        .unsupported_tracker_warnings = unsupported,
     };
     staging.applyProvisioned(&rec, provisioned);
     try allocateDhtSlot(daemon, &rec, meta.private_torrent);
@@ -432,17 +591,44 @@ fn releaseDhtSlot(daemon: *Daemon, rec: state.TorrentRecord) void {
     if (rec.dht_slot) |slot| daemon.dht_slots.release(slot);
 }
 
-fn validateTracker(meta: torrent.Metadata) ![]const u8 {
-    const announce = meta.announce orelse return error.UnsupportedTrackerMetadata;
-    if (!tracker.isSupportedTrackerScheme(announce)) return error.UnsupportedTrackerScheme;
-    return announce;
-}
-
 fn buildTrackerRecords(allocator: std.mem.Allocator, urls: []const []const u8) ![]state.TrackerRecord {
     const records = try allocator.alloc(state.TrackerRecord, urls.len);
     errdefer allocator.free(records);
     for (urls, 0..) |url, i| records[i] = .{ .url = try allocator.dupe(u8, url) };
     return records;
+}
+
+const TieredBuild = struct {
+    records: []state.TrackerRecord,
+    unsupported: []const []const u8,
+};
+
+/// Split BEP 12 tier-tagged trackers into supported-scheme `TrackerRecord`s
+/// (carrying their tier) and an unsupported-URL warning list.
+fn buildTieredTrackerRecords(allocator: std.mem.Allocator, tiered: []const torrent.TieredTracker) !TieredBuild {
+    var records: std.ArrayList(state.TrackerRecord) = .empty;
+    errdefer {
+        for (records.items) |*tr| tr.deinit(allocator);
+        records.deinit(allocator);
+    }
+    var warns: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (warns.items) |w| allocator.free(w);
+        warns.deinit(allocator);
+    }
+    for (tiered) |t| {
+        if (tracker.isSupportedTrackerScheme(t.url)) {
+            try records.append(allocator, .{ .url = try allocator.dupe(u8, t.url), .tier = t.tier });
+        } else {
+            try warns.append(allocator, try allocator.dupe(u8, t.url));
+        }
+    }
+    return .{ .records = try records.toOwnedSlice(allocator), .unsupported = try warns.toOwnedSlice(allocator) };
+}
+
+fn freeStringSlice(allocator: std.mem.Allocator, items: []const []const u8) void {
+    for (items) |item| allocator.free(item);
+    allocator.free(items);
 }
 
 fn freeTrackerRecords(allocator: std.mem.Allocator, records: []state.TrackerRecord) void {
@@ -470,7 +656,26 @@ fn showResponse(daemon: *Daemon, rec: state.TorrentRecord) !protocol.Response {
     try root.put(allocator, "verified_piece_count", .{ .integer = @intCast(rec.verified_piece_count) });
     try root.put(allocator, "derived_activity", .{ .string = state.derivedActivity(rec) });
     try root.put(allocator, "connected_peer_count", .{ .integer = @intCast(rec.connected_peer_count) });
+    try root.put(allocator, "listen_port", .{ .integer = @intCast(daemon.cfg.network.listen_port) });
+    try root.put(allocator, "inbound_peer_count", .{ .integer = @intCast(sessionInboundCount(daemon, rec.info_hash_hex)) });
+    try root.put(allocator, "max_inbound_peers_per_torrent", .{ .integer = @intCast(daemon.cfg.limits.max_inbound_peers_per_torrent) });
+    try root.put(allocator, "peer_families", .{ .object = try peerFamiliesObject(daemon, allocator, rec.info_hash_hex) });
+    try root.put(allocator, "encryption_modes", .{ .object = try encryptionModesObject(daemon, allocator, rec.info_hash_hex) });
+    if (daemon.engine.findSession(rec.info_hash_hex)) |sess| {
+        try root.put(allocator, "peer_candidate_count", .{ .integer = @intCast(sess.peer_candidates.items.len) });
+    }
+    var pm_obj: std.json.ObjectMap = .empty;
+    errdefer pm_obj.deinit(allocator);
+    try pm_obj.put(allocator, "enabled", .{ .bool = daemon.cfg.network.port_mapping.enabled });
+    try pm_obj.put(allocator, "listen_state", .{ .string = daemon.port_mapper.listen_state.label() });
+    try root.put(allocator, "port_mapping", .{ .object = pm_obj });
     try root.put(allocator, "trackers", .{ .array = try trackersShowArray(allocator, rec) });
+    if (daemon.engine.findSession(rec.info_hash_hex)) |sess| {
+        if (sess.trackers.items.len > 0 and sess.tracker_cursor < sess.trackers.items.len) {
+            try root.put(allocator, "current_tracker_tier", .{ .integer = @intCast(sess.trackers.items[sess.tracker_cursor].tier) });
+            try root.put(allocator, "current_tracker_url", .{ .string = sess.trackers.items[sess.tracker_cursor].raw_url });
+        }
+    }
     try root.put(allocator, "dht_eligible", .{ .bool = !rec.private_torrent and daemon.cfg.network.dht.enabled });
     if (rec.dht_slot) |slot| {
         try root.put(allocator, "dht_slot", .{ .integer = @intCast(slot) });
@@ -490,12 +695,67 @@ fn trackersShowArray(allocator: std.mem.Allocator, rec: state.TorrentRecord) !st
         var obj: std.json.ObjectMap = .empty;
         errdefer obj.deinit(allocator);
         try obj.put(allocator, "url", .{ .string = tr.url });
+        try obj.put(allocator, "tier", .{ .integer = @intCast(tr.tier) });
         try obj.put(allocator, "status", .{ .string = state.trackerShowStatus(tr) });
         try obj.put(allocator, "last_error", if (tr.last_error) |s| .{ .string = s } else .null);
         try obj.put(allocator, "next_announce", .{ .integer = tr.next_announce_ms });
         try arr.append(.{ .object = obj });
     }
     return arr;
+}
+
+fn sessionInboundCount(daemon: *Daemon, info_hash_hex: []const u8) u64 {
+    const sess = daemon.engine.findSession(info_hash_hex) orelse return 0;
+    var n: u64 = 0;
+    for (sess.peers.items) |p| if (p.direction == .inbound) {
+        n += 1;
+    };
+    for (sess.metadata_peers.items) |p| if (p.direction == .inbound) {
+        n += 1;
+    };
+    return n;
+}
+
+/// Counts connected peers by address family for `show`, surfacing dual-stack usage.
+fn peerFamiliesObject(daemon: *Daemon, allocator: std.mem.Allocator, info_hash_hex: []const u8) !std.json.ObjectMap {
+    var obj: std.json.ObjectMap = .empty;
+    errdefer obj.deinit(allocator);
+    var v4: i64 = 0;
+    var v6: i64 = 0;
+    if (daemon.engine.findSession(info_hash_hex)) |sess| {
+        for (sess.peers.items) |p| switch (p.peer_addr.ip) {
+            .v4 => v4 += 1,
+            .v6 => v6 += 1,
+        };
+        for (sess.metadata_peers.items) |p| switch (p.peer_addr.ip) {
+            .v4 => v4 += 1,
+            .v6 => v6 += 1,
+        };
+    }
+    try obj.put(allocator, "ipv4", .{ .integer = v4 });
+    try obj.put(allocator, "ipv6", .{ .integer = v6 });
+    return obj;
+}
+
+/// Counts connected peers by negotiated encryption mode for `show`.
+fn encryptionModesObject(daemon: *Daemon, allocator: std.mem.Allocator, info_hash_hex: []const u8) !std.json.ObjectMap {
+    var obj: std.json.ObjectMap = .empty;
+    errdefer obj.deinit(allocator);
+    var plaintext: i64 = 0;
+    var obfuscated: i64 = 0;
+    var encrypted: i64 = 0;
+    if (daemon.engine.findSession(info_hash_hex)) |sess| {
+        const lists = [_][]const @import("peer.zig").Connection{ sess.peers.items, sess.metadata_peers.items };
+        for (lists) |list| for (list) |p| switch (p.encryption_mode) {
+            .plaintext => plaintext += 1,
+            .obfuscated => obfuscated += 1,
+            .encrypted => encrypted += 1,
+        };
+    }
+    try obj.put(allocator, "plaintext", .{ .integer = plaintext });
+    try obj.put(allocator, "obfuscated", .{ .integer = obfuscated });
+    try obj.put(allocator, "encrypted", .{ .integer = encrypted });
+    return obj;
 }
 
 fn summaryValue(daemon: *Daemon, allocator: std.mem.Allocator, rec: state.TorrentRecord) !std.json.Value {

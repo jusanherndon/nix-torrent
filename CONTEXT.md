@@ -25,8 +25,8 @@ A peer discovery service identified by an announce URL that tells the torrent cl
 _Avoid_: Search engine, indexer, peer, tracker set
 
 **Tracker Tier**:
-An ordered group of Tracker announce URLs. For `.torrent` files, tiers come from `announce-list` (BEP 12). For magnets, all `tr=` URLs form one synthetic tier in URI order. The client announces sequentially within the current tier, prefers a working tracker, and advances tiers only when the current tier is exhausted.
-_Avoid_: Tracker list, parallel announce set, unordered magnet bag
+An ordered group of Tracker announce URLs. For `.torrent` files, tiers come from `announce-list` (BEP 12). For magnets, all `tr=` URLs form one synthetic tier in URI order. After metadata exists, the client announces sequentially within the current tier, prefers a working tracker, and advances tiers only when the current tier is exhausted. While fetching magnet metadata, the client may announce multiple due trackers per tick (up to `max_tracker_announces_per_tick`) for peer diversity before metadata exists.
+_Avoid_: Tracker list, unordered magnet bag
 
 **Private Torrent**:
 A torrent whose metadata forbids distributed peer discovery such as DHT; it may only use Trackers named in its metadata.
@@ -133,7 +133,7 @@ A peer connection that uses the standard BitTorrent handshake without MSE.
 _Avoid_: Obfuscated peer connection, encrypted peer connection, encryption policy
 
 **Encryption Policy**:
-A torrent-client setting that controls Message Stream Encryption for outbound and inbound Peer connections. `disable` uses a Plaintext Peer Connection (standard BitTorrent handshake, no MSE). `prefer` completes MSE and selects RC4 when offered, otherwise plaintext-within-MSE (`0x01`), and never falls back to a non-MSE BitTorrent handshake; peers that do not speak MSE are skipped. `require` accepts only peers that negotiate RC4 (`0x02`). On inbound MSE, the daemon probes active eligible torrents’ info hashes to finish key derivation, then demuxes onto the matching session.
+A torrent-client setting that controls Message Stream Encryption for outbound and inbound Peer connections. `disable` uses a Plaintext Peer Connection (standard BitTorrent handshake, no MSE). `prefer` completes MSE and selects RC4 when offered, otherwise plaintext-within-MSE (`0x01`). Peers that cleanly speak only plain BitTorrent (`PeerNotMse`) are skipped. After a mid-MSE abort (`MsePe2Short` / `MseVcEof` / `MseVcNotFound`) on outbound connects, `prefer` retries once on a fresh TCP connection with plaintext (ADR 0004 live-swarm refinement). `require` accepts only peers that negotiate RC4 (`0x02`). On inbound MSE, the daemon probes active eligible torrents’ info hashes to finish key derivation, then demuxes onto the matching session.
 _Avoid_: Encryption scheme, crypto flag, tracker announce parameter, outbound-only policy
 
 **Tracker MSE Signaling**:

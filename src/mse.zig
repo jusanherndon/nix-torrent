@@ -281,6 +281,97 @@ pub fn establishResponder(
     };
 }
 
+pub const ResponderMatch = struct {
+    established: Established,
+    info_hash: torrent.InfoHash,
+};
+
+/// MSE responder that probes the initiator's skey hash against a set of active
+/// info hashes (inbound Listen Socket path). Identifies the torrent from the
+/// obfuscated skey in PE3, then completes the handshake as `establishResponder`.
+pub fn establishResponderMulti(
+    allocator: std.mem.Allocator,
+    stream: ByteStream,
+    candidates: []const torrent.InfoHash,
+    local_peer_id: [20]u8,
+    offered_schemes: u32,
+) HandshakeError!ResponderMatch {
+    if (candidates.len == 0) return error.InfoHashMismatch;
+
+    var pe1_buf: [encryption.max_dh_packet_len]u8 = undefined;
+    const pe1_len = try readDhPeerKey(stream, &pe1_buf);
+    if (pe1_len < 96) return error.MalformedEncryption;
+    if (pe1_buf[0] == 19) return error.PeerNotMse;
+
+    var remote_pub: [96]u8 = undefined;
+    @memcpy(&remote_pub, pe1_buf[0..96]);
+
+    var dh = encryption.DhKeyExchange.generate(allocator) catch return error.OutOfMemory;
+    defer dh.deinit();
+    dh.computeShared(allocator, &remote_pub) catch return error.MalformedEncryption;
+    const shared = dh.shared().*;
+
+    stream.writeAll(dh.local_public[0..]) catch return error.ShortRead;
+
+    var frame_buf: [128]u8 = undefined;
+    var frame_len: usize = 0;
+    while (frame_len < 56) {
+        const n = stream.read(frame_buf[frame_len..56]) catch return error.ShortRead;
+        if (n == 0) return error.MalformedEncryption;
+        frame_len += n;
+    }
+    var ia_enc: [encryption.handshake_len]u8 = undefined;
+    try readExact(stream, &ia_enc);
+
+    // Identify the torrent: the initiator's obfuscated skey hash matches exactly one candidate.
+    const matched: torrent.InfoHash = blk: {
+        for (candidates) |candidate| {
+            var trial = encryption.Keystreams.derive(&shared, candidate, false);
+            if (encryption.parseInitiatorSync(&trial.decrypt, frame_buf[0..frame_len], &ia_enc, &shared, candidate)) |_| {
+                break :blk candidate;
+            } else |_| {}
+        }
+        return error.InfoHashMismatch;
+    };
+
+    var keys = encryption.Keystreams.derive(&shared, matched, false);
+    const parsed = encryption.parseInitiatorSync(&keys.decrypt, frame_buf[0..frame_len], &ia_enc, &shared, matched) catch return error.MalformedEncryption;
+
+    const selected = encryption.responderSelectScheme(parsed.crypto_provide, offered_schemes) orelse return error.UnsupportedEncryption;
+
+    var pad_b: [32]u8 = undefined;
+    @memset(&pad_b, 0xAB);
+    stream.writeAll(&pad_b) catch return error.ShortRead;
+
+    const pe4 = encryption.buildResponderSync(allocator, &keys, @intFromEnum(selected)) catch return error.OutOfMemory;
+    defer allocator.free(pe4);
+    stream.writeAll(pe4) catch return error.ShortRead;
+
+    var hs_out: [encryption.handshake_len]u8 = undefined;
+    encodeBtHandshake(&hs_out, matched, local_peer_id, false);
+    if (selected == .rc4) {
+        var hs_scratch = hs_out;
+        keys.encrypt.crypt(&hs_scratch);
+        stream.writeAll(&hs_scratch) catch return error.ShortRead;
+    } else {
+        stream.writeAll(&hs_out) catch return error.ShortRead;
+    }
+
+    if (!std.mem.eql(u8, &infoHashFromHandshake(&parsed.initiator_handshake), &matched)) {
+        return error.InfoHashMismatch;
+    }
+
+    return .{
+        .established = .{
+            .mode = encryption.modeForScheme(selected),
+            .crypto = if (selected == .rc4) keys else null,
+            .remote_handshake = parsed.initiator_handshake,
+            .leftover = &.{},
+        },
+        .info_hash = matched,
+    };
+}
+
 test "establish initiator refuses disable policy" {
     const stream = ByteStream{
         .ptr = undefined,

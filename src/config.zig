@@ -12,6 +12,8 @@ pub const Limits = struct {
     max_piece_count: u64 = 1_000_000,
     max_active_torrents: u64 = 20,
     max_peers_per_torrent: u64 = 50,
+    max_inbound_peers_per_torrent: u64 = 20,
+    max_inbound_handshakes: u64 = 32,
     max_peer_connect_attempts_per_tick: u64 = 5,
     max_tracker_announces_per_tick: u64 = 4,
     max_in_progress_pieces_per_torrent: u64 = 4,
@@ -36,18 +38,41 @@ pub const Encryption = struct {
     policy: []const u8 = "prefer",
 };
 
+pub const Pex = struct { enabled: bool = true };
+pub const Lsd = struct { enabled: bool = true };
+
+const default_port_mapping_protocols = [_][]const u8{ "natpmp", "upnp" };
+
+pub const PortMapping = struct {
+    enabled: bool = true,
+    protocols: []const []const u8 = &default_port_mapping_protocols,
+};
+
 pub const Network = struct {
-    dht_base_port: u64 = 6881,
+    /// TCP port advertised to trackers/DHT and bound for inbound BitTorrent peers.
+    listen_port: u64 = 6881,
+    /// Base UDP port for per-torrent DHT sockets (dht_base_port + slot).
+    dht_base_port: u64 = 6882,
     peer_connect_timeout_ms: u64 = 10_000,
+    /// Shorter TCP connect timeout used while fetching magnet metadata so dead
+    /// peer candidates do not monopolize the dial budget.
+    metadata_peer_connect_timeout_ms: u64 = 2_500,
     /// Wall-clock cap for outbound connect+handshake work in one engine tick.
     /// Always allows at least one attempt; further attempts stop once elapsed time hits this budget.
     peer_connect_batch_budget_ms: u64 = 15_000,
+    /// After a failed dial, skip that candidate until this cooldown elapses.
+    peer_connect_fail_cooldown_ms: u64 = 60_000,
     peer_request_timeout_ms: u64 = 30_000,
     tracker_request_timeout_ms: u64 = 10_000,
     tracker_retry_min_ms: u64 = 30_000,
     tracker_retry_max_ms: u64 = 300_000,
+    /// Optional PEM bundle for HTTPS trackers; null uses the system CA store.
+    tracker_ca_file: ?[]const u8 = null,
     dht: Dht = .{},
     encryption: Encryption = .{},
+    pex: Pex = .{},
+    lsd: Lsd = .{},
+    port_mapping: PortMapping = .{},
 };
 pub const Logging = struct { level: []const u8 = log.default_level, format: []const u8 = "json" };
 
@@ -72,6 +97,11 @@ pub const Config = struct {
         }
         if (self.network.dht.bootstrap_nodes.ptr != &default_bootstrap_nodes) {
             allocator.free(self.network.dht.bootstrap_nodes);
+        }
+        if (self.network.tracker_ca_file) |ca| allocator.free(ca);
+        if (self.network.port_mapping.protocols.ptr != &default_port_mapping_protocols) {
+            for (self.network.port_mapping.protocols) |p| allocator.free(p);
+            allocator.free(self.network.port_mapping.protocols);
         }
     }
 };
@@ -188,10 +218,21 @@ pub fn validateDaemon(cfg: Config) !void {
     if (cfg.limits.max_peer_connect_attempts_per_tick == 0 or cfg.limits.max_peer_connect_attempts_per_tick > cfg.limits.max_peers_per_torrent) return ConfigError.InvalidConfig;
     if (cfg.limits.max_tracker_announces_per_tick == 0) return ConfigError.InvalidConfig;
     if (cfg.engine.block_request_bytes == 0 or cfg.engine.block_request_bytes > cfg.limits.max_piece_bytes) return ConfigError.InvalidConfig;
+    if (cfg.network.listen_port == 0 or cfg.network.listen_port > 65535) return ConfigError.InvalidConfig;
     if (cfg.network.dht_base_port == 0 or cfg.network.dht_base_port > 65535) return ConfigError.InvalidConfig;
     if (cfg.network.dht_base_port + cfg.limits.max_active_torrents > 65535) return ConfigError.InvalidConfig;
+    // The listen port must not collide with any per-torrent DHT UDP port.
+    if (cfg.network.listen_port >= cfg.network.dht_base_port and
+        cfg.network.listen_port < cfg.network.dht_base_port + cfg.limits.max_active_torrents)
+        return ConfigError.InvalidConfig;
+    if (cfg.limits.max_inbound_peers_per_torrent == 0 or cfg.limits.max_inbound_handshakes == 0) return ConfigError.InvalidConfig;
+    for (cfg.network.port_mapping.protocols) |p| {
+        if (!std.mem.eql(u8, p, "natpmp") and !std.mem.eql(u8, p, "upnp")) return ConfigError.InvalidConfig;
+    }
     if (cfg.network.peer_connect_timeout_ms == 0) return ConfigError.InvalidConfig;
+    if (cfg.network.metadata_peer_connect_timeout_ms == 0) return ConfigError.InvalidConfig;
     if (cfg.network.peer_connect_batch_budget_ms == 0) return ConfigError.InvalidConfig;
+    if (cfg.network.peer_connect_fail_cooldown_ms == 0) return ConfigError.InvalidConfig;
     if (cfg.network.tracker_retry_min_ms > cfg.network.tracker_retry_max_ms) return ConfigError.InvalidConfig;
     if (!std.mem.eql(u8, cfg.logging.format, "json")) return ConfigError.InvalidConfig;
     if (log.parseLevel(cfg.logging.level) == null) return ConfigError.InvalidConfig;
@@ -214,7 +255,7 @@ fn isDefaultBootstrapNode(node: []const u8) bool {
 }
 
 fn parseTomlInto(allocator: std.mem.Allocator, cfg: *Config, bytes: []const u8) !void {
-    var section: enum { root, paths, limits, engine, network, network_dht, network_encryption, logging } = .root;
+    var section: enum { root, paths, limits, engine, network, network_dht, network_encryption, network_pex, network_lsd, network_port_mapping, logging } = .root;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |raw_line| {
         const no_comment = if (std.mem.indexOfScalar(u8, raw_line, '#')) |n| raw_line[0..n] else raw_line;
@@ -222,7 +263,7 @@ fn parseTomlInto(allocator: std.mem.Allocator, cfg: *Config, bytes: []const u8) 
         if (line.len == 0) continue;
         if (line[0] == '[' and line[line.len - 1] == ']') {
             const name = line[1 .. line.len - 1];
-            section = if (std.mem.eql(u8, name, "paths")) .paths else if (std.mem.eql(u8, name, "limits")) .limits else if (std.mem.eql(u8, name, "engine")) .engine else if (std.mem.eql(u8, name, "network.dht")) .network_dht else if (std.mem.eql(u8, name, "network.encryption")) .network_encryption else if (std.mem.eql(u8, name, "network")) .network else if (std.mem.eql(u8, name, "logging")) .logging else return ConfigError.InvalidConfig;
+            section = if (std.mem.eql(u8, name, "paths")) .paths else if (std.mem.eql(u8, name, "limits")) .limits else if (std.mem.eql(u8, name, "engine")) .engine else if (std.mem.eql(u8, name, "network.dht")) .network_dht else if (std.mem.eql(u8, name, "network.encryption")) .network_encryption else if (std.mem.eql(u8, name, "network.pex")) .network_pex else if (std.mem.eql(u8, name, "network.lsd")) .network_lsd else if (std.mem.eql(u8, name, "network.port_mapping")) .network_port_mapping else if (std.mem.eql(u8, name, "network")) .network else if (std.mem.eql(u8, name, "logging")) .logging else return ConfigError.InvalidConfig;
             continue;
         }
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse return ConfigError.InvalidConfig;
@@ -232,9 +273,12 @@ fn parseTomlInto(allocator: std.mem.Allocator, cfg: *Config, bytes: []const u8) 
             .paths => try parsePath(allocator, cfg, key, value),
             .limits => try parseLimit(&cfg.limits, key, value),
             .engine => try parseEngine(&cfg.engine, key, value),
-            .network => try parseNetwork(&cfg.network, key, value),
+            .network => try parseNetwork(allocator, &cfg.network, key, value),
             .network_dht => try parseDht(allocator, &cfg.network.dht, key, value),
             .network_encryption => try parseEncryption(allocator, &cfg.network.encryption, key, value),
+            .network_pex => try parseBoolSection("enabled", &cfg.network.pex.enabled, key, value),
+            .network_lsd => try parseBoolSection("enabled", &cfg.network.lsd.enabled, key, value),
+            .network_port_mapping => try parsePortMapping(allocator, &cfg.network.port_mapping, key, value),
             .logging => try parseLogging(allocator, &cfg.logging, key, value),
             .root => return ConfigError.InvalidConfig,
         }
@@ -266,20 +310,53 @@ fn parseLimit(l: *Limits, key: []const u8, value: []const u8) !void {
 fn parseEngine(e: *Engine, key: []const u8, value: []const u8) !void {
     if (std.mem.eql(u8, key, "block_request_bytes")) e.block_request_bytes = try parseInt(value) else return ConfigError.InvalidConfig;
 }
-fn parseNetwork(n: *Network, key: []const u8, value: []const u8) !void {
-    const v = try parseInt(value);
-    if (std.mem.eql(u8, key, "announce_port")) {
-        n.dht_base_port = v;
+fn parseNetwork(allocator: std.mem.Allocator, n: *Network, key: []const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, key, "tracker_ca_file")) {
+        const s = try parseString(value);
+        if (n.tracker_ca_file) |old| allocator.free(old);
+        n.tracker_ca_file = try allocator.dupe(u8, s);
         return;
     }
-    if (std.mem.eql(u8, key, "dht_base_port")) n.dht_base_port = v
+    const v = try parseInt(value);
+    // Legacy v2 `announce_port` now advertises the listen port (V3 split).
+    if (std.mem.eql(u8, key, "announce_port")) {
+        n.listen_port = v;
+        return;
+    }
+    if (std.mem.eql(u8, key, "listen_port")) n.listen_port = v
+    else if (std.mem.eql(u8, key, "dht_base_port")) n.dht_base_port = v
     else if (std.mem.eql(u8, key, "peer_connect_timeout_ms")) n.peer_connect_timeout_ms = v
+    else if (std.mem.eql(u8, key, "metadata_peer_connect_timeout_ms")) n.metadata_peer_connect_timeout_ms = v
     else if (std.mem.eql(u8, key, "peer_connect_batch_budget_ms")) n.peer_connect_batch_budget_ms = v
+    else if (std.mem.eql(u8, key, "peer_connect_fail_cooldown_ms")) n.peer_connect_fail_cooldown_ms = v
     else if (std.mem.eql(u8, key, "peer_request_timeout_ms")) n.peer_request_timeout_ms = v
     else if (std.mem.eql(u8, key, "tracker_request_timeout_ms")) n.tracker_request_timeout_ms = v
     else if (std.mem.eql(u8, key, "tracker_retry_min_ms")) n.tracker_retry_min_ms = v
     else if (std.mem.eql(u8, key, "tracker_retry_max_ms")) n.tracker_retry_max_ms = v
     else return ConfigError.InvalidConfig;
+}
+
+fn parseBoolSection(expected_key: []const u8, target: *bool, key: []const u8, value: []const u8) !void {
+    if (!std.mem.eql(u8, key, expected_key)) return ConfigError.InvalidConfig;
+    const s = try parseString(value);
+    target.* = std.mem.eql(u8, s, "true");
+}
+
+fn parsePortMapping(allocator: std.mem.Allocator, pm: *PortMapping, key: []const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, key, "enabled")) {
+        const s = try parseString(value);
+        pm.enabled = std.mem.eql(u8, s, "true");
+        return;
+    }
+    if (std.mem.eql(u8, key, "protocols")) {
+        if (pm.protocols.ptr != &default_port_mapping_protocols) {
+            for (pm.protocols) |p| allocator.free(p);
+            allocator.free(pm.protocols);
+        }
+        pm.protocols = try parseStringArray(allocator, value);
+        return;
+    }
+    return ConfigError.InvalidConfig;
 }
 
 pub fn encryptionPolicy(network: Network) @import("encryption.zig").Policy {
@@ -366,6 +443,43 @@ test "loads explicit paths from toml and ignores legacy flags while selecting co
     try std.testing.expectEqualStrings("srv/downloads", cfg.final_destination);
     try std.testing.expectEqualStrings("run/nix-torrent.sock", cfg.socket_path);
     try std.testing.expectEqual(@as(u64, 7), cfg.limits.max_active_torrents);
+}
+
+test "parses v3 network knobs and announce_port aliases listen_port" {
+    var cfg = try defaults(std.testing.allocator, null);
+    defer cfg.deinit(std.testing.allocator);
+    try parseTomlInto(std.testing.allocator, &cfg,
+        \\[network]
+        \\announce_port = 7000
+        \\dht_base_port = 7100
+        \\[network.pex]
+        \\enabled = "false"
+        \\[network.lsd]
+        \\enabled = "false"
+        \\[network.port_mapping]
+        \\enabled = "false"
+        \\protocols = ["natpmp"]
+        \\[limits]
+        \\max_inbound_peers_per_torrent = 10
+        \\max_inbound_handshakes = 16
+    );
+    try std.testing.expectEqual(@as(u64, 7000), cfg.network.listen_port);
+    try std.testing.expectEqual(@as(u64, 7100), cfg.network.dht_base_port);
+    try std.testing.expect(!cfg.network.pex.enabled);
+    try std.testing.expect(!cfg.network.lsd.enabled);
+    try std.testing.expect(!cfg.network.port_mapping.enabled);
+    try std.testing.expectEqual(@as(usize, 1), cfg.network.port_mapping.protocols.len);
+    try std.testing.expectEqual(@as(u64, 10), cfg.limits.max_inbound_peers_per_torrent);
+    try validateDaemon(cfg);
+}
+
+test "rejects listen_port overlapping dht port range" {
+    var cfg = try defaults(std.testing.allocator, null);
+    defer cfg.deinit(std.testing.allocator);
+    cfg.network.dht_base_port = 6881;
+    cfg.network.listen_port = 6885; // inside [6881, 6881+max_active_torrents)
+    cfg.limits.max_active_torrents = 20;
+    try std.testing.expectError(ConfigError.InvalidConfig, validateDaemon(cfg));
 }
 
 test "rejects unknown flags" {

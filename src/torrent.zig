@@ -169,6 +169,31 @@ fn parseOwnedBytes(allocator: std.mem.Allocator, bytes: []const u8) !Metadata {
     };
 }
 
+pub const TieredTracker = struct { url: []const u8, tier: usize };
+
+/// Flatten `announce-list` (BEP 12) into ordered tier-tagged trackers, falling
+/// back to the top-level `announce`. Returned URLs reference `meta` and must not
+/// outlive it; only the outer slice is owned by the caller.
+pub fn collectTrackers(allocator: std.mem.Allocator, meta: Metadata) ![]TieredTracker {
+    var out: std.ArrayList(TieredTracker) = .empty;
+    errdefer out.deinit(allocator);
+    if (meta.root.dictGet("announce-list")) |al| {
+        if (al == .list) {
+            for (al.list, 0..) |tier_val, tier_idx| {
+                if (tier_val != .list) continue;
+                for (tier_val.list) |url_val| {
+                    if (url_val != .string or url_val.string.len == 0) continue;
+                    try out.append(allocator, .{ .url = url_val.string, .tier = tier_idx });
+                }
+            }
+        }
+    }
+    if (out.items.len == 0) {
+        if (meta.announce) |a| try out.append(allocator, .{ .url = a, .tier = 0 });
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn requiredString(dict: bencode.Value, key: []const u8, missing_error: Error, invalid_error: Error) Error![]const u8 {
     const value = dict.dictGet(key) orelse return missing_error;
     return switch (value) {
@@ -265,6 +290,39 @@ test "parses multi-file fixture" {
     try std.testing.expectEqualStrings("dir", files[0].path[0]);
     try std.testing.expectEqualStrings("a.txt", files[0].path[1]);
     try std.testing.expectEqual(@as(u64, 5), files[1].length);
+}
+
+test "collectTrackers flattens announce-list into ordered tiers" {
+    const info = "d6:lengthi4e4:name1:x12:piece lengthi4e6:pieces20:01234567890123456789e";
+    const list = "l" ++ "l27:udp://tracker0.example:69699:wss://bade" ++ "l10:http://t1a10:http://t1be" ++ "e";
+    const raw = "d13:announce-list" ++ list ++ "4:info" ++ info ++ "e";
+    const metadata = try Metadata.parseBytes(std.testing.allocator, raw);
+    defer metadata.deinit();
+
+    const trackers = try collectTrackers(std.testing.allocator, metadata);
+    defer std.testing.allocator.free(trackers);
+
+    try std.testing.expectEqual(@as(usize, 4), trackers.len);
+    try std.testing.expectEqualStrings("udp://tracker0.example:6969", trackers[0].url);
+    try std.testing.expectEqual(@as(usize, 0), trackers[0].tier);
+    try std.testing.expectEqualStrings("wss://bad", trackers[1].url);
+    try std.testing.expectEqual(@as(usize, 0), trackers[1].tier);
+    try std.testing.expectEqualStrings("http://t1a", trackers[2].url);
+    try std.testing.expectEqual(@as(usize, 1), trackers[2].tier);
+    try std.testing.expectEqual(@as(usize, 1), trackers[3].tier);
+}
+
+test "collectTrackers falls back to top-level announce" {
+    const fixture = @embedFile("fixtures/single-file.torrent");
+    const metadata = try Metadata.parseBytes(std.testing.allocator, fixture);
+    defer metadata.deinit();
+    const trackers = try collectTrackers(std.testing.allocator, metadata);
+    defer std.testing.allocator.free(trackers);
+    if (metadata.announce) |a| {
+        try std.testing.expectEqual(@as(usize, 1), trackers.len);
+        try std.testing.expectEqualStrings(a, trackers[0].url);
+        try std.testing.expectEqual(@as(usize, 0), trackers[0].tier);
+    }
 }
 
 test "rejects invalid pieces length" {

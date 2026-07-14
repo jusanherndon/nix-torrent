@@ -59,8 +59,11 @@ pub const Engine = struct {
             trackers.deinit(self.allocator);
         }
 
-        const announce_port: u16 = if (rec.dht_slot) |slot| @intCast(cfg.network.dht_base_port + slot) else @intCast(cfg.network.dht_base_port);
-        const dht_socket = try openDhtSocket(io, self.allocator, rec, dht_ctx, announce_port);
+        // V3: trackers and DHT announce_peer advertise the listen port, while the
+        // per-torrent DHT socket binds to dht_base_port + slot.
+        const dht_bind_port: u16 = if (rec.dht_slot) |slot| @intCast(cfg.network.dht_base_port + slot) else @intCast(cfg.network.dht_base_port);
+        const advertise_port: u16 = @intCast(cfg.network.listen_port);
+        const dht_socket = try openDhtSocket(io, self.allocator, rec, dht_ctx, dht_bind_port);
 
         const sess = TorrentSession{
             .info_hash_hex = rec.info_hash_hex,
@@ -70,7 +73,7 @@ pub const Engine = struct {
             .layout = loaded.layout,
             .content_dir = loaded.content_dir,
             .trackers = trackers,
-            .announce_port = announce_port,
+            .announce_port = advertise_port,
             .dht_socket = dht_socket,
             .peers = .empty,
             .metadata_peers = .empty,
@@ -92,8 +95,9 @@ pub const Engine = struct {
             trackers.deinit(self.allocator);
         }
 
-        const announce_port: u16 = if (rec.dht_slot) |slot| @intCast(cfg.network.dht_base_port + slot) else @intCast(cfg.network.dht_base_port);
-        const dht_socket = try openDhtSocket(io, self.allocator, rec, dht_ctx, announce_port);
+        const dht_bind_port: u16 = if (rec.dht_slot) |slot| @intCast(cfg.network.dht_base_port + slot) else @intCast(cfg.network.dht_base_port);
+        const advertise_port: u16 = @intCast(cfg.network.listen_port);
+        const dht_socket = try openDhtSocket(io, self.allocator, rec, dht_ctx, dht_bind_port);
 
         const sess = TorrentSession{
             .info_hash_hex = rec.info_hash_hex,
@@ -103,7 +107,7 @@ pub const Engine = struct {
             .layout = null,
             .content_dir = null,
             .trackers = trackers,
-            .announce_port = announce_port,
+            .announce_port = advertise_port,
             .dht_socket = dht_socket,
             .peers = .empty,
             .metadata_peers = .empty,
@@ -130,6 +134,20 @@ pub const Engine = struct {
             if (std.mem.eql(u8, sess.info_hash_hex, info_hash_hex)) return sess;
         }
         return null;
+    }
+
+    /// Total inbound (Listen Socket) peers currently attached across all sessions.
+    pub fn inboundPeerCount(self: *Engine) u64 {
+        var n: u64 = 0;
+        for (self.sessions.items) |*sess| {
+            for (sess.peers.items) |p| {
+                if (p.direction == .inbound) n += 1;
+            }
+            for (sess.metadata_peers.items) |p| {
+                if (p.direction == .inbound) n += 1;
+            }
+        }
+        return n;
     }
 
     pub fn sendTrackerEvent(
@@ -216,6 +234,7 @@ fn buildTrackerEndpoints(allocator: std.mem.Allocator, cfg: config.Config, rec: 
         try trackers.append(allocator, .{
             .raw_url = try allocator.dupe(u8, tr_rec.url),
             .parsed = parsed,
+            .tier = tr_rec.tier,
             .state = .{
                 .next_announce_ms = tr_rec.next_announce_ms,
                 .last_error = if (tr_rec.last_error) |s| try allocator.dupe(u8, s) else null,

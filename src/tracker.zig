@@ -1,4 +1,5 @@
 const std = @import("std");
+const address = @import("address.zig");
 const bencode = @import("bencode.zig");
 const dns = @import("dns.zig");
 const encryption = @import("encryption.zig");
@@ -8,7 +9,26 @@ const torrent = @import("torrent.zig");
 
 const net = std.Io.net;
 
-pub const Peer = struct { ip: [4]u8, port: u16, crypto_required: bool = false };
+pub const Ip = address.Ip;
+
+/// A dual-stack peer candidate learned from a Tracker, DHT, PEX, or LSD.
+pub const Peer = struct {
+    ip: address.Ip,
+    port: u16,
+    crypto_required: bool = false,
+
+    pub fn v4(bytes: [4]u8, port: u16) Peer {
+        return .{ .ip = .{ .v4 = bytes }, .port = port };
+    }
+
+    pub fn v6(bytes: [16]u8, port: u16) Peer {
+        return .{ .ip = .{ .v6 = bytes }, .port = port };
+    }
+
+    pub fn addr(self: Peer) address.Address {
+        return .{ .ip = self.ip, .port = self.port };
+    }
+};
 pub const Announce = struct {
     interval: u64,
     peers: []Peer,
@@ -24,7 +44,7 @@ pub const Announce = struct {
 
 pub const Event = enum { none, started, stopped, completed };
 
-pub const Scheme = enum { http, udp };
+pub const Scheme = enum { http, https, udp };
 
 pub const AnnounceUrl = struct {
     scheme: Scheme,
@@ -52,6 +72,9 @@ pub const TrackerState = struct {
     retry_max_ms: i64 = 300_000,
     retry_ms: i64 = 30_000,
     started_sent: bool = false,
+    /// Failures since last success. Failover advances only after a retry
+    /// (consecutive_failures >= 2), per V3 Tracker Tier policy.
+    consecutive_failures: u32 = 0,
 
     pub fn deinit(self: *TrackerState, allocator: std.mem.Allocator) void {
         if (self.last_error) |s| allocator.free(s);
@@ -61,6 +84,7 @@ pub const TrackerState = struct {
         self.interval_ms = @max(@as(i64, @intCast(interval_sec)) * 1000, 1000);
         self.next_announce_ms = now_ms + self.interval_ms;
         self.retry_ms = self.retry_min_ms;
+        self.consecutive_failures = 0;
     }
 
     pub fn scheduleFailure(self: *TrackerState, now_ms: i64, message: []const u8, allocator: std.mem.Allocator) !void {
@@ -68,6 +92,7 @@ pub const TrackerState = struct {
         self.last_error = try allocator.dupe(u8, message);
         self.next_announce_ms = now_ms + self.retry_ms;
         self.retry_ms = @min(self.retry_ms * 2, self.retry_max_ms);
+        self.consecutive_failures += 1;
     }
 
     pub fn due(self: TrackerState, now_ms: i64) bool {
@@ -76,17 +101,26 @@ pub const TrackerState = struct {
 };
 
 pub fn isSupportedTrackerScheme(url: []const u8) bool {
-    return std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "udp://");
+    return std.mem.startsWith(u8, url, "http://") or
+        std.mem.startsWith(u8, url, "https://") or
+        std.mem.startsWith(u8, url, "udp://");
 }
 
 pub fn parseAnnounceUrl(allocator: std.mem.Allocator, url: []const u8) !AnnounceUrl {
-    const scheme: Scheme = if (std.mem.startsWith(u8, url, "http://"))
+    const scheme: Scheme = if (std.mem.startsWith(u8, url, "https://"))
+        .https
+    else if (std.mem.startsWith(u8, url, "http://"))
         .http
     else if (std.mem.startsWith(u8, url, "udp://"))
         .udp
     else
         return error.UnsupportedTrackerScheme;
-    const prefix_len: usize = if (scheme == .http) 7 else 6;
+    const is_http = scheme == .http or scheme == .https;
+    const prefix_len: usize = switch (scheme) {
+        .https => 8,
+        .http => 7,
+        .udp => 6,
+    };
     const rest = url[prefix_len..];
     const slash = std.mem.indexOfScalar(u8, rest, '/') orelse if (scheme == .udp) rest.len else return error.InvalidTrackerUrl;
     const authority = rest[0..slash];
@@ -94,11 +128,14 @@ pub fn parseAnnounceUrl(allocator: std.mem.Allocator, url: []const u8) !Announce
     const colon = std.mem.indexOfScalar(u8, authority, ':');
     const host: []const u8 = if (colon) |c| authority[0..c] else authority;
     if (host.len == 0) return error.InvalidTrackerUrl;
-    const default_port: u16 = if (scheme == .http) 80 else 80;
+    const default_port: u16 = switch (scheme) {
+        .https => 443,
+        else => 80,
+    };
     const port: u16 = if (colon) |c| std.fmt.parseInt(u16, authority[c + 1 ..], 10) catch return error.InvalidTrackerUrl else default_port;
     const q = std.mem.indexOfScalar(u8, path_part, '?');
-    const path = if (scheme == .http) path_part else if (q) |qi| path_part[0..qi] else path_part;
-    if (scheme == .http and path.len == 0) return error.InvalidTrackerUrl;
+    const path = if (is_http) path_part else if (q) |qi| path_part[0..qi] else path_part;
+    if (is_http and path.len == 0) return error.InvalidTrackerUrl;
     return .{
         .scheme = scheme,
         .host = try allocator.dupe(u8, host),
@@ -181,6 +218,94 @@ pub fn announceGet(
     };
 }
 
+/// HTTPS announce over TLS 1.2/1.3 using `std.crypto.tls.Client`. Server
+/// certificates are verified against the system CA bundle plus an optional
+/// extra PEM file (`tracker_ca_file`). There is no insecure verification path.
+pub fn announceGetTls(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    parsed: AnnounceUrl,
+    request_path: []const u8,
+    tracker_ca_file: ?[]const u8,
+    timeout_ms: u64,
+) !Announce {
+    const tls = std.crypto.tls;
+    const now = std.Io.Timestamp.now(io, .real);
+
+    var bundle: std.crypto.Certificate.Bundle = .empty;
+    defer bundle.deinit(allocator);
+    try bundle.rescan(allocator, io, now);
+    if (tracker_ca_file) |path| {
+        if (std.fs.path.isAbsolute(path))
+            try bundle.addCertsFromFilePathAbsolute(allocator, io, now, path)
+        else
+            try bundle.addCertsFromFilePath(allocator, io, now, std.Io.Dir.cwd(), path);
+    }
+    var ca_lock: std.Io.RwLock = .init;
+
+    const addr = net.IpAddress{ .ip4 = .{
+        .bytes = try resolveHost(io, parsed.host),
+        .port = parsed.port,
+    } };
+    var stream = try tcp.connectStream(io, addr.ip4.bytes, addr.ip4.port, timeout_ms);
+    defer stream.close(io);
+
+    const N = tls.Client.min_buffer_len;
+    const socket_read = try allocator.alloc(u8, N);
+    defer allocator.free(socket_read);
+    const socket_write = try allocator.alloc(u8, N);
+    defer allocator.free(socket_write);
+    const plaintext_read = try allocator.alloc(u8, N + 16 * 1024);
+    defer allocator.free(plaintext_read);
+    const plaintext_write = try allocator.alloc(u8, N);
+    defer allocator.free(plaintext_write);
+
+    var sw = stream.writer(io, socket_write);
+    var sr = stream.reader(io, socket_read);
+
+    var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
+    io.random(&entropy);
+
+    var client = tls.Client.init(&sr.interface, &sw.interface, .{
+        .host = .{ .explicit = parsed.host },
+        .ca = .{ .bundle = .{
+            .gpa = allocator,
+            .io = io,
+            .lock = &ca_lock,
+            .bundle = &bundle,
+        } },
+        .read_buffer = plaintext_read,
+        .write_buffer = plaintext_write,
+        .entropy = &entropy,
+        .realtime_now = now,
+        // Safe: tracker responses carry Content-Length / chunked framing.
+        .allow_truncation_attacks = true,
+    }) catch |err| switch (err) {
+        error.WriteFailed => return sw.err orelse error.TlsHandshakeFailed,
+        error.ReadFailed => return sr.err orelse error.TlsHandshakeFailed,
+        else => |e| return e,
+    };
+
+    var req_buf: [4096]u8 = undefined;
+    const req = try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{ request_path, parsed.host });
+    try client.writer.writeAll(req);
+    try client.writer.flush();
+    try sw.interface.flush();
+
+    const raw = client.reader.allocRemaining(allocator, .limited(2 * 1024 * 1024)) catch |err| switch (err) {
+        error.ReadFailed => return sr.err orelse error.TlsReadFailed,
+        else => |e| return e,
+    };
+    defer allocator.free(raw);
+
+    const body = try tcp.extractHttpBody(allocator, raw);
+    defer allocator.free(body);
+    return parseAnnounceResponse(allocator, body) catch |err| {
+        log.debug("tracker", "HTTPS announce parse failed for {s}:{d}: {s} (body_len={d})", .{ parsed.host, parsed.port, @errorName(err), body.len });
+        return err;
+    };
+}
+
 const udp_connect_magic: i64 = 0x0000041727101980;
 const udp_connection_ttl_ms: i64 = 50_000;
 
@@ -203,6 +328,7 @@ pub fn announce(
     left: u64,
     event: Event,
     enc_policy: encryption.Policy,
+    tracker_ca_file: ?[]const u8,
     timeout_ms: u64,
     now_ms: i64,
 ) !Announce {
@@ -211,6 +337,11 @@ pub fn announce(
             const path = try buildAnnouncePath(allocator, parsed.path, parsed.has_query, info_hash, peer_id, port, uploaded, downloaded, left, event, enc_policy);
             defer allocator.free(path);
             return announceGet(io, allocator, parsed, path, timeout_ms);
+        },
+        .https => {
+            const path = try buildAnnouncePath(allocator, parsed.path, parsed.has_query, info_hash, peer_id, port, uploaded, downloaded, left, event, enc_policy);
+            defer allocator.free(path);
+            return announceGetTls(io, allocator, parsed, path, tracker_ca_file, timeout_ms);
         },
         .udp => announceUdp(io, allocator, parsed, udp_session, info_hash, peer_id, port, uploaded, downloaded, left, event, timeout_ms, now_ms),
     };
@@ -372,11 +503,24 @@ pub fn parseAnnounceResponse(allocator: std.mem.Allocator, bytes: []const u8) !A
         else => return error.InvalidTrackerResponse,
     };
     const peers_v = root.dictGet("peers") orelse return error.InvalidTrackerResponse;
-    const peers = switch (peers_v) {
+    const peers4 = switch (peers_v) {
         .string => |compact| try parseCompactPeers(allocator, compact, root.dictGet("crypto_flags")),
         .list => |list| try parseDictionaryPeers(allocator, list),
         else => return error.InvalidTrackerResponse,
     };
+    defer allocator.free(peers4);
+
+    // BEP 7: optional compact `peers6` alongside IPv4 peers.
+    const peers6: []Peer = if (root.dictGet("peers6")) |v6| switch (v6) {
+        .string => |compact6| parseCompactPeers6(allocator, compact6) catch try allocator.alloc(Peer, 0),
+        else => try allocator.alloc(Peer, 0),
+    } else try allocator.alloc(Peer, 0);
+    defer allocator.free(peers6);
+
+    const peers = try allocator.alloc(Peer, peers4.len + peers6.len);
+    @memcpy(peers[0..peers4.len], peers4);
+    @memcpy(peers[peers4.len..], peers6);
+
     const crypto_flags = if (peers_v == .string) blk: {
         if (root.dictGet("crypto_flags")) |flags_v| {
             if (flags_v == .string) break :blk try allocator.dupe(u8, flags_v.string);
@@ -419,9 +563,25 @@ pub fn parseCompactPeers(allocator: std.mem.Allocator, bytes: []const u8, crypto
     for (peers, 0..) |*peer, i| {
         const off = i * 6;
         peer.* = .{
-            .ip = .{ bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3] },
+            .ip = .{ .v4 = .{ bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3] } },
             .port = std.mem.readInt(u16, bytes[off + 4 .. off + 6][0..2], .big),
             .crypto_required = i < flag_bytes.len and flag_bytes[i] != 0,
+        };
+    }
+    return peers;
+}
+
+/// Parses BEP 7 compact `peers6` (18-byte entries: 16-byte IPv6 + 2-byte port).
+pub fn parseCompactPeers6(allocator: std.mem.Allocator, bytes: []const u8) ![]Peer {
+    if (bytes.len % 18 != 0) return error.InvalidCompactPeers;
+    const peers = try allocator.alloc(Peer, bytes.len / 18);
+    for (peers, 0..) |*peer, i| {
+        const off = i * 18;
+        var v6: [16]u8 = undefined;
+        @memcpy(&v6, bytes[off .. off + 16]);
+        peer.* = .{
+            .ip = .{ .v6 = v6 },
+            .port = std.mem.readInt(u16, bytes[off + 16 .. off + 18][0..2], .big),
         };
     }
     return peers;
@@ -434,15 +594,23 @@ fn parseDictionaryPeers(allocator: std.mem.Allocator, list: []bencode.Value) ![]
         if (value != .dict) return error.InvalidTrackerResponse;
         const ip_s = switch (value.dictGet("ip") orelse return error.InvalidTrackerResponse) { .string => |s| s, else => return error.InvalidTrackerResponse };
         const port_i = switch (value.dictGet("port") orelse return error.InvalidTrackerResponse) { .int => |p| p, else => return error.InvalidTrackerResponse };
-        var parts = std.mem.splitScalar(u8, ip_s, '.');
-        var ip: [4]u8 = undefined;
-        var n: usize = 0;
-        while (parts.next()) |part| : (n += 1) {
-            if (n >= 4) return error.InvalidTrackerResponse;
-            ip[n] = try std.fmt.parseInt(u8, part, 10);
+        if (port_i <= 0 or port_i > 65535) return error.InvalidTrackerResponse;
+        const port: u16 = @intCast(port_i);
+        if (std.mem.indexOfScalar(u8, ip_s, ':') != null) {
+            // IPv6 literal.
+            const parsed = net.Ip6Address.parse(ip_s, port) catch return error.InvalidTrackerResponse;
+            peers[i] = .{ .ip = .{ .v6 = parsed.bytes }, .port = port };
+        } else {
+            var parts = std.mem.splitScalar(u8, ip_s, '.');
+            var ip: [4]u8 = undefined;
+            var n: usize = 0;
+            while (parts.next()) |part| : (n += 1) {
+                if (n >= 4) return error.InvalidTrackerResponse;
+                ip[n] = try std.fmt.parseInt(u8, part, 10);
+            }
+            if (n != 4) return error.InvalidTrackerResponse;
+            peers[i] = .{ .ip = .{ .v4 = ip }, .port = port };
         }
-        if (n != 4 or port_i <= 0 or port_i > 65535) return error.InvalidTrackerResponse;
-        peers[i] = .{ .ip = ip, .port = @intCast(port_i) };
     }
     return peers;
 }
@@ -474,7 +642,17 @@ test "parses announce interval and compact peers" {
     const result = try parseAnnounceResponse(std.testing.allocator, response);
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 1800), result.interval);
-    try std.testing.expectEqual(@as(u8, 127), result.peers[0].ip[0]);
+    try std.testing.expectEqual(@as(u8, 127), result.peers[0].ip.v4[0]);
+}
+
+test "parses announce peers6 alongside peers" {
+    // peers6 with a single ::1-style entry (16 bytes + 2 port).
+    const response = "d8:intervali1800e5:peers6:\x7f\x00\x00\x01\x1a\xe16:peers618:\x20\x01\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x1a\xe1e";
+    const result = try parseAnnounceResponse(std.testing.allocator, response);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), result.peers.len);
+    try std.testing.expect(result.peers[0].ip == .v4);
+    try std.testing.expect(result.peers[1].ip == .v6);
 }
 
 test "builds announce path with and without existing query parameters" {
@@ -506,8 +684,24 @@ test "parses dictionary ipv4 peer responses" {
     const dict_result = try parseAnnounceResponse(std.testing.allocator, response);
     defer dict_result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), dict_result.peers.len);
-    try std.testing.expectEqual(@as(u8, 192), dict_result.peers[0].ip[0]);
+    try std.testing.expectEqual(@as(u8, 192), dict_result.peers[0].ip.v4[0]);
     try std.testing.expectEqual(@as(u16, 6881), dict_result.peers[0].port);
+}
+
+test "parses https tracker announce url with default port 443" {
+    const parsed = try parseAnnounceUrl(std.testing.allocator, "https://tracker.example/announce");
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Scheme.https, parsed.scheme);
+    try std.testing.expectEqualStrings("tracker.example", parsed.host);
+    try std.testing.expectEqual(@as(u16, 443), parsed.port);
+    try std.testing.expectEqualStrings("/announce", parsed.path);
+}
+
+test "https and http and udp are supported schemes" {
+    try std.testing.expect(isSupportedTrackerScheme("https://t.example/announce"));
+    try std.testing.expect(isSupportedTrackerScheme("http://t.example/announce"));
+    try std.testing.expect(isSupportedTrackerScheme("udp://t.example:6969"));
+    try std.testing.expect(!isSupportedTrackerScheme("wss://t.example"));
 }
 
 test "parses udp tracker announce url" {

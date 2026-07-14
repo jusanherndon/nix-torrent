@@ -7,6 +7,9 @@ pub const Status = enum { active, paused, complete, failed };
 pub const TrackerRecord = struct {
     /// Persistence DTO: URL is stable; other fields are a projection of live TrackerState when a session is attached.
     url: []const u8,
+    /// BEP 12 Tracker Tier index. announce-list rows map to ascending tiers;
+    /// a lone announce or magnet `tr=` list is a single tier (0).
+    tier: usize = 0,
     last_error: ?[]const u8 = null,
     next_announce_ms: i64 = 0,
     started_sent: bool = false,
@@ -19,6 +22,7 @@ pub const TrackerRecord = struct {
     pub fn clone(allocator: std.mem.Allocator, record: TrackerRecord) !TrackerRecord {
         return .{
             .url = try allocator.dupe(u8, record.url),
+            .tier = record.tier,
             .last_error = if (record.last_error) |s| try allocator.dupe(u8, s) else null,
             .next_announce_ms = record.next_announce_ms,
             .started_sent = record.started_sent,
@@ -245,6 +249,8 @@ fn recordJson(allocator: std.mem.Allocator, record: TorrentRecord) ![]u8 {
         try jw.beginObject();
         try jw.objectField("url");
         try jw.write(tr.url);
+        try jw.objectField("tier");
+        try jw.write(tr.tier);
         try jw.objectField("started_sent");
         try jw.write(tr.started_sent);
         try jw.objectField("next_announce_ms");
@@ -374,6 +380,7 @@ pub fn readTorrentState(io: std.Io, allocator: std.mem.Allocator, path: []const 
     defer allocator.free(bytes);
     const WireTracker = struct {
         url: []const u8,
+        tier: usize = 0,
         started_sent: bool = false,
         next_announce_ms: i64 = 0,
         last_error: ?[]const u8 = null,
@@ -410,6 +417,7 @@ pub fn readTorrentState(io: std.Io, allocator: std.mem.Allocator, path: []const 
         for (wire_trackers, 0..) |wt, i| {
             trackers[i] = .{
                 .url = try allocator.dupe(u8, wt.url),
+                .tier = wt.tier,
                 .last_error = if (wt.last_error) |s| try allocator.dupe(u8, s) else null,
                 .next_announce_ms = wt.next_announce_ms,
                 .started_sent = wt.started_sent,

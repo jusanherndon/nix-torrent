@@ -1,11 +1,14 @@
-# Example Nix Torrent daemon configuration for v2.
+# Example Nix Torrent daemon configuration for v3.
 #
 # Configuration precedence, from highest to lowest:
 # 1. Explicit TOML selected with --config
 # 2. Default TOML at $XDG_CONFIG_HOME/nix-torrent/config.toml
 # 3. Built-in defaults
 #
-# Legacy v1 path flags and NIX_TORRENT_* environment variables are ignored in v2.
+# Legacy v1 path flags and NIX_TORRENT_* environment variables are ignored in v2+.
+# v3 adds a dual-stack inbound Listen Socket, IPv4 port mapping, DHT announce_peer,
+# PEX/LSD discovery, and HTTPS-capable Tracker Tier failover. The control protocol
+# is version 3; the CLI and daemon must be built together.
 
 [paths]
 # Client-owned incomplete content directory.
@@ -45,8 +48,15 @@ max_piece_count = 1000000
 # Maximum active torrents managed by the daemon.
 max_active_torrents = 20
 
-# Maximum connected peers per torrent.
+# Maximum connected outbound peers per torrent.
 max_peers_per_torrent = 50
+
+# Maximum connected inbound (Listen Socket) peers per torrent. Separate from the
+# outbound cap so inbound peers cannot starve outbound download progress.
+max_inbound_peers_per_torrent = 20
+
+# Daemon-global cap on concurrent inbound handshake/MSE probes before attach.
+max_inbound_handshakes = 32
 
 # Maximum outbound peer handshake attempts per engine tick (per tracker/DHT batch).
 max_peer_connect_attempts_per_tick = 5
@@ -67,16 +77,34 @@ max_in_flight_blocks_per_peer = 8
 block_request_bytes = 16384
 
 [network]
-# Port value reported to trackers. v2 does not listen for inbound peer connections on this port.
-announce_port = 6881
+# TCP Listen Port: bound dual-stack on `::` at daemon startup for inbound peers,
+# and the only port advertised to trackers and DHT announce_peer. The legacy
+# `announce_port` key is accepted as an alias for `listen_port`.
+listen_port = 6881
+
+# Base UDP port for per-torrent DHT sockets (dht_base_port + slot). Must not
+# overlap the range [dht_base_port, dht_base_port + max_active_torrents).
+# TCP (listen_port) and UDP (DHT) never share a port number.
+dht_base_port = 6882
+
+# Optional extra CA bundle (PEM) trusted for HTTPS trackers, in addition to the
+# system CA store. There is no insecure_skip_verify option in v3.
+# tracker_ca_file = "/etc/nix-torrent/extra-ca.pem"
 
 # Timeout for outbound peer TCP connection attempts.
 peer_connect_timeout_ms = 10000
+
+# Shorter TCP connect timeout used while fetching magnet metadata so dead
+# candidates do not burn the dial budget.
+metadata_peer_connect_timeout_ms = 2500
 
 # Wall-clock budget for outbound connect+handshake work per engine tick.
 # At least one attempt always runs; further attempts stop once this budget is spent
 # so control commands (show) are not blocked for max_attempts × connect timeout.
 peer_connect_batch_budget_ms = 15000
+
+# After a failed dial, skip that candidate until this cooldown elapses.
+peer_connect_fail_cooldown_ms = 60000
 
 # Timeout for in-flight block requests to a peer.
 peer_request_timeout_ms = 30000
@@ -89,6 +117,34 @@ tracker_retry_min_ms = 30000
 
 # Maximum retry delay after repeated temporary tracker failures.
 tracker_retry_max_ms = 300000
+
+[network.dht]
+# Distributed hash table peer discovery. Forced off for private torrents.
+enabled = "true"
+# bootstrap_nodes = ["router.bittorrent.com:6881", "router.utorrent.com:6881"]
+request_timeout_ms = 5000
+refresh_interval_ms = 900000
+
+[network.encryption]
+# Message Stream Encryption policy: "disable", "prefer", or "require".
+# Inbound connections use the same policy as outbound.
+policy = "prefer"
+
+[network.pex]
+# Peer Exchange (ut_pex, BEP 11). Consumed on content and metadata connections;
+# emitted only on content connections. Forced off for private torrents.
+enabled = "true"
+
+[network.lsd]
+# Local Service Discovery (BEP 14) multicast on the LAN. Forced off for private torrents.
+enabled = "true"
+
+[network.port_mapping]
+# IPv4 NAT port mapping for the Listen Port (and DHT Ports when DHT is enabled).
+# NAT-PMP/PCP is tried first, then UPnP IGD. Mapping failure never crashes the
+# daemon; LAN inbound and outbound download still work.
+enabled = "true"
+protocols = ["natpmp", "upnp"]
 
 [logging]
 # Supported v2 levels: "error", "warn", "info", "debug".

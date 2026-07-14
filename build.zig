@@ -65,6 +65,24 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const address_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/address.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
+    const dns_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dns.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
     const tcp_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/tcp.zig"),
@@ -104,6 +122,68 @@ pub fn build(b: *std.Build) void {
     const engine_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/engine.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
+    const inbound_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/inbound.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
+    const port_mapping_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/port_mapping.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
+    const pex_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/pex.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
+    const lsd_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lsd.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
+    const tracker_tier_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tracker_tier.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+
+    const control_plane_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/control_plane.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const lsd_service_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lsd_service.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -166,6 +246,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/dht.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         }),
     });
 
@@ -200,11 +281,20 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(bencode_tests).step);
     test_step.dependOn(&b.addRunArtifact(torrent_tests).step);
     test_step.dependOn(&b.addRunArtifact(storage_tests).step);
+    test_step.dependOn(&b.addRunArtifact(address_tests).step);
+    test_step.dependOn(&b.addRunArtifact(dns_tests).step);
     test_step.dependOn(&b.addRunArtifact(tcp_tests).step);
     test_step.dependOn(&b.addRunArtifact(tracker_tests).step);
     test_step.dependOn(&b.addRunArtifact(peer_tests).step);
     test_step.dependOn(&b.addRunArtifact(peer_pool_tests).step);
     test_step.dependOn(&b.addRunArtifact(engine_tests).step);
+    test_step.dependOn(&b.addRunArtifact(inbound_tests).step);
+    test_step.dependOn(&b.addRunArtifact(port_mapping_tests).step);
+    test_step.dependOn(&b.addRunArtifact(pex_tests).step);
+    test_step.dependOn(&b.addRunArtifact(lsd_tests).step);
+    test_step.dependOn(&b.addRunArtifact(tracker_tier_tests).step);
+    test_step.dependOn(&b.addRunArtifact(control_plane_tests).step);
+    test_step.dependOn(&b.addRunArtifact(lsd_service_tests).step);
     test_step.dependOn(&b.addRunArtifact(session_tests).step);
     test_step.dependOn(&b.addRunArtifact(piece_scheduler_tests).step);
     test_step.dependOn(&b.addRunArtifact(handoff_tests).step);

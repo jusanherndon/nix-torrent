@@ -1,4 +1,5 @@
 const std = @import("std");
+const address = @import("address.zig");
 
 const net = std.Io.net;
 const c = std.c;
@@ -11,18 +12,30 @@ pub const ConnectError = error{
 
 /// Opens a TCP stream to an IPv4 endpoint and applies read/write timeouts.
 pub fn connectStream(io: std.Io, ip: [4]u8, port: u16, timeout_ms: u64) ConnectError!net.Stream {
-    const addr = net.IpAddress{ .ip4 = .{ .bytes = ip, .port = port } };
+    return connectStreamAddr(io, address.Address.v4(ip, port), timeout_ms);
+}
+
+/// Opens a TCP stream to a dual-stack (IPv4 or IPv6) endpoint with timeouts.
+pub fn connectStreamAddr(io: std.Io, addr: address.Address, timeout_ms: u64) ConnectError!net.Stream {
+    const ip_addr = addr.toIpAddress();
     if (timeout_ms == 0) {
-        const stream = net.IpAddress.connect(&addr, io, .{ .mode = .stream }) catch |err| switch (err) {
+        const stream = net.IpAddress.connect(&ip_addr, io, .{ .mode = .stream }) catch |err| switch (err) {
             error.ConnectionRefused => return error.ConnectionRefused,
             else => return error.ConnectionFailed,
         };
         return stream;
     }
-    return try connectStreamWithTimeout(addr, timeout_ms);
+    return try connectStreamWithTimeout(ip_addr, timeout_ms);
 }
 
 fn connectStreamWithTimeout(addr: net.IpAddress, timeout_ms: u64) ConnectError!net.Stream {
+    return switch (addr) {
+        .ip4 => connectV4(addr, timeout_ms),
+        .ip6 => connectV6(addr, timeout_ms),
+    };
+}
+
+fn connectV4(addr: net.IpAddress, timeout_ms: u64) ConnectError!net.Stream {
     const ip4 = addr.ip4;
     const sock = c.socket(c.AF.INET, c.SOCK.STREAM, 0);
     if (sock == -1) return error.ConnectionFailed;
@@ -41,6 +54,33 @@ fn connectStreamWithTimeout(addr: net.IpAddress, timeout_ms: u64) ConnectError!n
     };
 
     const rc = c.connect(sock, @ptrCast(&sockaddr), @sizeOf(c.sockaddr.in));
+    return finishConnect(sock, addr, flags, rc, timeout_ms);
+}
+
+fn connectV6(addr: net.IpAddress, timeout_ms: u64) ConnectError!net.Stream {
+    const ip6 = addr.ip6;
+    const sock = c.socket(c.AF.INET6, c.SOCK.STREAM, 0);
+    if (sock == -1) return error.ConnectionFailed;
+    errdefer _ = c.close(sock);
+
+    const flags = c.fcntl(sock, c.F.GETFL, @as(c_int, 0));
+    if (flags == -1) return error.ConnectionFailed;
+    const o_nonblock: c_int = 0x800;
+    if (c.fcntl(sock, c.F.SETFL, flags | o_nonblock) == -1) return error.ConnectionFailed;
+
+    var sockaddr: c.sockaddr.in6 = .{
+        .family = c.AF.INET6,
+        .port = std.mem.nativeToBig(u16, ip6.port),
+        .flowinfo = 0,
+        .addr = ip6.bytes,
+        .scope_id = ip6.interface.index,
+    };
+
+    const rc = c.connect(sock, @ptrCast(&sockaddr), @sizeOf(c.sockaddr.in6));
+    return finishConnect(sock, addr, flags, rc, timeout_ms);
+}
+
+fn finishConnect(sock: c.fd_t, addr: net.IpAddress, flags: c_int, rc: c_int, timeout_ms: u64) ConnectError!net.Stream {
     switch (c.errno(rc)) {
         .SUCCESS => {
             _ = c.fcntl(sock, c.F.SETFL, flags);
@@ -149,7 +189,7 @@ fn pollReadable(sock: c.fd_t, timeout_ms: u64) ReadError!void {
     if (ready < 0) return error.ReadFailed;
 }
 
-fn extractHttpBody(allocator: std.mem.Allocator, raw: []const u8) ReadError![]u8 {
+pub fn extractHttpBody(allocator: std.mem.Allocator, raw: []const u8) ReadError![]u8 {
     const sep = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse std.mem.indexOf(u8, raw, "\n\n") orelse return error.InvalidHttpResponse;
     const header_end = if (raw[sep..].len >= 4 and raw[sep] == '\r') sep + 4 else sep + 2;
     const headers = raw[0..sep];

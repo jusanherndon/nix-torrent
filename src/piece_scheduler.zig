@@ -1,4 +1,5 @@
 const std = @import("std");
+const address = @import("address.zig");
 const config = @import("config.zig");
 const log = @import("log.zig");
 const peer = @import("peer.zig");
@@ -151,8 +152,7 @@ test "selects peer-available missing pieces ahead of unavailable sequential piec
     var conn = peer.Connection{
         .allocator = std.testing.allocator,
         .stream = undefined,
-        .peer_ip = .{ 127, 0, 0, 1 },
-        .peer_port = 6881,
+        .peer_addr = address.Address.v4(.{ 127, 0, 0, 1 }, 6881),
         .state = ps,
         .recv_buffer = .empty,
     };
