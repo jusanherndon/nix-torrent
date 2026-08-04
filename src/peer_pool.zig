@@ -108,13 +108,8 @@ fn connectTimeoutMs(cfg: config.Config, mode: DhtPeerMode) u64 {
     };
 }
 
-fn maxAttemptsForMode(cfg: config.Config, mode: DhtPeerMode) usize {
-    const base = @as(usize, @intCast(cfg.limits.max_peer_connect_attempts_per_tick));
-    // Metadata: same attempt count as content. Live diagnosis showed short
-    // timeouts + double attempts burned the batch on dead endpoints before a
-    // live peer could finish MSE. Prefer fewer longer dials (see timeout default).
-    _ = mode;
-    return base;
+fn maxAttemptsPerTick(cfg: config.Config) usize {
+    return @intCast(cfg.limits.max_peer_connect_attempts_per_tick);
 }
 
 fn isPreferPlaintextRetry(err: anyerror) bool {
@@ -151,7 +146,7 @@ pub fn connectCandidateBatch(
     const n = session.peer_candidates.items.len;
     if (n == 0) return;
     ensureCooldownCapacity(allocator, session);
-    const max_attempts = maxAttemptsForMode(cfg, mode);
+    const max_attempts = maxAttemptsPerTick(cfg);
     const batch_budget_ms = @as(i64, @intCast(cfg.network.peer_connect_batch_budget_ms));
     const batch_start_ms = nowMs(io);
     const policy = config.encryptionPolicy(cfg.network);
@@ -589,14 +584,4 @@ test "prefer metadata mid-abort recovers via plaintext retry" {
     try std.testing.expect(conn.ut_metadata_id != null);
     try std.testing.expectEqual(@as(usize, info_bytes.len), conn.metadata_size.?);
     try std.testing.expectEqual(encryption.Mode.plaintext, conn.encryption_mode);
-}
-
-test "ConnectDiag classifies terminal dial errors" {
-    var d: session_types.ConnectDiag = .{};
-    d.recordError(error.Timeout);
-    d.recordError(error.ConnectionRefused);
-    d.recordError(error.UnsupportedEncryption);
-    try std.testing.expectEqual(@as(u64, 1), d.dial_timeout);
-    try std.testing.expectEqual(@as(u64, 1), d.connection_refused);
-    try std.testing.expectEqual(@as(u64, 1), d.unsupported_encryption);
 }

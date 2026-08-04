@@ -15,7 +15,6 @@ const storage = @import("storage.zig");
 const dht = @import("dht.zig");
 const magnet = @import("magnet.zig");
 const staging = @import("staging.zig");
-const session_types = @import("session_types.zig");
 
 const Daemon = struct {
     allocator: std.mem.Allocator,
@@ -345,6 +344,20 @@ fn handleRequest(daemon: *Daemon, req: protocol.Request, started: i64) !protocol
             try dht_obj.put(allocator, "bootstrapped", .{ .bool = daemon.dht_bootstrapped });
             try dht_obj.put(allocator, "bootstrap_node_count", .{ .integer = @intCast(daemon.cfg.network.dht.bootstrap_nodes.len) });
             try root.put(allocator, "dht", .{ .object = dht_obj });
+            var torrents = std.json.Array.init(allocator);
+            errdefer torrents.deinit();
+            for (daemon.registry.records.items) |rec| {
+                var t_obj: std.json.ObjectMap = .empty;
+                errdefer t_obj.deinit(allocator);
+                try t_obj.put(allocator, "info_hash", .{ .string = rec.info_hash_hex });
+                try t_obj.put(allocator, "name", .{ .string = rec.name });
+                try t_obj.put(allocator, "lifecycle_status", .{ .string = @tagName(rec.status) });
+                try t_obj.put(allocator, "connected_peer_count", .{ .integer = @intCast(rec.connected_peer_count) });
+                try t_obj.put(allocator, "peer_candidate_count", .{ .integer = @intCast(rec.peer_candidate_count) });
+                try t_obj.put(allocator, "connect_diagnostics", .{ .object = try connectDiagObject(allocator, rec.connect_diag) });
+                try torrents.append(.{ .object = t_obj });
+            }
+            try root.put(allocator, "torrents", .{ .array = torrents });
             return .{ .success = .{ .object = root } };
         },
         .list => {
@@ -662,10 +675,8 @@ fn showResponse(daemon: *Daemon, rec: state.TorrentRecord) !protocol.Response {
     try root.put(allocator, "max_inbound_peers_per_torrent", .{ .integer = @intCast(daemon.cfg.limits.max_inbound_peers_per_torrent) });
     try root.put(allocator, "peer_families", .{ .object = try peerFamiliesObject(daemon, allocator, rec.info_hash_hex) });
     try root.put(allocator, "encryption_modes", .{ .object = try encryptionModesObject(daemon, allocator, rec.info_hash_hex) });
-    if (daemon.engine.findSession(rec.info_hash_hex)) |sess| {
-        try root.put(allocator, "peer_candidate_count", .{ .integer = @intCast(sess.peer_candidates.items.len) });
-        try root.put(allocator, "connect_diagnostics", .{ .object = try connectDiagObject(allocator, sess.connect_diag) });
-    }
+    try root.put(allocator, "peer_candidate_count", .{ .integer = @intCast(rec.peer_candidate_count) });
+    try root.put(allocator, "connect_diagnostics", .{ .object = try connectDiagObject(allocator, rec.connect_diag) });
     var pm_obj: std.json.ObjectMap = .empty;
     errdefer pm_obj.deinit(allocator);
     try pm_obj.put(allocator, "enabled", .{ .bool = daemon.cfg.network.port_mapping.enabled });
@@ -719,7 +730,7 @@ fn sessionInboundCount(daemon: *Daemon, info_hash_hex: []const u8) u64 {
 }
 
 /// Per-stage outbound connect counters for operator diagnosis without log diving.
-fn connectDiagObject(allocator: std.mem.Allocator, diag: session_types.ConnectDiag) !std.json.ObjectMap {
+fn connectDiagObject(allocator: std.mem.Allocator, diag: state.ConnectDiag) !std.json.ObjectMap {
     var obj: std.json.ObjectMap = .empty;
     errdefer obj.deinit(allocator);
     try obj.put(allocator, "attempts", .{ .integer = @intCast(diag.attempts) });

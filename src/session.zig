@@ -42,7 +42,9 @@ pub fn projectToRecord(allocator: std.mem.Allocator, rec: *state.TorrentRecord, 
         state.applyTrackerState(allocator, &rec.trackers[i], session.trackers.items[i].state);
     }
     rec.connected_peer_count = session.peers.items.len + session.metadata_peers.items.len;
+    rec.peer_candidate_count = session.peer_candidates.items.len;
     rec.downloading = session.active_piece != null;
+    rec.connect_diag = session.connect_diag;
     if (rec.dht_last_error) |old| allocator.free(old);
     rec.dht_last_error = if (session.dht_socket) |sock|
         if (sock.last_error) |e| allocator.dupe(u8, e) catch null else null
@@ -319,7 +321,15 @@ test "projectToRecord copies live session fields onto torrent record" {
     defer sess.metadata_peers.deinit(std.testing.allocator);
     if (sess.active_piece) |*piece| piece.deinit(std.testing.allocator);
 
+    sess.connect_diag.attempts = 7;
+    sess.connect_diag.handshake_ok = 1;
+    try sess.peer_candidates.append(std.testing.allocator, tracker.Peer.v4(.{ 1, 2, 3, 4 }, 6881));
+    defer sess.peer_candidates.deinit(std.testing.allocator);
+
     projectToRecord(std.testing.allocator, &rec, &sess);
     try std.testing.expect(rec.downloading);
     try std.testing.expectEqual(@as(usize, 0), rec.connected_peer_count);
+    try std.testing.expectEqual(@as(usize, 1), rec.peer_candidate_count);
+    try std.testing.expectEqual(@as(u64, 7), rec.connect_diag.attempts);
+    try std.testing.expectEqual(@as(u64, 1), rec.connect_diag.handshake_ok);
 }

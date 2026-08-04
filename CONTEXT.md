@@ -69,7 +69,7 @@ Engine-owned runtime for one torrent under active download — peers, piece prog
 _Avoid_: Torrent record, registry entry, completion history, engine tick phase
 
 **Registry Projection**:
-Materialization of live Torrent Session fields onto the registry `TorrentRecord` at the end of each Session tick (or equivalent publish point). Control Surface reads use the projected record only — not a parallel session lookup — including when the engine runs on a worker thread. Ephemeral fields (connected peer count, downloading, DHT last error) are projected each tick but not persisted in `state.json`; the Engine owns persistence after the tick returns.
+Materialization of live Torrent Session fields onto the registry `TorrentRecord` at the end of each Session tick (or equivalent publish point). Control Surface reads use the projected record only — not a parallel session lookup — including when the engine runs on a worker thread. Ephemeral fields (connected peer count, peer candidate count, connect diagnostics, downloading, DHT last error) are projected each tick but not persisted in `state.json`; the Engine owns persistence after the tick returns.
 _Avoid_: Dual lookup, live session DTO, sync glue
 
 **Final Destination**:
