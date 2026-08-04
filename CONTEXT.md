@@ -143,3 +143,55 @@ _Avoid_: Encryption policy, encryption scheme, UDP tracker announce
 **Tracker Peer Crypto Flag**:
 A per-peer hint in some HTTP tracker responses indicating whether that peer requires MSE. Used to filter or order peers before outbound connect attempts.
 _Avoid_: Encryption policy, encryption scheme, tracker announce parameter
+
+**Live Swarm Probe**:
+An operator- or agent-run exercise that adds a public Magnet Link or Torrent File to a real daemon, exercises Trackers / DHT / peer dials against the public swarm, collects Control Surface output and logs, and posts a redacted diagnosis. It is verification, not CI.
+_Avoid_: Integration harness test, unit test, un-redacted ticket dump
+
+---
+
+## Live Swarm Probe procedure
+
+Every Live Swarm Probe that produces public artifacts (GitHub issues, PR comments, research notes, chat paste-back that may be published) **must** follow this pattern. Local-only terminals need not redact, but anything that leaves the machine is public-ready first.
+
+### Run
+
+1. Use an isolated config (staging, final destination, socket, listen/DHT ports) so the probe does not touch production paths.
+2. Prefer debug-level logging for the duration of the probe; capture daemon logs, `status`, and periodic `show <info-hash>` samples.
+3. Add the Magnet Link or Torrent File; wait long enough to observe stage mix (discovery → dial → MSE/handshake → attach), not only a single `list` snapshot.
+4. Prefer Control Surface fields for diagnosis when present (`trackers`, `connect_diagnostics`, peer counts, encryption modes, DHT fields) over raw logs.
+5. Tear down the daemon and staging data when finished; do not leave the probe torrent running.
+
+### Publish only redacted material
+
+Assume issues, PR comments, and map notes are public. **Never** post unredacted full magnets, log dumps, or `show` JSON that still contains the fields below.
+
+| Category | Redact to | Examples |
+| --- | --- | --- |
+| Peer / endpoint IPs | `x.x.x.x` or `x:x:x:x` | compact peers, dial targets, inbound remote addrs |
+| Bind / listen / local addresses & ports | `[REDACTED_BIND]`, `[REDACTED_PORT]` | listen, DHT base, socket path host-specific roots |
+| Tracker hostnames and full announce URLs | scheme only (`http` / `https` / `udp`) plus **status** and **error class** | `https: ok`, `udp: error / Timeout`, never hostname or path |
+| Content identity | omit or placeholder | magnet `dn=`, torrent name, file paths, info-hash if the ticket does not already own a public hash |
+| Location / identity | omit | usernames, home directory paths, LAN names, geo-ish DNS, ISP hostnames |
+| Full magnet URIs | omit or `magnet:?xt=urn:btih:[REDACTED]` | do not repost the operator’s full magnet with `tr=` list |
+
+### Keep (these are the probe result)
+
+- Stage outcomes and activity (`fetching_metadata`, `downloading`, stuck/never attached).
+- Counts and histograms: candidate count, dial attempts, `Timeout` / `ConnectionRefused` / MSE mid-abort / plaintext retry / `handshake_ok` (from logs or `connect_diagnostics`).
+- Tracker **outcome classes** without names: success vs failure reason **class** (`missing user agent`, `bad request`, timeout) after redacting any endpoint identity.
+- Encryption Policy under test, duration of the sample window, and whether metadata completed.
+- Config knobs that matter to the stage mix (timeouts, policy), without machine-local paths.
+
+### Ticket write-up shape
+
+Public probe comments should read as diagnosis, not a data dump:
+
+1. Question / purpose of this probe.
+2. Stage table or short mix (what dominated).
+3. Redacted snapshot progression (`show` / `status` shapes).
+4. Failure-tag counts or `connect_diagnostics`.
+5. Tracker table with **scheme + status + error class only**.
+6. What is still open (fix hypothesis vs document-only).
+
+_Cross-check_: if a stranger reading the issue could name your trackers, swarm peers, content title, or home path, redaction failed — rewrite before posting.
