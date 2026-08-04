@@ -151,6 +151,11 @@ pub const http_user_agent = "nix-torrent/0.3.0";
 /// Default peers requested per announce — matches the UDP `num_want` field.
 pub const default_numwant: u32 = 50;
 
+/// Stable opaque key for tracker announces (BEP 3 / BEP 15), derived from peer_id.
+pub fn announceKeyFromPeerId(peer_id: [20]u8) u32 {
+    return std.mem.readInt(u32, peer_id[0..4], .big);
+}
+
 pub fn buildAnnouncePath(
     allocator: std.mem.Allocator,
     base_path: []const u8,
@@ -181,7 +186,7 @@ pub fn buildAnnouncePath(
         .require => "&supportcrypto=1&requirecrypto=1",
     };
     // BEP 3 optional but widely expected: `numwant` + opaque `key` for multi-client NATs.
-    const key = std.mem.readInt(u32, peer_id[0..4], .big);
+    const key = announceKeyFromPeerId(peer_id);
     return std.fmt.allocPrint(allocator, "{s}{c}info_hash={s}&peer_id={s}&port={d}&uploaded={d}&downloaded={d}&left={d}&compact=1&numwant={d}&key={d}{s}{s}", .{ base_path, sep, ih, pid, port, uploaded, downloaded, left, default_numwant, key, event_param, crypto_param });
 }
 
@@ -360,6 +365,25 @@ pub fn announce(
     };
 }
 
+fn ensureUdpConnection(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    parsed: AnnounceUrl,
+    udp_session: *UdpSession,
+    timeout_ms: u64,
+    now_ms: i64,
+) !void {
+    if (udp_session.connection_id != 0 and now_ms < udp_session.connection_expires_ms) return;
+    const conn_id = try udpConnect(io, allocator, parsed, timeout_ms);
+    udp_session.connection_id = conn_id;
+    udp_session.connection_expires_ms = now_ms + udp_connection_ttl_ms;
+}
+
+pub fn invalidateUdpSession(udp_session: *UdpSession) void {
+    udp_session.connection_id = 0;
+    udp_session.connection_expires_ms = 0;
+}
+
 fn announceUdp(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -375,11 +399,14 @@ fn announceUdp(
     timeout_ms: u64,
     now_ms: i64,
 ) !Announce {
-    if (udp_session.connection_id == 0 or now_ms >= udp_session.connection_expires_ms) {
-        const conn_id = try udpConnect(io, allocator, parsed, timeout_ms);
-        udp_session.connection_id = conn_id;
-        udp_session.connection_expires_ms = now_ms + udp_connection_ttl_ms;
-    }
+    try ensureUdpConnection(io, allocator, parsed, udp_session, timeout_ms, now_ms);
+    var result = try udpAnnounce(io, allocator, parsed, udp_session.connection_id, info_hash, peer_id, port, uploaded, downloaded, left, event, timeout_ms);
+    if (result.failure_reason == null) return result;
+    // Tracker-side connection_id expiry often surfaces as action=3 ("bad request").
+    // Reconnect once before surfacing the failure to the caller.
+    result.deinit(allocator);
+    invalidateUdpSession(udp_session);
+    try ensureUdpConnection(io, allocator, parsed, udp_session, timeout_ms, now_ms);
     return try udpAnnounce(io, allocator, parsed, udp_session.connection_id, info_hash, peer_id, port, uploaded, downloaded, left, event, timeout_ms);
 }
 
@@ -394,9 +421,50 @@ fn udpConnect(io: std.Io, allocator: std.mem.Allocator, parsed: AnnounceUrl, tim
     if (resp.bytes.len < 16) return error.InvalidTrackerResponse;
     const action = std.mem.readInt(u32, resp.bytes[0..4], .big);
     const tx = std.mem.readInt(u32, resp.bytes[4..8], .big);
-    if (action == 3) return error.TrackerFailure;
+    if (action == 3) {
+        const reason = if (resp.bytes.len > 8) resp.bytes[8..] else "tracker error";
+        log.debug("tracker", "UDP connect rejected for {s}:{d}: {s}", .{ parsed.host, parsed.port, reason });
+        return error.TrackerFailure;
+    }
     if (action != 0 or tx != transaction_id) return error.InvalidTrackerResponse;
     return std.mem.readInt(i64, resp.bytes[8..16], .big);
+}
+
+/// Packs a BEP 15 UDP announce request into `buf` (must be at least 98 bytes).
+/// Returns the transaction id embedded in the request.
+pub fn packUdpAnnounceRequest(
+    buf: []u8,
+    connection_id: i64,
+    transaction_id: u32,
+    info_hash: torrent.InfoHash,
+    peer_id: [20]u8,
+    port: u16,
+    uploaded: u64,
+    downloaded: u64,
+    left: u64,
+    event: Event,
+) u32 {
+    std.debug.assert(buf.len >= 98);
+    const event_code: u32 = switch (event) {
+        .none => 0,
+        .completed => 1,
+        .started => 2,
+        .stopped => 3,
+    };
+    std.mem.writeInt(i64, buf[0..8], connection_id, .big);
+    std.mem.writeInt(u32, buf[8..12], 1, .big);
+    std.mem.writeInt(u32, buf[12..16], transaction_id, .big);
+    @memcpy(buf[16..36], &info_hash);
+    @memcpy(buf[36..56], &peer_id);
+    std.mem.writeInt(u64, buf[56..64], downloaded, .big);
+    std.mem.writeInt(u64, buf[64..72], left, .big);
+    std.mem.writeInt(u64, buf[72..80], uploaded, .big);
+    std.mem.writeInt(u32, buf[80..84], event_code, .big);
+    std.mem.writeInt(u32, buf[84..88], 0, .big);
+    std.mem.writeInt(u32, buf[88..92], announceKeyFromPeerId(peer_id), .big);
+    std.mem.writeInt(u32, buf[92..96], default_numwant, .big);
+    std.mem.writeInt(u16, buf[96..98], port, .big);
+    return transaction_id;
 }
 
 fn udpAnnounce(
@@ -414,26 +482,8 @@ fn udpAnnounce(
     timeout_ms: u64,
 ) !Announce {
     const transaction_id: u32 = nextTransactionId();
-    const event_code: u32 = switch (event) {
-        .none => 0,
-        .completed => 1,
-        .started => 2,
-        .stopped => 3,
-    };
     var req: [98]u8 = undefined;
-    std.mem.writeInt(i64, req[0..8], connection_id, .big);
-    std.mem.writeInt(u32, req[8..12], 1, .big);
-    std.mem.writeInt(u32, req[12..16], transaction_id, .big);
-    @memcpy(req[16..36], &info_hash);
-    @memcpy(req[36..56], &peer_id);
-    std.mem.writeInt(u64, req[56..64], downloaded, .big);
-    std.mem.writeInt(u64, req[64..72], left, .big);
-    std.mem.writeInt(u64, req[72..80], uploaded, .big);
-    std.mem.writeInt(u32, req[80..84], event_code, .big);
-    std.mem.writeInt(u32, req[84..88], 0, .big);
-    std.mem.writeInt(u32, req[88..92], nextTransactionId(), .big);
-    std.mem.writeInt(u32, req[92..96], default_numwant, .big);
-    std.mem.writeInt(u16, req[96..98], port, .big);
+    _ = packUdpAnnounceRequest(&req, connection_id, transaction_id, info_hash, peer_id, port, uploaded, downloaded, left, event);
     const resp = try udpTransact(io, allocator, parsed, &req, timeout_ms);
     defer resp.deinit();
     return parseUdpAnnounceResponse(allocator, resp.bytes, transaction_id);
@@ -749,4 +799,49 @@ test "parses udp announce response" {
     try std.testing.expectEqual(@as(u64, 1800), udp_result.interval);
     try std.testing.expectEqual(@as(usize, 1), udp_result.peers.len);
     try std.testing.expectEqual(@as(u16, 6881), udp_result.peers[0].port);
+}
+
+test "parses udp announce action=3 error with reason" {
+    const err_msg = "bad request";
+    var buf: [8 + err_msg.len]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], 3, .big);
+    std.mem.writeInt(u32, buf[4..8], 99, .big);
+    @memcpy(buf[8..], err_msg);
+    const result = try parseUdpAnnounceResponse(std.testing.allocator, &buf, 99);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.failure_reason != null);
+    try std.testing.expectEqualStrings("bad request", result.failure_reason.?);
+    try std.testing.expectEqual(@as(usize, 0), result.peers.len);
+}
+
+test "packUdpAnnounceRequest uses stable key from peer_id" {
+    const ih: torrent.InfoHash = [_]u8{0xAA} ** 20;
+    const pid: [20]u8 = .{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14 };
+    var buf: [98]u8 = undefined;
+    _ = packUdpAnnounceRequest(&buf, 0x1234567890ABCDEF, 42, ih, pid, 6881, 100, 200, 300, .started);
+    try std.testing.expectEqual(@as(i64, 0x1234567890ABCDEF), std.mem.readInt(i64, buf[0..8], .big));
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, buf[8..12], .big));
+    try std.testing.expectEqual(@as(u32, 42), std.mem.readInt(u32, buf[12..16], .big));
+    try std.testing.expectEqualSlices(u8, &ih, buf[16..36]);
+    try std.testing.expectEqualSlices(u8, &pid, buf[36..56]);
+    try std.testing.expectEqual(@as(u64, 200), std.mem.readInt(u64, buf[56..64], .big));
+    try std.testing.expectEqual(@as(u64, 300), std.mem.readInt(u64, buf[64..72], .big));
+    try std.testing.expectEqual(@as(u64, 100), std.mem.readInt(u64, buf[72..80], .big));
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, buf[80..84], .big)); // started
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buf[84..88], .big)); // IP default
+    try std.testing.expectEqual(announceKeyFromPeerId(pid), std.mem.readInt(u32, buf[88..92], .big));
+    try std.testing.expectEqual(default_numwant, std.mem.readInt(u32, buf[92..96], .big));
+    try std.testing.expectEqual(@as(u16, 6881), std.mem.readInt(u16, buf[96..98], .big));
+}
+
+test "announceKeyFromPeerId matches HTTP key" {
+    const pid: [20]u8 = .{ 0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    try std.testing.expectEqual(@as(u32, 0xDEADBEEF), announceKeyFromPeerId(pid));
+}
+
+test "invalidateUdpSession clears connection state" {
+    var session: UdpSession = .{ .connection_id = 99, .connection_expires_ms = 12345 };
+    invalidateUdpSession(&session);
+    try std.testing.expectEqual(@as(i64, 0), session.connection_id);
+    try std.testing.expectEqual(@as(i64, 0), session.connection_expires_ms);
 }

@@ -54,9 +54,8 @@ pub const Network = struct {
     /// Base UDP port for per-torrent DHT sockets (dht_base_port + slot).
     dht_base_port: u64 = 6882,
     peer_connect_timeout_ms: u64 = 10_000,
-    /// TCP connect+early handshake timeout while fetching magnet metadata.
-    /// Longer than a pure probe so live but slow peers can complete MSE; paired
-    /// with fewer attempts-per-tick so dead endpoints do not burn the batch.
+    /// Wall-clock budget for TCP connect + outbound handshake (MSE/BT + ut_metadata LTEP) while fetching magnet metadata.
+    /// Handshake reads share this budget with the TCP connect; dead acceptors cannot monopolize the batch.
     metadata_peer_connect_timeout_ms: u64 = 5_000,
     /// Wall-clock cap for outbound connect+handshake work in one engine tick.
     /// Always allows at least one attempt; further attempts stop once elapsed time hits this budget.

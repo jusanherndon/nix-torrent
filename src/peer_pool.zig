@@ -130,6 +130,16 @@ fn failCooldownMs(cfg: config.Config, err: anyerror) u64 {
     return cfg.network.peer_connect_fail_cooldown_ms;
 }
 
+fn remainingDialMs(io: std.Io, deadline_ms: i64) !u64 {
+    const remaining = deadline_ms - nowMs(io);
+    if (remaining <= 0) return error.Timeout;
+    return @intCast(remaining);
+}
+
+fn dialDeadlineMs(io: std.Io, connect_timeout_ms: u64) i64 {
+    return nowMs(io) + @as(i64, @intCast(connect_timeout_ms));
+}
+
 pub fn connectCandidateBatch(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -275,14 +285,15 @@ fn dialWithPreferPlaintextRetry(
     allocator: std.mem.Allocator,
     addr: address.Address,
     connect_timeout_ms: u64,
-    read_timeout_ms: u64,
+    peer_request_timeout_ms: u64,
     info_hash: torrent.InfoHash,
     peer_id: [20]u8,
     policy: encryption.Policy,
     extensions: bool,
     diag: *session_types.ConnectDiag,
 ) !peer.Connection {
-    var conn = try peer.Connection.connectAddr(io, allocator, addr, connect_timeout_ms, read_timeout_ms);
+    const deadline_ms = dialDeadlineMs(io, connect_timeout_ms);
+    var conn = try connectForDial(io, allocator, addr, deadline_ms, connect_timeout_ms);
     var alive = true;
     errdefer if (alive) conn.deinit(io);
     conn.performHandshake(io, info_hash, peer_id, policy, extensions) catch |err| {
@@ -291,7 +302,8 @@ fn dialWithPreferPlaintextRetry(
         diag.plaintext_retry += 1;
         conn.deinit(io);
         alive = false;
-        conn = try peer.Connection.connectAddr(io, allocator, addr, connect_timeout_ms, read_timeout_ms);
+        const retry_deadline_ms = dialDeadlineMs(io, connect_timeout_ms);
+        conn = try connectForDial(io, allocator, addr, retry_deadline_ms, connect_timeout_ms);
         alive = true;
         conn.performHandshake(io, info_hash, peer_id, .disable, extensions) catch |retry_err| {
             diag.plaintext_retry_fail += 1;
@@ -299,6 +311,20 @@ fn dialWithPreferPlaintextRetry(
         };
     };
     alive = false;
+    conn.finishOutboundDial(peer_request_timeout_ms);
+    return conn;
+}
+
+fn connectForDial(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    addr: address.Address,
+    deadline_ms: i64,
+    handshake_read_timeout_ms: u64,
+) !peer.Connection {
+    const tcp_timeout_ms = try remainingDialMs(io, deadline_ms);
+    var conn = try peer.Connection.connectAddr(io, allocator, addr, tcp_timeout_ms, handshake_read_timeout_ms);
+    conn.handshake_deadline_ms = deadline_ms;
     return conn;
 }
 
@@ -307,13 +333,14 @@ fn dialMetadataWithPreferPlaintextRetry(
     allocator: std.mem.Allocator,
     addr: address.Address,
     connect_timeout_ms: u64,
-    read_timeout_ms: u64,
+    peer_request_timeout_ms: u64,
     info_hash: torrent.InfoHash,
     peer_id: [20]u8,
     policy: encryption.Policy,
     diag: *session_types.ConnectDiag,
 ) !peer.Connection {
-    var conn = try peer.Connection.connectAddr(io, allocator, addr, connect_timeout_ms, read_timeout_ms);
+    const deadline_ms = dialDeadlineMs(io, connect_timeout_ms);
+    var conn = try connectForDial(io, allocator, addr, deadline_ms, connect_timeout_ms);
     var alive = true;
     errdefer if (alive) conn.deinit(io);
     conn.performMetadataHandshake(io, info_hash, peer_id, policy) catch |err| {
@@ -324,7 +351,8 @@ fn dialMetadataWithPreferPlaintextRetry(
         log.debug("peer_pool", "metadata MSE mid-handshake abort from {s}; retrying plaintext", .{addr.render(&buf)});
         conn.deinit(io);
         alive = false;
-        conn = try peer.Connection.connectAddr(io, allocator, addr, connect_timeout_ms, read_timeout_ms);
+        const retry_deadline_ms = dialDeadlineMs(io, connect_timeout_ms);
+        conn = try connectForDial(io, allocator, addr, retry_deadline_ms, connect_timeout_ms);
         alive = true;
         conn.performMetadataHandshake(io, info_hash, peer_id, .disable) catch |retry_err| {
             diag.plaintext_retry_fail += 1;
@@ -332,6 +360,7 @@ fn dialMetadataWithPreferPlaintextRetry(
         };
     };
     alive = false;
+    conn.finishOutboundDial(peer_request_timeout_ms);
     return conn;
 }
 
@@ -526,6 +555,40 @@ test "mergeCandidates dedupes and skips garbage" {
     try std.testing.expectEqual(@as(usize, 2), session.peer_candidates.items.len);
     try std.testing.expectEqual(@as(u8, 1), session.peer_candidates.items[0].ip.v4[0]);
     try std.testing.expectEqual(@as(u8, 5), session.peer_candidates.items[1].ip.v4[0]);
+}
+
+test "remainingDialMs returns budget or Timeout" {
+    const io = std.testing.io;
+    const deadline = nowMs(io) + 50_000;
+    const rem = try remainingDialMs(io, deadline);
+    try std.testing.expect(rem >= 49_900 and rem <= 50_000);
+    try std.testing.expectError(error.Timeout, remainingDialMs(io, nowMs(io) - 1));
+}
+
+test "prefer metadata mid-abort recovers via plaintext retry" {
+    const harness = @import("integration_harness.zig");
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const fixture = @embedFile("fixtures/single-file.torrent");
+    const meta = try torrent.Metadata.parseBytes(allocator, fixture);
+    defer meta.deinit();
+    const info = meta.root.dictGet("info").?;
+    const info_bytes = info.dict.raw;
+
+    var metadata_peer = try harness.spawnFakeMetadataPeerMseAbortThenPlaintext(io, allocator, meta.info_hash, info_bytes);
+    defer metadata_peer.join(io);
+
+    var diag: session_types.ConnectDiag = .{};
+    const addr = address.Address.v4(.{ 127, 0, 0, 1 }, metadata_peer.port);
+    var conn = try dialMetadataWithPreferPlaintextRetry(io, allocator, addr, 5_000, 30_000, meta.info_hash, [_]u8{7} ** 20, .prefer, &diag);
+    defer conn.deinit(io);
+
+    try std.testing.expectEqual(@as(u64, 1), diag.mse_mid_abort);
+    try std.testing.expectEqual(@as(u64, 1), diag.plaintext_retry);
+    try std.testing.expectEqual(@as(u64, 0), diag.plaintext_retry_fail);
+    try std.testing.expect(conn.ut_metadata_id != null);
+    try std.testing.expectEqual(@as(usize, info_bytes.len), conn.metadata_size.?);
+    try std.testing.expectEqual(encryption.Mode.plaintext, conn.encryption_mode);
 }
 
 test "ConnectDiag classifies terminal dial errors" {

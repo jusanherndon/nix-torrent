@@ -486,13 +486,48 @@ fn serveEncryptedPieceRequestsFd(fd: c.fd_t, keys: *encryption.Keystreams, info_
 }
 
 pub fn spawnFakeMetadataPeer(io: std.Io, allocator: std.mem.Allocator, info_hash: torrent.InfoHash, info_bytes: []const u8) !BackgroundServer {
+    return spawnFakeMetadataPeerWithMode(io, allocator, info_hash, info_bytes, .plaintext_only);
+}
+
+/// First inbound connection aborts mid-MSE (partial garbage); later connections speak plaintext ut_metadata.
+pub fn spawnFakeMetadataPeerMseAbortThenPlaintext(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    info_hash: torrent.InfoHash,
+    info_bytes: []const u8,
+) !BackgroundServer {
+    return spawnFakeMetadataPeerWithMode(io, allocator, info_hash, info_bytes, .mse_abort_then_plaintext);
+}
+
+const MetadataPeerMode = enum { plaintext_only, mse_abort_then_plaintext };
+
+fn spawnFakeMetadataPeerWithMode(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    info_hash: torrent.InfoHash,
+    info_bytes: []const u8,
+    mode: MetadataPeerMode,
+) !BackgroundServer {
     const addr = net.IpAddress{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     const server = try addr.listen(io, .{ .mode = .stream, .kernel_backlog = 8 });
     const port = server.socket.address.ip4.port;
     const stop = try allocator.create(std.atomic.Value(bool));
     stop.* = std.atomic.Value(bool).init(false);
+    var visits: ?*std.atomic.Value(u32) = null;
+    if (mode == .mse_abort_then_plaintext) {
+        visits = try allocator.create(std.atomic.Value(u32));
+        visits.?.* = std.atomic.Value(u32).init(0);
+    }
     const ctx = try allocator.create(MetadataCtx);
-    ctx.* = .{ .allocator = allocator, .server = server, .stop = stop, .info_hash = info_hash, .info_bytes = info_bytes };
+    ctx.* = .{
+        .allocator = allocator,
+        .server = server,
+        .stop = stop,
+        .info_hash = info_hash,
+        .info_bytes = info_bytes,
+        .mode = mode,
+        .visits = visits,
+    };
     const thread = try std.Thread.spawn(.{}, metadataWorker, .{ctx});
     return .{ .thread = thread, .allocator = allocator, .stop = stop, .port = port, .server = &ctx.server };
 }
@@ -503,11 +538,16 @@ const MetadataCtx = struct {
     stop: *std.atomic.Value(bool),
     info_hash: torrent.InfoHash,
     info_bytes: []const u8,
+    mode: MetadataPeerMode,
+    visits: ?*std.atomic.Value(u32) = null,
 };
 
 fn metadataWorker(ctx: *MetadataCtx) void {
     const listen_fd = ctx.server.socket.handle;
-    defer ctx.allocator.destroy(ctx);
+    defer {
+        if (ctx.visits) |v| ctx.allocator.destroy(v);
+        ctx.allocator.destroy(ctx);
+    }
     while (!ctx.stop.load(.acquire)) {
         if (!pollFd(listen_fd, 50)) continue;
         const client_fd = c.accept(listen_fd, null, null);
@@ -522,6 +562,22 @@ fn handleMetadataPeerFd(ctx: *MetadataCtx, fd: c.fd_t) void {
 }
 
 fn handleMetadataPeerFdInner(ctx: *MetadataCtx, fd: c.fd_t) !void {
+    if (ctx.mode == .mse_abort_then_plaintext and ctx.visits.?.fetchAdd(1, .monotonic) == 0) {
+        try serveMetadataMseAbortFd(fd);
+        return;
+    }
+    try servePlainMetadataPeerFd(ctx, fd);
+}
+
+/// Simulates an ambiguous peer: reads initiator MSE PE1, returns short non-BT garbage, closes.
+fn serveMetadataMseAbortFd(fd: c.fd_t) !void {
+    var drain: [512]u8 = undefined;
+    _ = readSomeFd(fd, &drain) catch {};
+    const garbage: [8]u8 = .{ 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04 };
+    try writeAllFd(fd, &garbage);
+}
+
+fn servePlainMetadataPeerFd(ctx: *MetadataCtx, fd: c.fd_t) !void {
     var hs_in: [700]u8 = undefined;
     var got: usize = 0;
     while (got < 68) {
