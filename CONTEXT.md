@@ -49,40 +49,52 @@ The UDP port bound for one torrent's DHT socket (`dht_base_port + slot`). It is 
 _Avoid_: Listen Port, shared TCP/UDP port number
 
 **Inbound Peer Connection**:
-A Peer that dialed the Listen Socket and, after handshake, joins an active Torrent Session that is downloading or fetching metadata. Download only — no uploaded piece data. Connections for paused, failed, completed, or unknown info hashes are closed.
-_Avoid_: Seeding peer, outbound peer, Listen Socket
+A Peer that dialed the Listen Socket and, after handshake, joins an active Torrent Session that is fetching metadata, downloading, or Seeding. During Seeding (and upload-capable download peers per algorithm), the Session may serve Piece/Block data subject to choke. Connections for paused, failed, soft-removed / no Session, or unknown info hashes are closed.
+_Avoid_: Outbound-only seed myth, permanent download-only listen as Seeding, attaching to history-only info hashes without a Session
 
 **Port Mapping**:
 A gateway-granted IPv4 NAT forwarding of a Listen Port (TCP) or DHT Port (UDP) so peers outside the LAN can reach the Torrent Client, typically via UPnP or NAT-PMP.
 _Avoid_: Listen Socket, manual firewall rule as the only concept, IPv6 address assignment
 
 **Staging Area**:
-The client-owned location where incomplete torrent content is kept before it is ready for handoff.
-_Avoid_: Final destination, downloads folder
+The client-owned location where incomplete torrent content is kept before it is ready for Handoff. After successful Handoff the per-torrent staging tree is removed; verified content lives only under Final Destination for that Session’s Seeding.
+_Avoid_: Final destination, downloads folder, permanent second copy after handoff
 
 **Staging Provisioning**:
 Filesystem preparation of a torrent's staging area — directories, metadata on disk, staged content files, and piece recheck — before the engine attaches a Torrent Session.
 _Avoid_: Session attach, registry update, DHT slot allocation
 
 **Torrent Session**:
-Engine-owned runtime for one torrent under active download — peers, piece progress, tracker protocol state, and DHT handles — whose tick is the unit of progress for that torrent.
-_Avoid_: Torrent record, registry entry, completion history, engine tick phase
+Engine-owned runtime for one info hash under active management — peer exchange while downloading, through Handoff, then Seeding — peers, piece progress, tracker protocol state, and DHT handles — whose tick is the unit of progress for that torrent. Live Sessions (including Seeding and paused post-Handoff) are restored from persisted state after a daemon restart.
+_Avoid_: Torrent record, registry entry, engine tick phase, process-local-only seed ownership
 
 **Registry Projection**:
 Materialization of live Torrent Session fields onto the registry `TorrentRecord` at the end of each Session tick (or equivalent publish point). Control Surface reads use the projected record only — not a parallel session lookup — including when the engine runs on a worker thread. Ephemeral fields (connected peer count, peer candidate count, connect diagnostics, downloading, DHT last error) are projected each tick but not persisted in `state.json`; the Engine owns persistence after the tick returns.
 _Avoid_: Dual lookup, live session DTO, sync glue
 
 **Final Destination**:
-The user-facing location where completed torrent content is placed after handoff.
+The user-facing location where completed torrent content is placed after Handoff and from which Seeding serves verified Pieces.
 _Avoid_: Staging area, incomplete folder
 
 **Handoff**:
-The daemon-owned transition that moves fully verified torrent content from the staging area to the final destination and ends active daemon ownership of that content.
-_Avoid_: Copy, download completion, seeding
+The daemon-owned transition that moves fully verified torrent content from the Staging Area to the Final Destination, records Completion History, removes the per-torrent Staging Area tree, and continues the same Torrent Session into Seeding from Final Destination.
+_Avoid_: Copy without moving ownership of the content path, download completion alone, ending daemon ownership, removing the session
+
+**Seeding**:
+The post-Handoff phase of a Torrent Session that offers verified content from the Final Destination to Peers until the operator pauses or removes the session. Control Surface presents this as live-registry activity `seeding` (not history-only), with Handoff path/time available alongside live peer fields on the same identity. If Final Destination content goes missing or fails verify while Seeding, the Session fails with a visible Control Surface reason, stops serving Peers, and leaves Completion History until soft Remove or Purge.
+_Avoid_: Completion history as the only row, incomplete download, one-shot share after exit, activity label `completed` while still managing a Session, silent soft-remove on missing files, auto re-download as the seeding failure path
 
 **Completion History**:
-A daemon-owned record that preserves what torrent completed, where it was handed off, and when, after active daemon ownership has ended.
-_Avoid_: Active torrent state, seeding state, final content
+A daemon-owned record of Handoff — info hash, name, Final Destination path, and when — written when Handoff succeeds. It coexists with an active Torrent Session while Seeding. Soft Remove leaves it in place; Purge deletes it with the Final Destination content for that entry.
+_Avoid_: Replacing the live registry row, “completed means no session forever”, immutable after handoff
+
+**Remove** (soft):
+A Control Surface command that tears down the Torrent Session and live registry row while retaining Final Destination content and Completion History. The same info hash may later be re-added to start a new Seeding Session from Final Destination when content still verifies.
+_Avoid_: Delete files, purge, pause, permanent ban on re-add
+
+**Purge**:
+A Control Surface command that tears down the Torrent Session and live registry row, deletes that torrent’s Final Destination content for the Handoff, and prunes the matching Completion History entry.
+_Avoid_: Soft remove, pause, handoff
 
 **Info Hash**:
 The canonical identity of a torrent, derived from its metadata and used to recognize the same torrent across files, sessions, and peers.

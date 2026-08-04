@@ -14,7 +14,7 @@ Working today (control protocol version 3):
 - Add `.torrent` or magnet; pause / resume / remove / list / show / status
 - HTTP and UDP trackers, DHT `get_peers` + `announce_peer`, outbound TCP peers
 - **Dual-stack IPv4/IPv6** peers and sockets (tracker `peers6`, DHT `nodes6`/BEP 32)
-- **Inbound Listen Socket** (download-only, no seeding): a daemon-wide dual-stack
+- **Inbound Listen Socket** (download-only today): a daemon-wide dual-stack
   TCP listener on `::`/`listen_port` accepts inbound peers under the same MSE policy
 - **IPv4 port mapping** for the Listen Port via NAT-PMP/PCP, then UPnP IGD (best-effort)
 - **Peer Exchange (`ut_pex`)** and **Local Service Discovery (BEP 14)**
@@ -24,8 +24,7 @@ Working today (control protocol version 3):
 - Magnet metadata via `ut_metadata`; piece download, verify, and staging writes
 - Unit and local integration tests with fake trackers/peers (IPv4 and IPv6)
 
-The full roadmap lives in [`docs/V3_PLAN.md`](docs/V3_PLAN.md). Seeding remains out of
-scope. See [Known limitations](#known-limitations) for intentional gaps.
+Active product direction is the MVP map on GitHub (issue [#2](https://github.com/jusanherndon/nix-torrent/issues/2)): public magnets and ordinary downloads that progress, hand off, and **seed from the Final Destination**. Domain language is in [`CONTEXT.md`](CONTEXT.md). See [Known limitations](#known-limitations) for what the code still does not implement.
 
 ## Build
 
@@ -83,5 +82,5 @@ Nix Torrent keeps metadata fetch on dedicated connections and separates extensio
 
 ## Known limitations
 
-- **Seeding** is intentionally out of scope: inbound peers download only, stay choked, and the connection is closed if a peer sends `request`.
+- **Seeding (implementation gap):** domain model and MVP map include continuous Session Seeding after Handoff (see ADR 0007 and issue [#7](https://github.com/jusanherndon/nix-torrent/issues/7)). Code still handoff-ends ownership: inbound peers download only, stay choked, and close on `request`; completed hashes refuse pause/remove/re-add.
 - **Port mapping** is best-effort: DHT UDP lease renewal is simplified relative to a production client; mapping failures are surfaced in `status`/`show` without stopping the daemon.
