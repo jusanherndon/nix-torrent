@@ -91,19 +91,21 @@ dht_base_port = 6882
 # system CA store. There is no insecure_skip_verify option in v3.
 # tracker_ca_file = "/etc/nix-torrent/extra-ca.pem"
 
-# Timeout for outbound peer TCP connection attempts.
+# Timeout for outbound peer TCP connection attempts (content path).
 peer_connect_timeout_ms = 10000
 
-# Shorter TCP connect timeout used while fetching magnet metadata so dead
-# candidates do not burn the dial budget.
-metadata_peer_connect_timeout_ms = 2500
+# TCP connect + early handshake timeout while fetching magnet metadata.
+# Longer than a pure dead-peer probe so live but slow peers can finish MSE;
+# attempt counts stay the same as content dials (fewer longer dials).
+metadata_peer_connect_timeout_ms = 5000
 
 # Wall-clock budget for outbound connect+handshake work per engine tick.
 # At least one attempt always runs; further attempts stop once this budget is spent
 # so control commands (show) are not blocked for max_attempts × connect timeout.
-peer_connect_batch_budget_ms = 15000
+peer_connect_batch_budget_ms = 20000
 
 # After a failed dial, skip that candidate until this cooldown elapses.
+# Dial Timeouts use a third of this value (min 10s) so reachability noise rotates.
 peer_connect_fail_cooldown_ms = 60000
 
 # Timeout for in-flight block requests to a peer.

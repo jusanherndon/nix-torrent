@@ -145,6 +145,12 @@ pub fn parseAnnounceUrl(allocator: std.mem.Allocator, url: []const u8) !Announce
     };
 }
 
+/// Stable product identity for HTTP(S) tracker announces (BEP 3 clients identify themselves).
+pub const http_user_agent = "nix-torrent/0.3.0";
+
+/// Default peers requested per announce — matches the UDP `num_want` field.
+pub const default_numwant: u32 = 50;
+
 pub fn buildAnnouncePath(
     allocator: std.mem.Allocator,
     base_path: []const u8,
@@ -174,7 +180,14 @@ pub fn buildAnnouncePath(
         .prefer => "&supportcrypto=1",
         .require => "&supportcrypto=1&requirecrypto=1",
     };
-    return std.fmt.allocPrint(allocator, "{s}{c}info_hash={s}&peer_id={s}&port={d}&uploaded={d}&downloaded={d}&left={d}&compact=1{s}{s}", .{ base_path, sep, ih, pid, port, uploaded, downloaded, left, event_param, crypto_param });
+    // BEP 3 optional but widely expected: `numwant` + opaque `key` for multi-client NATs.
+    const key = std.mem.readInt(u32, peer_id[0..4], .big);
+    return std.fmt.allocPrint(allocator, "{s}{c}info_hash={s}&peer_id={s}&port={d}&uploaded={d}&downloaded={d}&left={d}&compact=1&numwant={d}&key={d}{s}{s}", .{ base_path, sep, ih, pid, port, uploaded, downloaded, left, default_numwant, key, event_param, crypto_param });
+}
+
+/// Formats the HTTP/1.1 announce request line + headers (Host, User-Agent, Connection).
+pub fn formatAnnounceHttpRequest(buf: []u8, request_path: []const u8, host: []const u8) ![]u8 {
+    return std.fmt.bufPrint(buf, "GET {s} HTTP/1.1\r\nHost: {s}\r\nUser-Agent: {s}\r\nConnection: close\r\n\r\n", .{ request_path, host, http_user_agent });
 }
 
 pub fn buildAnnouncePathLegacy(allocator: std.mem.Allocator, base_path: []const u8, info_hash: torrent.InfoHash, peer_id: [20]u8, port: u16, uploaded: u64, downloaded: u64, left: u64) ![]u8 {
@@ -196,7 +209,7 @@ pub fn announceGet(
     defer stream.close(io);
 
     var req_buf: [4096]u8 = undefined;
-    const req = try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{ request_path, parsed.host });
+    const req = try formatAnnounceHttpRequest(&req_buf, request_path, parsed.host);
 
     var write_buffer: [4096]u8 = undefined;
     var writer = stream.writer(io, &write_buffer);
@@ -287,7 +300,7 @@ pub fn announceGetTls(
     };
 
     var req_buf: [4096]u8 = undefined;
-    const req = try std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{ request_path, parsed.host });
+    const req = try formatAnnounceHttpRequest(&req_buf, request_path, parsed.host);
     try client.writer.writeAll(req);
     try client.writer.flush();
     try sw.interface.flush();
@@ -419,7 +432,7 @@ fn udpAnnounce(
     std.mem.writeInt(u32, req[80..84], event_code, .big);
     std.mem.writeInt(u32, req[84..88], 0, .big);
     std.mem.writeInt(u32, req[88..92], nextTransactionId(), .big);
-    std.mem.writeInt(u32, req[92..96], 50, .big);
+    std.mem.writeInt(u32, req[92..96], default_numwant, .big);
     std.mem.writeInt(u16, req[96..98], port, .big);
     const resp = try udpTransact(io, allocator, parsed, &req, timeout_ms);
     defer resp.deinit();
@@ -663,11 +676,21 @@ test "builds announce path with and without existing query parameters" {
     try std.testing.expect(std.mem.startsWith(u8, plain, "/announce?info_hash="));
     try std.testing.expect(std.mem.indexOf(u8, plain, "&event=started") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain, "&supportcrypto=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "&numwant=50") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "&key=") != null);
 
     const with_query = try buildAnnouncePath(std.testing.allocator, "/announce?pass=key", true, ih, pid, 6881, 0, 0, 100, .none, .require);
     defer std.testing.allocator.free(with_query);
     try std.testing.expect(std.mem.startsWith(u8, with_query, "/announce?pass=key&info_hash="));
     try std.testing.expect(std.mem.indexOf(u8, with_query, "&event=") == null);
+}
+
+test "HTTP announce request includes User-Agent" {
+    var buf: [512]u8 = undefined;
+    const req = try formatAnnounceHttpRequest(&buf, "/announce?info_hash=ab", "tracker.example");
+    try std.testing.expect(std.mem.indexOf(u8, req, "User-Agent: nix-torrent/0.3.0\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "Host: tracker.example\r\n") != null);
+    try std.testing.expect(std.mem.startsWith(u8, req, "GET /announce?info_hash=ab HTTP/1.1\r\n"));
 }
 
 test "parses http tracker announce url" {

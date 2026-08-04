@@ -13,6 +13,7 @@ pub const metadata_piece_size = session_types.metadata_piece_size;
 pub const PieceDownload = session_types.PieceDownload;
 pub const TrackerEndpoint = session_types.TrackerEndpoint;
 pub const TorrentSession = session_types.TorrentSession;
+pub const ConnectDiag = session_types.ConnectDiag;
 pub const DhtContext = peer_pool.DhtContext;
 
 /// Everything a Torrent Session needs from outside for one tick.

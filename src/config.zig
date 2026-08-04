@@ -54,13 +54,15 @@ pub const Network = struct {
     /// Base UDP port for per-torrent DHT sockets (dht_base_port + slot).
     dht_base_port: u64 = 6882,
     peer_connect_timeout_ms: u64 = 10_000,
-    /// Shorter TCP connect timeout used while fetching magnet metadata so dead
-    /// peer candidates do not monopolize the dial budget.
-    metadata_peer_connect_timeout_ms: u64 = 2_500,
+    /// TCP connect+early handshake timeout while fetching magnet metadata.
+    /// Longer than a pure probe so live but slow peers can complete MSE; paired
+    /// with fewer attempts-per-tick so dead endpoints do not burn the batch.
+    metadata_peer_connect_timeout_ms: u64 = 5_000,
     /// Wall-clock cap for outbound connect+handshake work in one engine tick.
     /// Always allows at least one attempt; further attempts stop once elapsed time hits this budget.
-    peer_connect_batch_budget_ms: u64 = 15_000,
+    peer_connect_batch_budget_ms: u64 = 20_000,
     /// After a failed dial, skip that candidate until this cooldown elapses.
+    /// Timeouts use a third of this (min 10s) so the candidate set keeps rotating.
     peer_connect_fail_cooldown_ms: u64 = 60_000,
     peer_request_timeout_ms: u64 = 30_000,
     tracker_request_timeout_ms: u64 = 10_000,

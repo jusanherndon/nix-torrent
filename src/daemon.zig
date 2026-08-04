@@ -15,6 +15,7 @@ const storage = @import("storage.zig");
 const dht = @import("dht.zig");
 const magnet = @import("magnet.zig");
 const staging = @import("staging.zig");
+const session_types = @import("session_types.zig");
 
 const Daemon = struct {
     allocator: std.mem.Allocator,
@@ -663,6 +664,7 @@ fn showResponse(daemon: *Daemon, rec: state.TorrentRecord) !protocol.Response {
     try root.put(allocator, "encryption_modes", .{ .object = try encryptionModesObject(daemon, allocator, rec.info_hash_hex) });
     if (daemon.engine.findSession(rec.info_hash_hex)) |sess| {
         try root.put(allocator, "peer_candidate_count", .{ .integer = @intCast(sess.peer_candidates.items.len) });
+        try root.put(allocator, "connect_diagnostics", .{ .object = try connectDiagObject(allocator, sess.connect_diag) });
     }
     var pm_obj: std.json.ObjectMap = .empty;
     errdefer pm_obj.deinit(allocator);
@@ -714,6 +716,24 @@ fn sessionInboundCount(daemon: *Daemon, info_hash_hex: []const u8) u64 {
         n += 1;
     };
     return n;
+}
+
+/// Per-stage outbound connect counters for operator diagnosis without log diving.
+fn connectDiagObject(allocator: std.mem.Allocator, diag: session_types.ConnectDiag) !std.json.ObjectMap {
+    var obj: std.json.ObjectMap = .empty;
+    errdefer obj.deinit(allocator);
+    try obj.put(allocator, "attempts", .{ .integer = @intCast(diag.attempts) });
+    try obj.put(allocator, "dial_timeout", .{ .integer = @intCast(diag.dial_timeout) });
+    try obj.put(allocator, "connection_refused", .{ .integer = @intCast(diag.connection_refused) });
+    try obj.put(allocator, "connection_failed", .{ .integer = @intCast(diag.connection_failed) });
+    try obj.put(allocator, "mse_mid_abort", .{ .integer = @intCast(diag.mse_mid_abort) });
+    try obj.put(allocator, "plaintext_retry", .{ .integer = @intCast(diag.plaintext_retry) });
+    try obj.put(allocator, "plaintext_retry_fail", .{ .integer = @intCast(diag.plaintext_retry_fail) });
+    try obj.put(allocator, "unsupported_encryption", .{ .integer = @intCast(diag.unsupported_encryption) });
+    try obj.put(allocator, "short_read", .{ .integer = @intCast(diag.short_read) });
+    try obj.put(allocator, "handshake_ok", .{ .integer = @intCast(diag.handshake_ok) });
+    try obj.put(allocator, "other", .{ .integer = @intCast(diag.other) });
+    return obj;
 }
 
 /// Counts connected peers by address family for `show`, surfacing dual-stack usage.

@@ -53,6 +53,53 @@ pub const TrackerEndpoint = struct {
     }
 };
 
+/// Cumulative outbound connect/handshake counters for `show` diagnosis (issue #9 / #12).
+/// Never persisted; session-lifetime only.
+pub const ConnectDiag = struct {
+    attempts: u64 = 0,
+    dial_timeout: u64 = 0,
+    connection_refused: u64 = 0,
+    connection_failed: u64 = 0,
+    mse_mid_abort: u64 = 0,
+    plaintext_retry: u64 = 0,
+    plaintext_retry_fail: u64 = 0,
+    unsupported_encryption: u64 = 0,
+    short_read: u64 = 0,
+    handshake_ok: u64 = 0,
+    other: u64 = 0,
+
+    pub fn recordError(self: *ConnectDiag, err: anyerror) void {
+        // Mid-MSE aborts that trigger a prefer→plaintext retry are counted in the
+        // dial helpers (mse_mid_abort / plaintext_retry*). This path records the
+        // *terminal* fail of an attempt only.
+        if (err == error.Timeout) {
+            self.dial_timeout += 1;
+        } else if (err == error.ConnectionRefused) {
+            self.connection_refused += 1;
+        } else if (err == error.ConnectionFailed) {
+            self.connection_failed += 1;
+        } else if (err == error.MsePe2Short or err == error.MseVcEof or err == error.MseVcNotFound) {
+            self.mse_mid_abort += 1;
+        } else if (err == error.UnsupportedEncryption or err == error.PeerNotMse) {
+            self.unsupported_encryption += 1;
+        } else if (err == error.ShortRead or err == error.ShortMessage) {
+            self.short_read += 1;
+        } else {
+            self.other += 1;
+        }
+    }
+};
+
+test "ConnectDiag classifies terminal dial errors" {
+    var d: ConnectDiag = .{};
+    d.recordError(error.Timeout);
+    d.recordError(error.ConnectionRefused);
+    d.recordError(error.UnsupportedEncryption);
+    try std.testing.expectEqual(@as(u64, 1), d.dial_timeout);
+    try std.testing.expectEqual(@as(u64, 1), d.connection_refused);
+    try std.testing.expectEqual(@as(u64, 1), d.unsupported_encryption);
+}
+
 pub const TorrentSession = struct {
     info_hash_hex: []const u8,
     info_hash: torrent.InfoHash,
@@ -77,6 +124,7 @@ pub const TorrentSession = struct {
     last_pex_emit_ms: i64 = 0,
     /// Timestamp of the last LSD announce (throttle).
     last_lsd_announce_ms: i64 = 0,
+    connect_diag: ConnectDiag = .{},
     metadata_chunks: std.AutoHashMap(u32, []u8),
     metadata_size: ?usize = null,
     metadata_next_request: u32 = 0,

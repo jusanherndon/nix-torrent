@@ -110,16 +110,24 @@ fn connectTimeoutMs(cfg: config.Config, mode: DhtPeerMode) u64 {
 
 fn maxAttemptsForMode(cfg: config.Config, mode: DhtPeerMode) usize {
     const base = @as(usize, @intCast(cfg.limits.max_peer_connect_attempts_per_tick));
-    return switch (mode) {
-        // Metadata fetcher is gated on finding any live peer; spend more of the
-        // tick budget probing short-timeout dials through dead candidates.
-        .metadata => @min(base * 2, @as(usize, @intCast(cfg.limits.max_peers_per_torrent))),
-        .content => base,
-    };
+    // Metadata: same attempt count as content. Live diagnosis showed short
+    // timeouts + double attempts burned the batch on dead endpoints before a
+    // live peer could finish MSE. Prefer fewer longer dials (see timeout default).
+    _ = mode;
+    return base;
 }
 
 fn isPreferPlaintextRetry(err: anyerror) bool {
     return err == error.MsePe2Short or err == error.MseVcEof or err == error.MseVcNotFound;
+}
+
+/// Timeouts get a shorter cooldown so the candidate set keeps rotating through
+/// reachability noise; hard failures (refused, etc.) keep the full cooldown.
+fn failCooldownMs(cfg: config.Config, err: anyerror) u64 {
+    if (err == error.Timeout) {
+        return @max(cfg.network.peer_connect_fail_cooldown_ms / 3, 10_000);
+    }
+    return cfg.network.peer_connect_fail_cooldown_ms;
 }
 
 pub fn connectCandidateBatch(
@@ -152,8 +160,10 @@ pub fn connectCandidateBatch(
                 if (session.peers.items.len >= cfg.limits.max_peers_per_torrent) break;
                 if (hasContent(session, tp.addr())) continue;
                 attempts += 1;
+                session.connect_diag.attempts += 1;
                 connectContentTimed(allocator, io, cfg, session, tp.addr(), peer_id, connect_timeout) catch |err| {
-                    markCandidateCooldown(session, idx, nowMs(io), cfg.network.peer_connect_fail_cooldown_ms);
+                    session.connect_diag.recordError(err);
+                    markCandidateCooldown(session, idx, nowMs(io), failCooldownMs(cfg, err));
                     logConnectFailure("content", session, tp.addr(), err);
                 };
             },
@@ -161,8 +171,10 @@ pub fn connectCandidateBatch(
                 if (session.metadata_peers.items.len >= cfg.limits.max_peers_per_torrent) break;
                 if (hasMetadata(session, tp.addr())) continue;
                 attempts += 1;
+                session.connect_diag.attempts += 1;
                 connectMetadataTimed(allocator, io, cfg, session, tp.addr(), peer_id, connect_timeout) catch |err| {
-                    markCandidateCooldown(session, idx, nowMs(io), cfg.network.peer_connect_fail_cooldown_ms);
+                    session.connect_diag.recordError(err);
+                    markCandidateCooldown(session, idx, nowMs(io), failCooldownMs(cfg, err));
                     logConnectFailure("metadata", session, tp.addr(), err);
                 };
             },
@@ -194,12 +206,13 @@ fn connectContentTimed(
     if (session.peers.items.len >= cfg.limits.max_peers_per_torrent) return;
     if (hasContent(session, addr)) return;
     const policy = config.encryptionPolicy(cfg.network);
-    var conn = try dialWithPreferPlaintextRetry(io, allocator, addr, connect_timeout_ms, cfg.network.peer_request_timeout_ms, session.info_hash, peer_id, policy, false);
+    var conn = try dialWithPreferPlaintextRetry(io, allocator, addr, connect_timeout_ms, cfg.network.peer_request_timeout_ms, session.info_hash, peer_id, policy, false, &session.connect_diag);
     errdefer conn.deinit(io);
     try conn.sendInterested(io);
     // Advertise our LTEP extensions so the peer can send us `ut_pex` (BEP 11).
     if (cfg.network.pex.enabled) conn.sendExtendedHandshake(io) catch {};
     try session.peers.append(allocator, conn);
+    session.connect_diag.handshake_ok += 1;
     var buf: [64]u8 = undefined;
     log.debug("peer_pool", "connected content peer {s} ({s}) for {s} ({d} total)", .{ addr.render(&buf), addr.ip.family(), session.info_hash_hex, session.peers.items.len });
 }
@@ -242,12 +255,13 @@ fn connectMetadataTimed(
     if (session.metadata_peers.items.len >= cfg.limits.max_peers_per_torrent) return;
     if (hasMetadata(session, addr)) return;
     const policy = config.encryptionPolicy(cfg.network);
-    var conn = try dialMetadataWithPreferPlaintextRetry(io, allocator, addr, connect_timeout_ms, cfg.network.peer_request_timeout_ms, session.info_hash, peer_id, policy);
+    var conn = try dialMetadataWithPreferPlaintextRetry(io, allocator, addr, connect_timeout_ms, cfg.network.peer_request_timeout_ms, session.info_hash, peer_id, policy, &session.connect_diag);
     errdefer conn.deinit(io);
     if (conn.metadata_size) |size| {
         if (session.metadata_size == null) session.metadata_size = size;
     }
     try session.metadata_peers.append(allocator, conn);
+    session.connect_diag.handshake_ok += 1;
     var buf: [64]u8 = undefined;
     log.debug("peer_pool", "connected metadata peer {s} ({s}) for {s} ({d} total)", .{ addr.render(&buf), addr.ip.family(), session.info_hash_hex, session.metadata_peers.items.len });
     // Always request; leftover bitfield/have in recv_buffer must not block ut_metadata.
@@ -266,17 +280,23 @@ fn dialWithPreferPlaintextRetry(
     peer_id: [20]u8,
     policy: encryption.Policy,
     extensions: bool,
+    diag: *session_types.ConnectDiag,
 ) !peer.Connection {
     var conn = try peer.Connection.connectAddr(io, allocator, addr, connect_timeout_ms, read_timeout_ms);
     var alive = true;
     errdefer if (alive) conn.deinit(io);
     conn.performHandshake(io, info_hash, peer_id, policy, extensions) catch |err| {
         if (policy != .prefer or !isPreferPlaintextRetry(err)) return err;
+        diag.mse_mid_abort += 1;
+        diag.plaintext_retry += 1;
         conn.deinit(io);
         alive = false;
         conn = try peer.Connection.connectAddr(io, allocator, addr, connect_timeout_ms, read_timeout_ms);
         alive = true;
-        try conn.performHandshake(io, info_hash, peer_id, .disable, extensions);
+        conn.performHandshake(io, info_hash, peer_id, .disable, extensions) catch |retry_err| {
+            diag.plaintext_retry_fail += 1;
+            return retry_err;
+        };
     };
     alive = false;
     return conn;
@@ -291,19 +311,25 @@ fn dialMetadataWithPreferPlaintextRetry(
     info_hash: torrent.InfoHash,
     peer_id: [20]u8,
     policy: encryption.Policy,
+    diag: *session_types.ConnectDiag,
 ) !peer.Connection {
     var conn = try peer.Connection.connectAddr(io, allocator, addr, connect_timeout_ms, read_timeout_ms);
     var alive = true;
     errdefer if (alive) conn.deinit(io);
     conn.performMetadataHandshake(io, info_hash, peer_id, policy) catch |err| {
         if (policy != .prefer or !isPreferPlaintextRetry(err)) return err;
+        diag.mse_mid_abort += 1;
+        diag.plaintext_retry += 1;
         var buf: [64]u8 = undefined;
         log.debug("peer_pool", "metadata MSE mid-handshake abort from {s}; retrying plaintext", .{addr.render(&buf)});
         conn.deinit(io);
         alive = false;
         conn = try peer.Connection.connectAddr(io, allocator, addr, connect_timeout_ms, read_timeout_ms);
         alive = true;
-        try conn.performMetadataHandshake(io, info_hash, peer_id, .disable);
+        conn.performMetadataHandshake(io, info_hash, peer_id, .disable) catch |retry_err| {
+            diag.plaintext_retry_fail += 1;
+            return retry_err;
+        };
     };
     alive = false;
     return conn;
@@ -500,4 +526,14 @@ test "mergeCandidates dedupes and skips garbage" {
     try std.testing.expectEqual(@as(usize, 2), session.peer_candidates.items.len);
     try std.testing.expectEqual(@as(u8, 1), session.peer_candidates.items[0].ip.v4[0]);
     try std.testing.expectEqual(@as(u8, 5), session.peer_candidates.items[1].ip.v4[0]);
+}
+
+test "ConnectDiag classifies terminal dial errors" {
+    var d: session_types.ConnectDiag = .{};
+    d.recordError(error.Timeout);
+    d.recordError(error.ConnectionRefused);
+    d.recordError(error.UnsupportedEncryption);
+    try std.testing.expectEqual(@as(u64, 1), d.dial_timeout);
+    try std.testing.expectEqual(@as(u64, 1), d.connection_refused);
+    try std.testing.expectEqual(@as(u64, 1), d.unsupported_encryption);
 }
