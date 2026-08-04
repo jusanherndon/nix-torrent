@@ -160,23 +160,29 @@ _Avoid_: Encryption policy, encryption scheme, tracker announce parameter
 An operator- or agent-run exercise that adds a public Magnet Link or Torrent File to a real daemon, exercises Trackers / DHT / peer dials against the public swarm, collects Control Surface output and logs, and posts a redacted diagnosis. It is verification, not CI.
 _Avoid_: Integration harness test, unit test, un-redacted ticket dump
 
+**MVP Smoke Pass Bar**:
+A Live Swarm Probe used as the MVP definition’s manual acceptance standard: ordered early gates and binary pass/fail through Handoff and Seeding for a public Magnet Link run and a Torrent File run on a NAT home lab. Publish rules are identical to every Live Swarm Probe — ticket artifacts redacted the same way; no separate looser path.
+_Avoid_: CI suite, unit test, informal “it downloaded once”, separate unredacted ritual, smoke with weaker redaction than Live Swarm Probe
+
 ---
 
 ## Live Swarm Probe procedure
 
-Every Live Swarm Probe that produces public artifacts (GitHub issues, PR comments, research notes, chat paste-back that may be published) **must** follow this pattern. Local-only terminals need not redact, but anything that leaves the machine is public-ready first.
+This procedure applies to **every** Live Swarm Probe **and** every **MVP Smoke Pass Bar** run. Scored smoke is not a second publish policy.
+
+Every probe that produces public artifacts (GitHub issues, PR comments, research notes, chat paste-back that may be published) **must** follow this pattern. Local-only terminals need not redact, but **anything uploaded to a ticket or leaving the machine is public-ready first** — including full daemon log dumps: redacted only, or do not upload.
 
 ### Run
 
 1. Use an isolated config (staging, final destination, socket, listen/DHT ports) so the probe does not touch production paths.
-2. Prefer debug-level logging for the duration of the probe; capture daemon logs, `status`, and periodic `show <info-hash>` samples.
-3. Add the Magnet Link or Torrent File; wait long enough to observe stage mix (discovery → dial → MSE/handshake → attach), not only a single `list` snapshot.
-4. Prefer Control Surface fields for diagnosis when present (`trackers`, `connect_diagnostics`, peer counts, encryption modes, DHT fields) over raw logs.
+2. Prefer debug-level logging for the duration of the probe; capture daemon logs, `status`, and periodic `show <info-hash>` samples **locally**.
+3. Add the Magnet Link or Torrent File; wait long enough to observe stage mix (discovery → dial → MSE/handshake → attach), not only a single `list` snapshot. For MVP Smoke Pass Bar, apply the gate ladder and clocks below.
+4. Prefer Control Surface fields for diagnosis when present (`trackers`, `connect_diagnostics`, peer counts, encryption modes, DHT / Port Mapping fields) over raw logs. Smoke greening requires the diagnosis surface from issue #9 so log diving is not required for gate pass/fail.
 5. Tear down the daemon and staging data when finished; do not leave the probe torrent running.
 
 ### Publish only redacted material
 
-Assume issues, PR comments, and map notes are public. **Never** post unredacted full magnets, log dumps, or `show` JSON that still contains the fields below.
+Assume issues, PR comments, map notes, and any **attached logs** are public. **Never** post unredacted full magnets, log dumps, or `show` JSON that still contains the fields below. Unredacted local files may stay on disk; they do not go on tickets.
 
 | Category | Redact to | Examples |
 | --- | --- | --- |
@@ -189,21 +195,71 @@ Assume issues, PR comments, and map notes are public. **Never** post unredacted 
 
 ### Keep (these are the probe result)
 
-- Stage outcomes and activity (`fetching_metadata`, `downloading`, stuck/never attached).
+- Stage outcomes and activity (`fetching_metadata`, `downloading`, `seeding`, stuck/never attached).
 - Counts and histograms: candidate count, dial attempts, `Timeout` / `ConnectionRefused` / MSE mid-abort / plaintext retry / `handshake_ok` (from logs or `connect_diagnostics`).
 - Tracker **outcome classes** without names: success vs failure reason **class** (`missing user agent`, `bad request`, timeout) after redacting any endpoint identity.
-- Encryption Policy under test, duration of the sample window, and whether metadata completed.
+- Encryption Policy under test, duration of the sample window, whether metadata completed, and (for smoke) each gate pass/fail.
 - Config knobs that matter to the stage mix (timeouts, policy), without machine-local paths.
+- Port Mapping outcome classes (Listen / DHT mapped vs failed), without external IPs.
 
 ### Ticket write-up shape
 
 Public probe comments should read as diagnosis, not a data dump:
 
-1. Question / purpose of this probe.
-2. Stage table or short mix (what dominated).
+1. Question / purpose of this probe (or “MVP smoke run” + magnet vs torrent leg).
+2. Stage table or short mix (what dominated); for smoke, gate table G0–G6 with pass/fail and wall time.
 3. Redacted snapshot progression (`show` / `status` shapes).
 4. Failure-tag counts or `connect_diagnostics`.
 5. Tracker table with **scheme + status + error class only**.
 6. What is still open (fix hypothesis vs document-only).
 
-_Cross-check_: if a stranger reading the issue could name your trackers, swarm peers, content title, or home path, redaction failed — rewrite before posting.
+_Cross-check_: if a stranger reading the issue could name your trackers, swarm peers, content title, or home path, redaction failed — rewrite before posting. Same check for smoke and non-smoke Live Swarm Probes.
+
+---
+
+## MVP Smoke Pass Bar procedure
+
+Extends Live Swarm Probe procedure (isolation, Control Surface preference, **identical redaction**). This is the MVP definition’s manual acceptance bar — not CI. Procedure text may be complete before a green run is possible; greening waits on the blockers below.
+
+### Green blockers (must ship before declare pass)
+
+1. Minimum `show`/`status` diagnosis surface — issue #9 (locked + shipped).
+2. Continuous Torrent Session Seeding after Handoff — issue #19 / ADR 0007 in code.
+3. Port Mapping for Listen Port (TCP) and active torrent DHT Port (UDP) with Control Surface state — issue #20.
+4. Enough connect-path fixes that G1–G4 can clear under the clocks — issue #12 residual (#14, #15, #17, #18, related).
+
+### Environment and setup
+
+- Isolated config paths (staging, Final Destination, socket, listen/DHT ports); Encryption Policy **`prefer`** (default). Alternate policy is diagnosis-only, not a second pass bar.
+- Outbound IPv4 works.
+- Port Mapping enabled; within **2 minutes** of start (Listen) and of active DHT slot (UDP), Control Surface shows **mapped** for both. Fail = G0 fail.
+- Public swarm only; operator-chosen content, prefer **≤ ~2 GiB** so G5 stays within budget; no private/auth trackers; no infinite content swap (G1 zero-candidates: reselect **once**, then fail the bar).
+
+### Dual-run order
+
+1. **Magnet Link** run (full G0–G6).
+2. Soft Remove (or equivalent) and clear that run’s probe content so progress does not bleed.
+3. **Torrent File** run (full G0–G6; G2 still asserted even if true immediately after add).
+4. Bar **passes only if both runs pass**. Full probe teardown after both complete or after a hard fail.
+
+### Gate ladder (both runs)
+
+| Gate | Pass (Control Surface, not unredacted logs) | Fail if not met by |
+| --- | --- | --- |
+| G0 | Daemon up; add accepted; Port Mapping mapped for Listen Port and (when slot held) active DHT Port | Immediate for add; **2 min** for mapping |
+| G1 | Peer candidate count > 0 | **5 min** after add |
+| G2 | `metadata_complete` (or equivalent) true | **15 min** after G1, or **20 min** wall from add (whichever first) |
+| G3 | Connected / content peer ≥ 1 | **15 min** after G2 |
+| G4 | Verified piece progress advances after G3 | **10 min** after G3 with progress still 0 |
+| G5 | Handoff: content under Final Destination; Completion History written; Staging Area removed; Session continues | Operator budget **≤ 2 h** after progress moving; **30 min** quiet with no piece progress → fail |
+| G6 | Activity `seeding`; Final Destination path present; Session still live-managed; no FD fail in observe window | **5 min** observe after Handoff |
+
+G6 does **not** require `uploaded > 0` or a remote leecher finishing a download.
+
+### Fail recording
+
+On any gate fail: stop that run; ticket artifact = redacted diagnosis packet (write-up shape above) using #9 fields when shipped. Do not “rescue” by only watching later gates. Do not attach unredacted logs.
+
+### Pass
+
+Both runs clear G0–G6 under clocks with green blockers satisfied; ticket comment (if any) uses the same redaction rules as any Live Swarm Probe.
