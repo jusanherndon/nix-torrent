@@ -2,9 +2,13 @@
 const std = @import("std");
 const peer = @import("peer.zig");
 const storage = @import("storage.zig");
+const state = @import("state.zig");
 const torrent = @import("torrent.zig");
 const tracker = @import("tracker.zig");
 const dht = @import("dht.zig");
+
+/// Re-export: counters live on the Registry Projection (`TorrentRecord.connect_diag`).
+pub const ConnectDiag = state.ConnectDiag;
 
 pub const metadata_piece_size: u32 = 16 * 1024;
 
@@ -77,6 +81,7 @@ pub const TorrentSession = struct {
     last_pex_emit_ms: i64 = 0,
     /// Timestamp of the last LSD announce (throttle).
     last_lsd_announce_ms: i64 = 0,
+    connect_diag: ConnectDiag = .{},
     metadata_chunks: std.AutoHashMap(u32, []u8),
     metadata_size: ?usize = null,
     metadata_next_request: u32 = 0,

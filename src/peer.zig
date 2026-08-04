@@ -90,10 +90,28 @@ pub const Connection = struct {
     metadata_size: ?usize = null,
     read_scratch: [4096]u8 = undefined,
     read_timeout_ms: u64 = 30_000,
+    /// Wall-clock cap for outbound connect+handshake I/O (metadata/content dial path).
+    handshake_deadline_ms: ?i64 = null,
 
     fn readStreamSlice(self: *Connection, io: std.Io, dest: []u8) !usize {
-        _ = io;
-        return tcp.readSome(self.stream.socket.handle, dest, self.read_timeout_ms);
+        return tcp.readSome(self.stream.socket.handle, dest, self.effectiveReadTimeoutMs(io));
+    }
+
+    fn effectiveReadTimeoutMs(self: *Connection, io: std.Io) u64 {
+        var timeout_ms = self.read_timeout_ms;
+        if (self.handshake_deadline_ms) |deadline| {
+            const remaining = deadline - nowMs(io);
+            if (remaining <= 0) return 0;
+            timeout_ms = @min(timeout_ms, @as(u64, @intCast(remaining)));
+        }
+        return timeout_ms;
+    }
+
+    /// Clears the dial-phase deadline and switches to post-handshake I/O timeouts.
+    pub fn finishOutboundDial(self: *Connection, peer_request_timeout_ms: u64) void {
+        self.handshake_deadline_ms = null;
+        self.read_timeout_ms = peer_request_timeout_ms;
+        tcp.setIoTimeouts(self.stream.socket.handle, peer_request_timeout_ms);
     }
 
     const MseBridge = struct {
@@ -315,7 +333,7 @@ pub const Connection = struct {
         const ext = try encodeExtendedHandshake(self.allocator, 1);
         defer self.allocator.free(ext);
         try self.sendRaw(io, ext);
-        const deadline_ms = nowMs(io) + @as(i64, @intCast(@min(self.read_timeout_ms, 15_000)));
+        const deadline_ms = self.handshake_deadline_ms orelse nowMs(io) + @as(i64, @intCast(@min(self.read_timeout_ms, 15_000)));
         while (self.ut_metadata_id == null) {
             if (nowMs(io) >= deadline_ms) return error.MetadataHandshakeFailed;
             if (self.recv_buffer.items.len < 4) {
@@ -637,6 +655,24 @@ fn encodeBlockRef(out: *std.ArrayList(u8), allocator: std.mem.Allocator, id: Mes
 fn parseBlockRef(payload: []const u8) BlockRef { return .{ .index = std.mem.readInt(u32, payload[0..4], .big), .begin = std.mem.readInt(u32, payload[4..8], .big), .length = std.mem.readInt(u32, payload[8..12], .big) }; }
 fn writeLen(out: *std.ArrayList(u8), allocator: std.mem.Allocator, len: u32) !void { try writeU32(out, allocator, len); }
 fn writeU32(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u32) !void { var b: [4]u8 = undefined; std.mem.writeInt(u32, &b, value, .big); try out.appendSlice(allocator, &b); }
+
+test "effectiveReadTimeoutMs respects handshake deadline" {
+    var conn = Connection{
+        .allocator = std.testing.allocator,
+        .stream = undefined,
+        .peer_addr = address.Address.v4(.{ 127, 0, 0, 1 }, 6881),
+        .state = .{},
+        .recv_buffer = .empty,
+        .read_timeout_ms = 30_000,
+        .handshake_deadline_ms = std.Io.Timestamp.now(std.testing.io, .real).toMilliseconds() + 2_000,
+    };
+    defer conn.recv_buffer.deinit(std.testing.allocator);
+    defer conn.state.deinit(std.testing.allocator);
+    const rem = conn.effectiveReadTimeoutMs(std.testing.io);
+    try std.testing.expect(rem > 1_900 and rem <= 2_000);
+    conn.handshake_deadline_ms = std.Io.Timestamp.now(std.testing.io, .real).toMilliseconds() - 1;
+    try std.testing.expectEqual(@as(u64, 0), conn.effectiveReadTimeoutMs(std.testing.io));
+}
 
 test "encodes and decodes handshake" {
     var ih: torrent.InfoHash = [_]u8{1} ** 20;

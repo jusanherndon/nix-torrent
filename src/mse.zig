@@ -81,6 +81,20 @@ fn readExact(stream: ByteStream, dest: []u8) HandshakeError!void {
     }
 }
 
+const bt_protocol_name = "BitTorrent protocol";
+
+/// Classic BitTorrent handshake prefix anywhere in `buf` (BEP 3). Used to detect
+/// `PeerNotMse` even when a leading pad/wrapper byte precedes pstrlen `19`.
+fn looksLikeClassicBtHandshake(buf: []const u8) bool {
+    if (buf.len < 20) return false;
+    var i: usize = 0;
+    while (i + 20 <= buf.len) : (i += 1) {
+        if (buf[i] != 19) continue;
+        if (std.mem.eql(u8, buf[i + 1 .. i + 20], bt_protocol_name)) return true;
+    }
+    return false;
+}
+
 fn readDhPeerKey(stream: ByteStream, buf: []u8) HandshakeError!usize {
     // At least Y (96). Do not block waiting for more pad — that delays the next frame.
     var total: usize = 0;
@@ -88,7 +102,7 @@ fn readDhPeerKey(stream: ByteStream, buf: []u8) HandshakeError!usize {
         const n = stream.read(buf[total..]) catch return error.ShortRead;
         if (n == 0) return total;
         total += n;
-        if (buf[0] == 19) return total;
+        if (looksLikeClassicBtHandshake(buf[0..total])) return total;
     }
     return total;
 }
@@ -110,7 +124,7 @@ pub fn establishInitiator(
 
     var pe2_buf: [encryption.max_dh_packet_len]u8 = undefined;
     const pe2_len = try readDhPeerKey(stream, &pe2_buf);
-    if (pe2_len >= 1 and pe2_buf[0] == 19) return error.PeerNotMse;
+    if (looksLikeClassicBtHandshake(pe2_buf[0..pe2_len])) return error.PeerNotMse;
     if (pe2_len < 96) return error.MsePe2Short;
 
     var remote_pub: [96]u8 = undefined;
@@ -370,6 +384,29 @@ pub fn establishResponderMulti(
         },
         .info_hash = matched,
     };
+}
+
+test "looksLikeClassicBtHandshake detects pstrlen at offset zero and after pad" {
+    var plain: [20]u8 = undefined;
+    plain[0] = 19;
+    @memcpy(plain[1..20], bt_protocol_name);
+    try std.testing.expect(looksLikeClassicBtHandshake(&plain));
+
+    var with_pad: [21]u8 = undefined;
+    with_pad[0] = 0x00;
+    with_pad[1] = 19;
+    @memcpy(with_pad[2..21], bt_protocol_name);
+    try std.testing.expect(looksLikeClassicBtHandshake(&with_pad));
+
+    var no_pstrlen: [20]u8 = undefined;
+    no_pstrlen[0] = 0x00;
+    @memcpy(no_pstrlen[1..20], bt_protocol_name);
+    try std.testing.expect(!looksLikeClassicBtHandshake(&no_pstrlen));
+
+    var dh_like: [96]u8 = undefined;
+    @memset(&dh_like, 0xAB);
+    dh_like[0] = 19;
+    try std.testing.expect(!looksLikeClassicBtHandshake(&dh_like));
 }
 
 test "establish initiator refuses disable policy" {
