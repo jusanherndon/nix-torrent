@@ -164,6 +164,10 @@ _Avoid_: Integration harness test, unit test, un-redacted ticket dump
 A Live Swarm Probe used as the MVP definition’s manual acceptance standard: ordered early gates and binary pass/fail through Handoff and Seeding for a public Magnet Link run and a Torrent File run on a NAT home lab. Publish rules are identical to every Live Swarm Probe — ticket artifacts redacted the same way; no separate looser path.
 _Avoid_: CI suite, unit test, informal “it downloaded once”, separate unredacted ritual, smoke with weaker redaction than Live Swarm Probe
 
+**Smoke Diagnosis Surface**:
+The minimum Control Surface `status` / `show` field set required so an operator can score MVP Smoke Pass Bar gates G0–G6 and classify stalls (dial vs MSE vs handshake vs attach, discovery, progress, Handoff, Seeding) without log diving. Session-level aggregates and status classes only — not per-peer identity tables.
+_Avoid_: Raw log scrape as the primary diagnosis path, per-peer IP dumps, dual unredacted packet for smoke
+
 ---
 
 ## Live Swarm Probe procedure
@@ -177,7 +181,7 @@ Every probe that produces public artifacts (GitHub issues, PR comments, research
 1. Use an isolated config (staging, final destination, socket, listen/DHT ports) so the probe does not touch production paths.
 2. Prefer debug-level logging for the duration of the probe; capture daemon logs, `status`, and periodic `show <info-hash>` samples **locally**.
 3. Add the Magnet Link or Torrent File; wait long enough to observe stage mix (discovery → dial → MSE/handshake → attach), not only a single `list` snapshot. For MVP Smoke Pass Bar, apply the gate ladder and clocks below.
-4. Prefer Control Surface fields for diagnosis when present (`trackers`, `connect_diagnostics`, peer counts, encryption modes, DHT / Port Mapping fields) over raw logs. Smoke greening requires the diagnosis surface from issue #9 so log diving is not required for gate pass/fail.
+4. Prefer Control Surface fields for diagnosis when present — the [Smoke Diagnosis Surface](#smoke-diagnosis-surface-checklist) — over raw logs. Smoke greening requires that surface **locked and shipped** so log diving is not required for gate pass/fail.
 5. Tear down the daemon and staging data when finished; do not leave the probe torrent running.
 
 ### Publish only redacted material
@@ -196,7 +200,7 @@ Assume issues, PR comments, map notes, and any **attached logs** are public. **N
 ### Keep (these are the probe result)
 
 - Stage outcomes and activity (`fetching_metadata`, `downloading`, `seeding`, stuck/never attached).
-- Counts and histograms: candidate count, dial attempts, `Timeout` / `ConnectionRefused` / MSE mid-abort / plaintext retry / `handshake_ok` (from logs or `connect_diagnostics`).
+- Counts and histograms: candidate count, dial attempts, `Timeout` / `ConnectionRefused` / MSE mid-abort / plaintext retry / `handshake_ok` / `attach_ok` (from Control Surface `connect_diagnostics` or equivalent).
 - Tracker **outcome classes** without names: success vs failure reason **class** (`missing user agent`, `bad request`, timeout) after redacting any endpoint identity.
 - Encryption Policy under test, duration of the sample window, whether metadata completed, and (for smoke) each gate pass/fail.
 - Config knobs that matter to the stage mix (timeouts, policy), without machine-local paths.
@@ -223,7 +227,7 @@ Extends Live Swarm Probe procedure (isolation, Control Surface preference, **ide
 
 ### Green blockers (must ship before declare pass)
 
-1. Minimum `show`/`status` diagnosis surface — issue #9 (locked + shipped).
+1. Smoke Diagnosis Surface — definition locked (issue #9); residual fields must be **shipped** (see checklist ship gaps / follow-up task).
 2. Continuous Torrent Session Seeding after Handoff — issue #19 / ADR 0007 in code.
 3. Port Mapping for Listen Port (TCP) and active torrent DHT Port (UDP) with Control Surface state — issue #20.
 4. Enough connect-path fixes that G1–G4 can clear under the clocks — issue #12 residual (#14, #15, #17, #18, related).
@@ -258,8 +262,59 @@ G6 does **not** require `uploaded > 0` or a remote leecher finishing a download.
 
 ### Fail recording
 
-On any gate fail: stop that run; ticket artifact = redacted diagnosis packet (write-up shape above) using #9 fields when shipped. Do not “rescue” by only watching later gates. Do not attach unredacted logs.
+On any gate fail: stop that run; ticket artifact = redacted diagnosis packet (write-up shape above) using the Smoke Diagnosis Surface when shipped. Do not “rescue” by only watching later gates. Do not attach unredacted logs.
 
 ### Pass
 
 Both runs clear G0–G6 under clocks with green blockers satisfied; ticket comment (if any) uses the same redaction rules as any Live Swarm Probe.
+
+---
+
+## Smoke Diagnosis Surface checklist
+
+Definition locked from issue #9. Full **why-it-stalled** packet lives on `show`; `status` carries a **score-oriented** subset (plus cheap connect counters). Session-cumulative counters only — operators take **deltas between samples**. Zero on new Torrent Session / cold-start Session restore of a new life cycle. No per-peer identity tables. Ticket paste still follows Live Swarm Probe redaction (scheme + status + error class; no hostnames, paths, or external IPs).
+
+### Process rules
+
+| Surface | Carries |
+| --- | --- |
+| `show <info-hash>` | Full score + why packet for one torrent |
+| `status.torrents[]` | Score-enough per torrent (see below) + full `connect_diagnostics` (and `attach_ok` when present) |
+| Daemon-level `status` | `port_mapping` (Listen), DHT bootstrap block; DHT Port Mapping when a slot is held as applicable |
+
+### `status.torrents[]` score subset (minimum)
+
+- Identity / lifecycle: `info_hash`, `lifecycle_status`
+- Stage: `derived_activity`, or derive inputs (`metadata_complete`, `downloading`, status)
+- G1–G4: `peer_candidate_count`, `connected_peer_count`, `metadata_complete`, `verified_piece_count`, `piece_count` when known
+- Connect why: full `connect_diagnostics` (+ `attach_ok`)
+- G5–G6: `final_path` (nullable until Handoff), handoff / `completed_at` when set, `failure_reason` when failed
+
+### Gate checklist (score + why)
+
+| Gate | Score (Control Surface) | Why-it-stalled (primarily `show`) |
+| --- | --- | --- |
+| **G0** | Torrent on live registry; `port_mapping.enabled`; Listen Port mapping **mapped**; when DHT slot held, active DHT Port mapping **mapped** | Mapping state enum per Listen and DHT: `disabled` / `pending` / `mapped` / `failed`; DHT slot/port when held; mapping **error class** on `show` when `failed` (no external IP / gateway identity) |
+| **G1** | `peer_candidate_count` > 0 | Tracker tier + status + last **error class** (ticket paste: scheme only); DHT eligible / slot / port / `dht_last_error`; **candidate source breakdown** counts (tracker / DHT / PEX) |
+| **G2** | `metadata_complete` | `source` (magnet vs torrent_file); `metadata_error`; activity; **metadata progress** on `show` while incomplete (pieces received/total when size known); connect packet + `encryption_modes` |
+| **G3** | `connected_peer_count` ≥ 1 | Full `connect_diagnostics` including `handshake_ok`; cumulative **`attach_ok`** (handshake then attach to metadata or download peer list); `inbound_peer_count`, `peer_families`, `encryption_modes` on `show` |
+| **G4** | `verified_piece_count` advances (compare samples) | `piece_count`, `verified_piece_count`, activity / `downloading`; **downloadable-peer counts** (interested + unchoked, or equivalent); **request/transfer signal** on `show` (outstanding requests and/or session bytes/blocks received) — not bitfield dumps or per-peer rates |
+| **G5** | Live Session still listed; verify complete (`verified_piece_count == piece_count` or equivalent); live **`final_path` + handoff time**; activity toward / at `seeding` | **failure_reason** if Session failed during Handoff; **`staging_removed`** (or equivalent bool) on `show` after success |
+| **G6** | Activity `seeding`; `final_path` present; Session still live-managed; not failed for **5 min** observe | Same failure visibility if Final Destination missing/corrupt; session **`bytes_uploaded`** on `show` for diagnosis only — **not** a pass gate. No ratio / unchoke dashboard requirement |
+
+### Connect diagnostics core (already largely shipped)
+
+Outbound stage counters on `show` and `status.torrents[]`: `attempts`, `dial_timeout`, `connection_refused`, `connection_failed`, `mse_mid_abort`, `plaintext_retry`, `plaintext_retry_fail`, `unsupported_encryption`, `short_read`, `handshake_ok`, `other` — plus `peer_candidate_count` and `connected_peer_count`. **`attach_ok`** is required by this checklist even if not yet in code.
+
+### Ship gaps (definition complete; greening waits on code)
+
+Fields / projections to implement (or finish) after locking this checklist — tracked as implementation work (not re-open of the definition):
+
+1. DHT Port Mapping state + Listen/DHT **error class** on Control Surface (overlaps issue #20).
+2. Candidate **source breakdown** (tracker / DHT / PEX).
+3. **`attach_ok`** counter.
+4. Metadata **progress** while incomplete.
+5. Downloadable-peer counts + request/transfer signal for G4.
+6. Live post-Handoff row: activity `seeding`, `final_path`, handoff time, `staging_removed`, `failure_reason` (overlaps issue #19).
+7. Session **`bytes_uploaded`** (diagnosis-only).
+8. Expand **`status.torrents[]`** to the score subset above (not only hash / lifecycle / peer counts / connect_diagnostics).
